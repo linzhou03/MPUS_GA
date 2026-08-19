@@ -38,8 +38,10 @@ from model import GSA_CAST  # noqa: E402
 
 from transfer_losses import (  # noqa: E402
     balanced_reliable_gate,
+    balanced_topk_gate,
     entropy_mi_reliability,
     graph_ramp_weight,
+    scheduled_confidence_threshold,
     soft_graph_edge_loss,
 )
 from window_data import (  # noqa: E402
@@ -56,12 +58,12 @@ from window_data import (  # noqa: E402
 DEFAULT_DATA_DIR = SCRIPT_DIR / "data_processed"
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed: int, device: torch.device) -> None:
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    torch.random.default_generator.manual_seed(seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -91,12 +93,24 @@ def _next_batch(iterator, loader):
         return next(iterator), iterator
 
 
-def make_loaders(source, target, batch_size: int, iterations: int, seed: int):
-    source_labels = source.labels.long()
-    counts = torch.bincount(source_labels, minlength=NUM_CLASSES)
+def source_sampling_weights(labels: torch.Tensor, balance_alpha: float) -> torch.Tensor:
+    labels = labels.long()
+    counts = torch.bincount(labels, minlength=NUM_CLASSES)
     if torch.any(counts == 0):
         raise ValueError(f"Source has an empty class: {counts.tolist()}")
-    weights = counts.float().reciprocal()[source_labels].double()
+    return counts.float().pow(-balance_alpha)[labels].double()
+
+
+def make_loaders(
+    source,
+    target,
+    batch_size: int,
+    iterations: int,
+    seed: int,
+    source_balance_alpha: float,
+):
+    source_labels = source.labels.long()
+    weights = source_sampling_weights(source_labels, source_balance_alpha)
     sample_count = batch_size * iterations
     source_sampler = WeightedRandomSampler(
         weights,
@@ -151,6 +165,14 @@ def make_teacher(student: GSA_CAST) -> GSA_CAST:
     teacher.requires_grad_(False)
     teacher.eval()
     return teacher
+
+
+def copy_student_to_teacher(teacher: GSA_CAST, student: GSA_CAST) -> None:
+    """Hard-sync the teacher after source warm-up, without sharing storage."""
+
+    teacher.load_state_dict(student.state_dict())
+    teacher.requires_grad_(False)
+    teacher.eval()
 
 
 def update_teacher(teacher: GSA_CAST, student: GSA_CAST, momentum: float) -> None:
@@ -259,6 +281,56 @@ def hard_balanced_edge_loss(
     )
 
 
+def target_diagnostics(
+    probability: torch.Tensor,
+    entropy: torch.Tensor,
+    mi: torch.Tensor,
+    reliability: torch.Tensor,
+    selected: torch.Tensor,
+    raw_counts: torch.Tensor,
+    confidence_threshold: float,
+) -> dict[str, float | int]:
+    confidence, pseudo_label = probability.max(dim=1)
+
+    def quantile(values: torch.Tensor, q: float) -> float:
+        return float(torch.quantile(values.detach().float(), q).cpu())
+
+    selected_counts = torch.bincount(
+        pseudo_label[selected], minlength=probability.shape[1]
+    )
+    predicted_counts = torch.bincount(
+        pseudo_label, minlength=probability.shape[1]
+    )
+    return {
+        "confidence_threshold": float(confidence_threshold),
+        "confidence_mean": float(confidence.mean()),
+        "confidence_p50": quantile(confidence, 0.50),
+        "confidence_p75": quantile(confidence, 0.75),
+        "confidence_p90": quantile(confidence, 0.90),
+        "confidence_max": float(confidence.max()),
+        "entropy": float(entropy.mean()),
+        "entropy_p90": quantile(entropy, 0.90),
+        "mutual_information": float(mi.mean()),
+        "mutual_information_p90": quantile(mi, 0.90),
+        "reliability": float(reliability.mean()),
+        "reliability_p50": quantile(reliability, 0.50),
+        "reliability_p75": quantile(reliability, 0.75),
+        "reliability_p90": quantile(reliability, 0.90),
+        "reliability_p95": quantile(reliability, 0.95),
+        "reliability_max": float(reliability.max()),
+        "selected_target": int(selected.sum()),
+        "selected_positive": int(selected_counts[0]),
+        "selected_neutral": int(selected_counts[1]),
+        "selected_negative": int(selected_counts[2]),
+        "predicted_positive": int(predicted_counts[0]),
+        "predicted_neutral": int(predicted_counts[1]),
+        "predicted_negative": int(predicted_counts[2]),
+        "raw_positive": int(raw_counts[0]),
+        "raw_neutral": int(raw_counts[1]),
+        "raw_negative": int(raw_counts[2]),
+    }
+
+
 def train_step(
     variant: str,
     model: GSA_CAST,
@@ -280,7 +352,13 @@ def train_step(
     optimizer.zero_grad(set_to_none=True)
     graph_optimizer.zero_grad(set_to_none=True)
 
-    if variant == "r-softsga":
+    is_v1 = variant == "r-softsga"
+    is_v2 = variant == "r-softsga-v2"
+    teacher_active = is_v1 or (
+        is_v2 and iteration > args.graph_warmup_iters
+    )
+    confidence_threshold = args.min_soft_confidence
+    if teacher_active:
         assert teacher is not None
         mc_probability = mc_teacher_probability(
             teacher, target_batch, args.mc_passes, args.temperature
@@ -288,12 +366,28 @@ def train_step(
         target_probability, entropy, mi, reliability = entropy_mi_reliability(
             mc_probability, args.reliability_beta
         )
-        selected, raw_counts = balanced_reliable_gate(
-            target_probability,
-            reliability,
-            args.min_soft_confidence,
-            args.min_reliability,
-        )
+        if is_v2:
+            confidence_threshold = scheduled_confidence_threshold(
+                iteration,
+                args.graph_warmup_iters,
+                args.confidence_ramp_iters,
+                args.confidence_start,
+                args.confidence_end,
+            )
+            selected, raw_counts = balanced_topk_gate(
+                target_probability,
+                reliability,
+                confidence_threshold,
+                args.max_target_per_class,
+                args.fallback_confidence,
+            )
+        else:
+            selected, raw_counts = balanced_reliable_gate(
+                target_probability,
+                reliability,
+                confidence_threshold,
+                args.min_reliability,
+            )
     else:
         target_probability = entropy = mi = reliability = selected = raw_counts = None
 
@@ -311,6 +405,7 @@ def train_step(
     )
 
     if variant == "caga-balanced":
+        confidence_threshold = 0.90
         target_probability = target_student_probability.detach()
         reliability = torch.ones(
             len(target_probability), device=device, dtype=target_probability.dtype
@@ -318,8 +413,20 @@ def train_step(
         entropy = -(target_probability * target_probability.clamp_min(1e-8).log()).sum(1) / math.log(NUM_CLASSES)
         mi = torch.zeros_like(entropy)
         selected, raw_counts = balanced_reliable_gate(
-            target_probability, reliability, 0.90, 0.0
+            target_probability, reliability, confidence_threshold, 0.0
         )
+    elif is_v2 and not teacher_active:
+        confidence_threshold = args.confidence_start
+        target_probability, entropy, mi, reliability = entropy_mi_reliability(
+            target_student_probability.detach().unsqueeze(0),
+            args.reliability_beta,
+        )
+        confidence, pseudo_label = target_probability.max(dim=1)
+        candidate = confidence >= confidence_threshold
+        raw_counts = torch.bincount(
+            pseudo_label[candidate], minlength=NUM_CLASSES
+        )
+        selected = torch.zeros_like(candidate)
 
     classification = F.cross_entropy(source_logits, source_labels)
     domain_logits = torch.cat((source_domain, target_domain))
@@ -330,26 +437,42 @@ def train_step(
     style = style_loss(
         source_style,
         target_style,
-        reliability.detach() if variant == "r-softsga" else None,
+        reliability.detach() if is_v1 else None,
     )
 
     combined_features = torch.cat((source_features, target_features))
     graph_logits, affinity_logits = graph_module(combined_features)
     node = F.cross_entropy(graph_logits[: len(source_labels)], source_labels)
-    if variant == "r-softsga":
+    if is_v1 or is_v2:
         ramp = graph_ramp_weight(
             iteration, args.graph_warmup_iters, args.graph_rampup_iters
         )
+        evidence_scale = 1.0
+        if is_v2:
+            if bool(selected.any()):
+                selected_reliability = reliability[selected].mean()
+                evidence_scale = float(
+                    torch.clamp(
+                        selected_reliability / args.reliability_reference,
+                        min=0.0,
+                        max=1.0,
+                    )
+                )
+            else:
+                evidence_scale = 0.0
+        target_graph_weight = ramp * evidence_scale
         edge, blocks = soft_graph_edge_loss(
             affinity_logits,
             source_labels,
             target_probability.detach(),
             reliability.detach(),
             selected,
-            ramp,
+            target_graph_weight,
         )
     else:
         ramp = 1.0
+        evidence_scale = 1.0
+        target_graph_weight = 1.0
         edge = hard_balanced_edge_loss(
             affinity_logits, source_labels, target_probability, selected
         )
@@ -361,9 +484,18 @@ def train_step(
     total.backward()
     optimizer.step()
     graph_optimizer.step()
-    if teacher is not None:
+    if teacher is not None and (is_v1 or iteration > args.graph_warmup_iters):
         update_teacher(teacher, model, args.teacher_ema)
 
+    diagnostics = target_diagnostics(
+        target_probability,
+        entropy,
+        mi,
+        reliability,
+        selected,
+        raw_counts,
+        confidence_threshold,
+    )
     return {
         "iteration": iteration,
         "total": float(total.detach()),
@@ -376,13 +508,12 @@ def train_step(
         "edge_st": float(blocks["st"].detach()),
         "edge_tt": float(blocks["tt"].detach()),
         "graph_ramp": ramp,
-        "entropy": float(entropy.mean()),
-        "mutual_information": float(mi.mean()),
-        "reliability": float(reliability.mean()),
-        "selected_target": int(selected.sum()),
-        "raw_positive": int(raw_counts[0]),
-        "raw_neutral": int(raw_counts[1]),
-        "raw_negative": int(raw_counts[2]),
+        "reliability_evidence_scale": evidence_scale,
+        "target_graph_weight": target_graph_weight,
+        "target_graph_active": int(
+            bool(selected.any()) and target_graph_weight > 0
+        ),
+        **diagnostics,
     }
 
 
@@ -501,9 +632,14 @@ def run_fold(args, window_seconds: float, seed: int, subject: int, source, devic
         args.target_normalization,
     )
     fold_seed = seed
-    set_seed(fold_seed)
+    set_seed(fold_seed, device)
     source_loader, target_loader, test_loader = make_loaders(
-        source.dataset, target, args.batch_size, args.max_iters, fold_seed
+        source.dataset,
+        target,
+        args.batch_size,
+        args.max_iters,
+        fold_seed,
+        args.source_balance_alpha,
     )
     source_iterator = iter(source_loader)
     target_iterator = iter(target_loader)
@@ -521,7 +657,11 @@ def run_fold(args, window_seconds: float, seed: int, subject: int, source, devic
         num_classes=NUM_CLASSES,
     ).to(device)
     bootstrap_style(model, source_batch, target_batch, device)
-    teacher = make_teacher(model) if args.variant == "r-softsga" else None
+    teacher = (
+        make_teacher(model)
+        if args.variant in {"r-softsga", "r-softsga-v2"}
+        else None
+    )
     graph_module = SemanticAligner(args.d_model, NUM_CLASSES, args.d_model).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
@@ -540,6 +680,16 @@ def run_fold(args, window_seconds: float, seed: int, subject: int, source, devic
             dynamic_ncols=True,
         )
         for iteration in iterations:
+            if (
+                args.variant == "r-softsga-v2"
+                and iteration == args.graph_warmup_iters + 1
+            ):
+                assert teacher is not None
+                copy_student_to_teacher(teacher, model)
+                tqdm.write(
+                    f"Hard-synced teacher after {args.graph_warmup_iters} "
+                    "warm-up iterations"
+                )
             if iteration > 1:
                 source_batch, source_iterator = _next_batch(source_iterator, source_loader)
                 target_batch, target_iterator = _next_batch(target_iterator, target_loader)
@@ -556,15 +706,23 @@ def run_fold(args, window_seconds: float, seed: int, subject: int, source, devic
                 iteration,
                 args,
             )
-            if iteration == 1 or iteration % args.log_interval == 0:
+            progress_checkpoint = (
+                iteration == 1
+                or iteration == args.graph_warmup_iters + 1
+                or iteration % args.log_interval == 0
+            )
+            if args.variant == "r-softsga-v2" or progress_checkpoint:
                 log_handle.write(json.dumps(losses) + "\n")
+            if progress_checkpoint:
                 log_handle.flush()
                 iterations.set_postfix(
                     total=f"{losses['total']:.3f}",
                     cls=f"{losses['classification']:.3f}",
                     edge=f"{losses['edge']:.3f}",
-                    reliability=f"{losses['reliability']:.2f}",
+                    conf90=f"{losses['confidence_p90']:.2f}",
+                    rel90=f"{losses['reliability_p90']:.3f}",
                     selected=losses["selected_target"],
+                    graph_w=f"{losses['target_graph_weight']:.3f}",
                 )
 
     metrics = evaluate(
@@ -582,6 +740,16 @@ def run_fold(args, window_seconds: float, seed: int, subject: int, source, devic
         "target_subject": subject,
         "iterations": args.max_iters,
         "target_normalization": args.target_normalization,
+        "source_balance_alpha": args.source_balance_alpha,
+        "graph_warmup_iters": args.graph_warmup_iters,
+        "graph_rampup_iters": args.graph_rampup_iters,
+        "teacher_ema": args.teacher_ema,
+        "confidence_start": args.confidence_start,
+        "confidence_end": args.confidence_end,
+        "confidence_ramp_iters": args.confidence_ramp_iters,
+        "max_target_per_class": args.max_target_per_class,
+        "fallback_confidence": args.fallback_confidence,
+        "reliability_reference": args.reliability_reference,
         **metrics,
     }
     result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
@@ -596,7 +764,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--result-dir", type=Path, default=SCRIPT_DIR / "results")
     parser.add_argument(
-        "--variant", choices=("caga-balanced", "r-softsga"), default="caga-balanced"
+        "--variant",
+        choices=("caga-balanced", "r-softsga", "r-softsga-v2"),
+        default="caga-balanced",
     )
     parser.add_argument("--window-seconds", nargs="+", type=float, default=(1, 2, 4))
     parser.add_argument(
@@ -612,12 +782,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=5e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--target-normalization", choices=("source", "domain"), default="source")
+    parser.add_argument("--source-balance-alpha", type=float, default=1.0)
     parser.add_argument("--teacher-ema", type=float, default=0.99)
     parser.add_argument("--mc-passes", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--reliability-beta", type=float, default=2.0)
     parser.add_argument("--min-soft-confidence", type=float, default=0.70)
     parser.add_argument("--min-reliability", type=float, default=0.20)
+    parser.add_argument("--confidence-start", type=float, default=0.34)
+    parser.add_argument("--confidence-end", type=float, default=0.40)
+    parser.add_argument("--confidence-ramp-iters", type=int, default=800)
+    parser.add_argument("--max-target-per-class", type=int, default=4)
+    parser.add_argument("--fallback-confidence", type=float, default=0.334)
+    parser.add_argument("--reliability-reference", type=float, default=0.05)
     parser.add_argument("--graph-warmup-iters", type=int, default=200)
     parser.add_argument("--graph-rampup-iters", type=int, default=200)
     parser.add_argument("--d-model", type=int, default=64)
@@ -626,7 +803,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--spatial-topk", type=int, default=8)
     parser.add_argument("--log-interval", type=int, default=100)
-    parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device")
     parser.add_argument("--overwrite", action="store_true")
     return parser
 
@@ -640,6 +817,18 @@ def validate_args(args) -> None:
         raise ValueError("d-model must be divisible by num-heads")
     if not 0 <= args.teacher_ema < 1:
         raise ValueError("teacher-ema must be in [0,1)")
+    if not 0 <= args.confidence_start <= args.confidence_end <= 1:
+        raise ValueError("confidence thresholds must satisfy 0 <= start <= end <= 1")
+    if args.confidence_ramp_iters < 0 or args.max_target_per_class < 1:
+        raise ValueError("confidence-ramp-iters must be nonnegative and top-k positive")
+    if args.reliability_reference <= 0:
+        raise ValueError("reliability-reference must be positive")
+    if not 0 <= args.source_balance_alpha <= 1:
+        raise ValueError("source-balance-alpha must be between 0 and 1")
+    if not 1 / NUM_CLASSES <= args.fallback_confidence <= args.confidence_start:
+        raise ValueError(
+            "fallback-confidence must be between random chance and confidence-start"
+        )
     if any(scale not in {1.0, 2.0, 4.0} for scale in args.window_seconds):
         raise ValueError("window-seconds must be selected from 1, 2, 4")
 
@@ -649,7 +838,12 @@ def main() -> None:
     validate_args(args)
     args.data_dir = args.data_dir.expanduser().resolve()
     args.result_dir = args.result_dir.expanduser().resolve()
-    device = torch.device(args.device)
+    device_name = args.device
+    if device_name is None:
+        device_name = "cuda:0" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device_name)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
     tqdm.write(
         f"Variant={args.variant}, device={device}, windows={args.window_seconds}, "
         f"random_seeds={args.random_seeds}, targets={args.target_subjects}"
