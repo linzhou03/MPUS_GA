@@ -66,6 +66,53 @@ def balanced_reliable_gate(
     return selected, raw_counts
 
 
+def balanced_topk_gate(
+    mean_probability: torch.Tensor,
+    reliability: torch.Tensor,
+    min_confidence: float,
+    max_per_class: int,
+    fallback_confidence: float | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select a bounded, class-balanced target set by reliability-confidence.
+
+    Unlike the v1 gate, reliability is a ranking signal rather than an
+    absolute threshold.  The soft-edge loss normalizes its reliability weights,
+    so discarding every sample merely because the absolute values are small is
+    unnecessary.  All classes must still be represented to prevent a collapsed
+    teacher from defining the target graph.
+    """
+
+    if max_per_class < 1:
+        raise ValueError("max_per_class must be positive")
+    if fallback_confidence is not None and not (
+        0.0 <= fallback_confidence <= min_confidence
+    ):
+        raise ValueError(
+            "fallback_confidence must be within [0, min_confidence]"
+        )
+    confidence, pseudo_label = mean_probability.max(dim=1)
+    candidate = confidence >= float(min_confidence)
+    class_count = mean_probability.shape[1]
+    if fallback_confidence is not None:
+        for class_id in range(class_count):
+            class_candidate = candidate & (pseudo_label == class_id)
+            if not bool(class_candidate.any()):
+                candidate |= (
+                    (pseudo_label == class_id)
+                    & (confidence >= float(fallback_confidence))
+                )
+    raw_counts = torch.bincount(pseudo_label[candidate], minlength=class_count)
+    selected = torch.zeros_like(candidate)
+    if torch.all(raw_counts > 0):
+        quota = min(int(raw_counts.min().item()), int(max_per_class))
+        score = reliability * confidence
+        for class_id in range(class_count):
+            indices = torch.where(candidate & (pseudo_label == class_id))[0]
+            keep = indices[torch.topk(score[indices], k=quota).indices]
+            selected[keep] = True
+    return selected, raw_counts
+
+
 def _weighted_bce(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -148,3 +195,20 @@ def graph_ramp_weight(iteration: int, warmup: int, rampup: int) -> float:
         return 1.0
     progress = (iteration - warmup) / rampup
     return 0.5 * (1.0 - math.cos(math.pi * progress))
+
+
+def scheduled_confidence_threshold(
+    iteration: int,
+    warmup: int,
+    ramp_iterations: int,
+    start: float,
+    end: float,
+) -> float:
+    """Linearly tighten the teacher-confidence floor after warm-up."""
+
+    if not 0.0 <= start <= end <= 1.0:
+        raise ValueError("confidence thresholds must satisfy 0 <= start <= end <= 1")
+    if iteration <= warmup or ramp_iterations <= 0:
+        return float(start)
+    progress = min(1.0, (iteration - warmup) / ramp_iterations)
+    return float(start + progress * (end - start))

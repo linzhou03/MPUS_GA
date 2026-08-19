@@ -73,7 +73,8 @@ Each NPZ stores:
 The server BCI environment already contains MNE, NumPy, SciPy, and openpyxl:
 
 ```bash
-MNE_DONTWRITE_HOME=true /home/gzw/anaconda3/envs/BCI/bin/python \
+CUDA_VISIBLE_DEVICES=1 MNE_DONTWRITE_HOME=true \
+  /home/gzw/anaconda3/envs/BCI/bin/python \
   MPUS_GA/preprocess.py \
   --data-root /dataset/gzw/seed_series \
   --datasets seed-vii seed-v \
@@ -122,22 +123,49 @@ MNE_DONTWRITE_HOME=true /home/gzw/anaconda3/envs/BCI/bin/python \
   --window-seconds 1 2 4 \
   --random-seeds 42 \
   --target-subjects all \
-  --device cuda:1
+  --device cuda:0
 ```
 
-The first-priority MVP from the proposal adds an EMA teacher, three stochastic
+The frozen v1 MVP from the proposal adds an EMA teacher, three stochastic
 teacher passes, entropy-plus-MI reliability, balanced target-node gating,
 separately normalized SS/ST/TT soft edge losses, and the 200+200 iteration graph
 ramp:
 
 ```bash
-MNE_DONTWRITE_HOME=true /home/gzw/anaconda3/envs/BCI/bin/python \
+CUDA_VISIBLE_DEVICES=1 MNE_DONTWRITE_HOME=true \
+  /home/gzw/anaconda3/envs/BCI/bin/python \
   MPUS_GA/train_transfer.py \
   --variant r-softsga \
   --window-seconds 1 2 4 \
   --random-seeds 42 \
   --target-subjects all \
-  --device cuda:1
+  --device cuda:0
+```
+
+`r-softsga-v2` is the diagnostic correction after v1 admitted no target nodes.
+It trains a 200-iteration source warm-up, hard-syncs student to teacher, removes
+the absolute reliability cutoff, ranks candidates by confidence times
+reliability, and retains at most four candidates per predicted class. Based on
+the diagnostic pilot, the confidence floor rises slowly from 0.34 to 0.40. If
+one predicted class alone has no candidate, a 0.334 chance-level fallback may
+supply that missing class; it does not bypass the requirement that all three
+predicted classes be present in the batch. Absolute reliability scales the
+complete target-graph block relative to a 0.05
+reference instead of being erased by within-block normalization. Its JSONL log
+records every iteration, including confidence/reliability quantiles, predicted
+and candidate class counts, and SS/ST/TT activation.
+
+Run the intended small pilot before any full v2 matrix:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 /home/gzw/anaconda3/envs/BCI/bin/python \
+  MPUS_GA/train_transfer.py \
+  --variant r-softsga-v2 \
+  --window-seconds 1 \
+  --random-seeds 42 \
+  --target-subjects 1-4 \
+  --max-iters 400 \
+  --device cuda:0
 ```
 
 The terminal displays an overall tqdm bar across all scale/subject folds, an
@@ -151,19 +179,62 @@ metrics and trial-level metrics obtained by averaging all window probabilities
 within a trial. The default output is
 `MPUS_GA/results/<variant>/window_*/random_seed_*`.
 
+## True trial-level temporal baseline
+
+`train_trial_temporal.py` is the next-stage baseline and is deliberately kept
+separate from the window-based transfer entry point. It groups all windows by
+`(subject_id, session_id, trial_id)`, sorts each group by `window_id`, and pads
+only within the current batch. Its prediction path is:
+
+```text
+DE windows [T,62,5]
+  -> per-window attentive electrode graph encoder
+  -> ordered window embeddings [T,d]
+  -> temporal Transformer
+  -> masked attention pooling
+  -> one trial prediction
+```
+
+The model uses labeled SEED-VII trials for classification and unlabeled SEED-V
+trials only for domain-adversarial alignment. The target training view does not
+return labels. SEED-VII subjects 17--20 are held out for source-only checkpoint
+selection; target labels are not exposed to optimization or checkpoint
+selection and are consumed by metric computation only after the selected
+checkpoint has been restored. Consequently this entry point reports
+Trial Acc, Trial Balanced Acc, and Trial Macro-F1 only. A Window Acc is not
+defined because the model does not make independent window predictions.
+
+Run the first 1-second, three-random-seed baseline on physical GPU 0 with:
+
+```bash
+cd /home/gzw/projects/CAGA-SGA
+mkdir -p MPUS_GA/logs/trial_temporal
+RUN_LOG="MPUS_GA/logs/trial_temporal/nohup_$(date +%Y%m%d_%H%M%S).log"
+nohup env PHYSICAL_GPU=0 WINDOW_SECONDS="1" RANDOM_SEEDS="42 43 44" \
+  bash MPUS_GA/run_trial_temporal.sh > "${RUN_LOG}" 2>&1 &
+echo "PID=$! LOG=${RUN_LOG}"
+```
+
+The shell script is resumable at target-subject granularity. Useful overrides
+include `TARGET_SUBJECTS=1-4`, `MAX_ITERS=2`, `BATCH_SIZE=4`, and
+`RESULT_DIR=/path/to/results`. After the 1-second baseline is reviewed, 2 s and
+4 s should be run as separate single-scale ablations before any multiscale
+fusion is introduced.
+
 For a cheap end-to-end smoke test before the full matrix:
 
 ```bash
-/home/gzw/anaconda3/envs/BCI/bin/python MPUS_GA/train_transfer.py \
+CUDA_VISIBLE_DEVICES=1 /home/gzw/anaconda3/envs/BCI/bin/python \
+  MPUS_GA/train_transfer.py \
   --variant r-softsga --window-seconds 4 --random-seeds 42 \
-  --target-subjects 16 --max-iters 2 --batch-size 8 --device cuda:1
+  --target-subjects 16 --max-iters 2 --batch-size 8 --device cuda:0
 ```
 
 ### Sequential nohup run
 
 `run_transfer_sequential.sh` first verifies the expected 80 SEED-VII and 48
 SEED-V session files at every scale, runs the full processed-data validator,
-then executes `caga-balanced` followed by `r-softsga`. A failed validation or
+then executes `caga-balanced` followed by `r-softsga-v2`. A failed validation or
 baseline stops the sequence rather than launching the next stage. Completed
 subject results are reused when the script is restarted.
 
@@ -182,12 +253,13 @@ Follow the master status log and the detailed tqdm logs with:
 ```bash
 tail -f "${RUN_LOG}"
 tail -f MPUS_GA/logs/training/*_caga-balanced.log
-tail -f MPUS_GA/logs/training/*_r-softsga.log
+tail -f MPUS_GA/logs/training/*_r-softsga-v2.log
 ```
 
-The script accepts environment overrides without editing the file, for
-example `DEVICE=cuda:0`, `MAX_ITERS=2`, or `BATCH_SIZE=32`. The checked-in
-default is `cuda:1`.
+The script accepts environment overrides without editing the file, for example
+`PHYSICAL_GPU=0`, `MAX_ITERS=2`, or `BATCH_SIZE=32`. The checked-in default
+exposes only physical GPU 1 through `CUDA_VISIBLE_DEVICES=1`; inside the process
+that card is correctly addressed as `cuda:0`.
 
 ## Signal processing
 
