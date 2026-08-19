@@ -3,8 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import DenseGCNConv
 
+
 class SemanticAligner(nn.Module):
-    def __init__(self, in_features, num_classes, gcn_out_features=128):
+    def __init__(self, in_features, num_classes, gcn_out_features=64):
         super().__init__()
         self.edge_network = nn.Linear(in_features, in_features)
         self.gcn = DenseGCNConv(in_features, gcn_out_features)
