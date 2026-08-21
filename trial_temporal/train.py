@@ -1,4 +1,4 @@
-"""Fixed-protocol class-conditional multiscale multi-source UDA training."""
+"""Class-conditional multiscale multi-source UDA training."""
 
 from __future__ import annotations
 
@@ -40,8 +40,14 @@ from .model import MultiScaleMultiSourceDANN
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = PACKAGE_DIR / "data_processed"
 DEFAULT_RESULT_ROOT = PACKAGE_DIR / "results_class_conditional_multiscale"
-VARIANT = "class-conditional-multisource-multiscale-fixed1000"
+VARIANT = "class-conditional-multisource-multiscale"
 CLASS_NAMES = ("positive", "neutral", "negative")
+EVALUATION_PROTOCOL_FIXED_FINAL = "fixed_final"
+EVALUATION_PROTOCOL_CAGA_TARGET_BEST = "caga_target_best"
+EVALUATION_PROTOCOLS = (
+    EVALUATION_PROTOCOL_FIXED_FINAL,
+    EVALUATION_PROTOCOL_CAGA_TARGET_BEST,
+)
 
 
 @dataclass(frozen=True)
@@ -736,6 +742,30 @@ def evaluate_trials(
     }
 
 
+def _should_evaluate_target(
+    protocol: str,
+    iteration: int,
+    total_iterations: int,
+    target_eval_interval: int,
+) -> bool:
+    """Return whether this model state is a target-evaluation candidate."""
+
+    if iteration == total_iterations:
+        return True
+    return (
+        protocol == EVALUATION_PROTOCOL_CAGA_TARGET_BEST
+        and iteration % target_eval_interval == 0
+    )
+
+
+def _target_evaluation_is_better(candidate: dict, incumbent: dict | None) -> bool:
+    """Match public CAGA-SGA: select strictly higher target Accuracy."""
+
+    return incumbent is None or (
+        candidate["fused"]["accuracy"] > incumbent["fused"]["accuracy"]
+    )
+
+
 def _write_summary(result_dir: Path) -> None:
     results = [
         json.loads(path.read_text(encoding="utf-8"))
@@ -896,6 +926,9 @@ def run_fold(
     source_iterators = [iter(loader) for loader in source_loaders]
     target_iterator = iter(target_loader)
     training_trace = []
+    target_evaluation_trace = []
+    selected_evaluation = None
+    selected_iteration = None
     progress = tqdm(
         range(1, iterations + 1),
         desc=f"{spec.name} | seed={seed} | target={subject:02d}",
@@ -942,31 +975,69 @@ def run_fold(
                 dom=f"{record['domain']:.3f}",
                 proto=f"{record['prototype']:.3f}",
             )
+        if _should_evaluate_target(
+            args.evaluation_protocol,
+            iteration,
+            iterations,
+            args.target_eval_interval,
+        ):
+            candidate_evaluation = evaluate_trials(
+                model,
+                test_loader,
+                device,
+                (
+                    f"Target eval I{iteration:04d} "
+                    f"{spec.name}/seed{seed}/S{subject:02d}"
+                ),
+                prototype_bank,
+            )
+            target_evaluation_trace.append(
+                {"iteration": iteration, "evaluation": candidate_evaluation}
+            )
+            if _target_evaluation_is_better(
+                candidate_evaluation, selected_evaluation
+            ):
+                selected_evaluation = candidate_evaluation
+                selected_iteration = iteration
+            tqdm.write(
+                f"Target eval {spec.name}/seed{seed}/S{subject:02d} "
+                f"I{iteration:04d}: "
+                f"acc={candidate_evaluation['fused']['accuracy']:.4f}, "
+                f"best_acc={selected_evaluation['fused']['accuracy']:.4f} "
+                f"at I{selected_iteration:04d}"
+            )
 
-    # This is the only point at which target labels are accessed.
-    evaluation = evaluate_trials(
-        model,
-        test_loader,
-        device,
-        f"Final eval {spec.name}/seed{seed}/S{subject:02d}",
-        prototype_bank,
+    if selected_evaluation is None or selected_iteration is None:
+        raise RuntimeError("No target evaluation was produced")
+    evaluation = selected_evaluation
+    is_target_selected = (
+        args.evaluation_protocol == EVALUATION_PROTOCOL_CAGA_TARGET_BEST
     )
     result = {
-        "variant": VARIANT,
+        "variant": f"{VARIANT}-{args.evaluation_protocol}",
         "experiment": spec.name,
         "experiment_spec": asdict(spec),
         "protocol": {
             "name": (
                 f"{'_'.join(prepared.domain_names)}_to_"
-                f"{spec.target_dataset}_transductive_fixed1000"
+                f"{spec.target_dataset}_transductive_"
+                f"{args.evaluation_protocol}"
             ),
             "source_domains": list(prepared.domain_names),
             "target_dataset": spec.target_dataset,
             "target_subject_count": spec.target_subject_count,
             "target_trials": spec.target_trials,
             "training_iterations": FIXED_UDA_PROTOCOL.training_iterations,
-            "checkpoint_selection": FIXED_UDA_PROTOCOL.checkpoint_selection,
-            "target_evaluations": FIXED_UDA_PROTOCOL.target_evaluations,
+            "checkpoint_selection": (
+                "highest_target_accuracy"
+                if is_target_selected
+                else FIXED_UDA_PROTOCOL.checkpoint_selection
+            ),
+            "target_evaluations": len(target_evaluation_trace),
+            "target_eval_interval": (
+                args.target_eval_interval if is_target_selected else None
+            ),
+            "selected_iteration": selected_iteration,
             "target_probability_correction": False,
         },
         "source_trials": {
@@ -1024,6 +1095,7 @@ def run_fold(
             prototype_bank.state() if prototype_bank is not None else None
         ),
         "training_trace": training_trace,
+        "target_evaluation_trace": target_evaluation_trace,
         "evaluation": evaluation,
     }
     if device.type == "cuda":
@@ -1033,8 +1105,10 @@ def run_fold(
     result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
     _write_summary(experiment_dir)
     fused = evaluation["fused"]
+    result_label = "Selected" if is_target_selected else "Final"
     tqdm.write(
-        f"Final {result_path}: acc={fused['accuracy']:.4f}, "
+        f"{result_label} {result_path} at iteration {selected_iteration}: "
+        f"acc={fused['accuracy']:.4f}, "
         f"bal={fused['balanced_accuracy']:.4f}, f1={fused['macro_f1']:.4f}"
     )
 
@@ -1072,6 +1146,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dropout", type=float, default=0.3)
     parser.add_argument("--spatial-topk", type=int, default=8)
     parser.add_argument("--log-interval", type=int, default=50)
+    parser.add_argument(
+        "--evaluation-protocol",
+        choices=EVALUATION_PROTOCOLS,
+        default=EVALUATION_PROTOCOL_FIXED_FINAL,
+        help=(
+            "fixed_final evaluates only iteration 1000; caga_target_best "
+            "evaluates the labeled target at intervals and reports the "
+            "highest-Accuracy iteration"
+        ),
+    )
+    parser.add_argument(
+        "--target-eval-interval",
+        type=int,
+        default=50,
+        help="Target evaluation interval for caga_target_best",
+    )
     parser.add_argument("--device")
     parser.add_argument("--overwrite", action="store_true")
     return parser
@@ -1101,8 +1191,15 @@ def validate_args(args, spec: ExperimentSpec) -> None:
         raise ValueError("source-balance-alpha must be within [0,1]")
     if args.warmup_iterations < 0:
         raise ValueError("warmup-iterations must be nonnegative")
-    if args.log_interval < 1 or args.gradient_clip <= 0:
-        raise ValueError("log interval and gradient clip must be positive")
+    if (
+        args.log_interval < 1
+        or args.target_eval_interval < 1
+        or args.gradient_clip <= 0
+    ):
+        raise ValueError(
+            "log interval, target evaluation interval, and gradient clip "
+            "must be positive"
+        )
     if not (
         0
         <= args.adaptation_warmup_iterations
@@ -1139,10 +1236,17 @@ def main() -> None:
         f"Experiment={spec.name}: {spec.description}; "
         f"sources={spec.source_domains}; scales={spec.scales}; device={device}"
     )
-    tqdm.write(
-        "Protocol: fixed 1000 iterations, raw fused logits, no checkpoint "
-        "selection, one final target evaluation"
-    )
+    if args.evaluation_protocol == EVALUATION_PROTOCOL_CAGA_TARGET_BEST:
+        tqdm.write(
+            "Protocol: CAGA-SGA-style target selection, fixed 1000 training "
+            f"iterations, target evaluation every {args.target_eval_interval} "
+            "iterations, highest target Accuracy reported"
+        )
+    else:
+        tqdm.write(
+            "Protocol: fixed 1000 iterations, raw fused logits, no checkpoint "
+            "selection, one final target evaluation"
+        )
     prepared = prepare_sources(args.data_dir, spec.source_domains, spec.scales)
     for seed in args.random_seeds:
         for subject in args.target_subjects:
