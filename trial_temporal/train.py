@@ -39,8 +39,8 @@ from .model import MultiScaleMultiSourceDANN
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = PACKAGE_DIR / "data_processed"
-DEFAULT_RESULT_ROOT = PACKAGE_DIR / "results_class_conditional_multiscale"
-VARIANT = "source-anchored-scale-class-relation-graph"
+DEFAULT_RESULT_ROOT = PACKAGE_DIR / "results_prior_aware_weighted_pyramid"
+VARIANT = "prior-aware-class-conditional-weighted-feature-pyramid"
 CLASS_NAMES = ("positive", "neutral", "negative")
 EVALUATION_PROTOCOL_FIXED_FINAL = "fixed_final"
 EVALUATION_PROTOCOL_CAGA_TARGET_BEST = "caga_target_best"
@@ -295,6 +295,21 @@ def _natural_source_class_priors(
     return torch.stack(priors).to(device)
 
 
+def _effective_source_class_priors(
+    prepared: PreparedMultiSource,
+    balance_alpha: float,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return the class prior induced by softened inverse-frequency sampling."""
+
+    priors = []
+    for dataset in prepared.datasets:
+        counts = torch.bincount(dataset.labels.long(), minlength=NUM_CLASSES)
+        mass = counts.float().pow(1.0 - balance_alpha)
+        priors.append(mass / mass.sum())
+    return torch.stack(priors).to(device)
+
+
 def _adaptation_ramp(
     iteration: int, warmup_iterations: int, ramp_end_iteration: int
 ) -> float:
@@ -371,6 +386,149 @@ def independent_scale_consensus(
         vote_count=vote_count,
         js_divergence=js_divergence,
     )
+
+
+class TargetPriorEstimator:
+    """Estimate target label proportions from independent multiscale evidence.
+
+    Each scale maintains a source soft-confusion matrix P(prediction | class).
+    The unlabeled target mean prediction is then matched jointly across scales
+    by a ridge-regularized label-shift solve. Fused predictions never enter the
+    estimator, which prevents a pyramid-error feedback loop.
+    """
+
+    def __init__(
+        self,
+        domain_count: int,
+        scale_count: int,
+        class_count: int,
+        source_prior: torch.Tensor,
+        device: torch.device,
+        momentum: float = 0.99,
+        ridge: float = 0.10,
+        prior_floor: float = 0.03,
+    ) -> None:
+        if domain_count < 1 or scale_count < 1 or class_count < 2:
+            raise ValueError("prior estimator dimensions must be positive")
+        if source_prior.shape != (class_count,):
+            raise ValueError("source_prior must be [classes]")
+        if not 0 <= momentum < 1:
+            raise ValueError("prior momentum must be within [0,1)")
+        if ridge < 0:
+            raise ValueError("prior ridge must be nonnegative")
+        if not 0 <= prior_floor < 1.0 / class_count:
+            raise ValueError("prior floor must be within [0,1/classes)")
+        self.momentum = float(momentum)
+        self.ridge = float(ridge)
+        self.prior_floor = float(prior_floor)
+        anchor = source_prior.detach().float().to(device).clamp_min(1e-8)
+        self.source_prior = anchor / anchor.sum()
+        identity = torch.eye(class_count, device=device)
+        self.source_confusion = identity.view(
+            1, 1, class_count, class_count
+        ).expand(domain_count, scale_count, -1, -1).clone()
+        self.source_initialized = torch.zeros(
+            domain_count,
+            scale_count,
+            class_count,
+            dtype=torch.bool,
+            device=device,
+        )
+        self.source_updates = torch.zeros_like(
+            self.source_initialized, dtype=torch.long
+        )
+        self.target_mean_probability = self.source_prior.unsqueeze(0).expand(
+            scale_count, -1
+        ).clone()
+        self.target_initialized = False
+        self.target_updates = 0
+        self.estimated_prior = self.source_prior.clone()
+
+    @torch.no_grad()
+    def update_source(
+        self,
+        domain_index: int,
+        scale_logits: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> None:
+        probability = F.softmax(scale_logits.detach(), dim=-1)
+        if probability.shape[1:] != self.source_confusion.shape[1:3]:
+            raise ValueError("source scale logits do not match prior estimator")
+        for class_index in range(self.source_prior.numel()):
+            selected = labels == class_index
+            if not torch.any(selected):
+                continue
+            observation = probability[selected].mean(dim=0)
+            for scale_index in range(probability.shape[1]):
+                index = (domain_index, scale_index, class_index)
+                column = self.source_confusion[
+                    domain_index, scale_index, :, class_index
+                ]
+                if bool(self.source_initialized[index]):
+                    column.mul_(self.momentum).add_(
+                        observation[scale_index], alpha=1.0 - self.momentum
+                    )
+                else:
+                    column.copy_(observation[scale_index])
+                    self.source_initialized[index] = True
+                column.div_(column.sum().clamp_min(1e-8))
+                self.source_updates[index] += 1
+
+    @torch.no_grad()
+    def update_target(self, scale_logits: torch.Tensor) -> None:
+        probability = F.softmax(scale_logits.detach(), dim=-1)
+        if probability.shape[1:] != self.target_mean_probability.shape:
+            raise ValueError("target scale logits do not match prior estimator")
+        observation = probability.mean(dim=0)
+        if self.target_initialized:
+            self.target_mean_probability.mul_(self.momentum).add_(
+                observation, alpha=1.0 - self.momentum
+            )
+        else:
+            self.target_mean_probability.copy_(observation)
+            self.target_initialized = True
+        self.target_updates += 1
+        self._solve()
+
+    @torch.no_grad()
+    def _solve(self) -> None:
+        if not self.target_initialized:
+            self.estimated_prior.copy_(self.source_prior)
+            return
+        confusion = self.source_confusion.mean(dim=0)
+        design = confusion.reshape(-1, self.source_prior.numel())
+        observed = self.target_mean_probability.reshape(-1)
+        identity = torch.eye(
+            self.source_prior.numel(), device=design.device, dtype=design.dtype
+        )
+        system = design.T @ design + self.ridge * identity
+        rhs = design.T @ observed + self.ridge * self.source_prior
+        estimate = torch.linalg.solve(system, rhs)
+        estimate = estimate.clamp_min(self.prior_floor)
+        self.estimated_prior.copy_(estimate / estimate.sum().clamp_min(1e-8))
+
+    @torch.no_grad()
+    def logit_adjustment(self, strength: float) -> torch.Tensor:
+        if strength < 0:
+            raise ValueError("prior correction strength must be nonnegative")
+        ratio = torch.log(self.estimated_prior.clamp_min(1e-8)) - torch.log(
+            self.source_prior.clamp_min(1e-8)
+        )
+        return float(strength) * ratio.clamp(-2.0, 2.0)
+
+    @torch.no_grad()
+    def state(self) -> dict:
+        return {
+            "source_prior_anchor": self.source_prior.cpu().tolist(),
+            "estimated_target_prior": self.estimated_prior.cpu().tolist(),
+            "target_mean_probability_by_scale": (
+                self.target_mean_probability.cpu().tolist()
+            ),
+            "source_soft_confusion": self.source_confusion.cpu().tolist(),
+            "source_initialized": self.source_initialized.cpu().tolist(),
+            "source_updates": self.source_updates.cpu().tolist(),
+            "target_updates": self.target_updates,
+        }
 
 
 class PrototypeBank:
@@ -775,6 +933,8 @@ def train_step(
     scale_classification_weight: float = 0.30,
     gate_supervision_weight: float = 0.10,
     gate_teacher_temperature: float = 0.25,
+    target_prior_estimator: TargetPriorEstimator | None = None,
+    prior_correction_strength: float = 0.50,
 ) -> dict:
     if "y" in target_batch:
         raise RuntimeError("Target adaptation batch unexpectedly contains labels")
@@ -787,6 +947,13 @@ def train_step(
     reliability = (
         prototype_bank.scale_class_reliability()
         if prototype_bank is not None
+        else None
+    )
+    prior_adjustment = (
+        target_prior_estimator.logit_adjustment(
+            prior_correction_strength * ramp
+        )
+        if target_prior_estimator is not None
         else None
     )
     source_outputs = []
@@ -809,10 +976,11 @@ def train_step(
         target_mask,
         grl_alpha=ramp,
         scale_class_reliability=reliability,
+        class_logit_adjustment=prior_adjustment,
     )
 
     target_consensus = independent_scale_consensus(
-        target_output["scale_logits"],
+        target_output["calibrated_scale_logits"],
         pseudo_confidence_threshold,
         consensus_jsd_threshold,
         consensus_minimum_votes,
@@ -903,6 +1071,17 @@ def train_step(
     optimizer.step()
     scheduler.step()
 
+    if target_prior_estimator is not None:
+        for domain_index, (output, labels) in enumerate(
+            zip(source_outputs, source_labels, strict=True)
+        ):
+            target_prior_estimator.update_source(
+                domain_index, output["scale_logits"], labels
+            )
+        # The estimator only sees raw independent target-scale logits. It never
+        # consumes prior-corrected or pyramid-fused predictions.
+        target_prior_estimator.update_target(target_output["scale_logits"])
+
     if prototype_bank is not None:
         for domain_index, (output, labels) in enumerate(
             zip(source_outputs, source_labels, strict=True)
@@ -962,9 +1141,24 @@ def train_step(
         "target_scale_consensus": consensus_statistics,
         "source_weights": [float(value) for value in source_weights.detach()],
         "mean_target_scale_class_gate": mean_gate.cpu().tolist(),
+        "pyramid_residual_weight": float(
+            target_output["pyramid_residual_weight"].detach()
+        ),
+        "learned_scale_class_relation_residual": (
+            model.scale_class_relation_residual.detach().cpu().tolist()
+        ),
         "gradient_norm": float(gradient_norm),
         "learning_rate": float(optimizer.param_groups[0]["lr"]),
     }
+    if target_prior_estimator is not None:
+        record["estimated_target_prior"] = (
+            target_prior_estimator.estimated_prior.cpu().tolist()
+        )
+        record["prior_logit_adjustment"] = (
+            prior_adjustment.cpu().tolist()
+            if prior_adjustment is not None
+            else [0.0] * NUM_CLASSES
+        )
     if prototype_bank is not None:
         record["joint_source_scale_class_weights"] = (
             prototype_bank.joint_weights().cpu().tolist()
@@ -1016,15 +1210,23 @@ def evaluate_trials(
     device: torch.device,
     description: str,
     prototype_bank: PrototypeBank | None,
+    target_prior_estimator: TargetPriorEstimator | None = None,
+    prior_correction_strength: float = 0.50,
 ) -> dict:
     model.eval()
     probabilities = []
     scale_probabilities = []
+    corrected_scale_probabilities = []
     scale_gates = []
     labels = []
     reliability = (
         prototype_bank.scale_class_reliability()
         if prototype_bank is not None
+        else None
+    )
+    prior_adjustment = (
+        target_prior_estimator.logit_adjustment(prior_correction_strength)
+        if target_prior_estimator is not None
         else None
     )
     with torch.no_grad():
@@ -1043,16 +1245,25 @@ def evaluate_trials(
                 mask,
                 compute_domain=False,
                 scale_class_reliability=reliability,
+                class_logit_adjustment=prior_adjustment,
             )
             probabilities.append(output["probability"].cpu().numpy())
             scale_probabilities.append(
                 F.softmax(output["scale_logits"], dim=-1).cpu().numpy()
+            )
+            corrected_scale_probabilities.append(
+                F.softmax(
+                    output["calibrated_scale_logits"], dim=-1
+                ).cpu().numpy()
             )
             scale_gates.append(output["scale_class_weight"].cpu().numpy())
             labels.append(batch["y"].numpy())
     labels_array = np.concatenate(labels)
     probability_array = np.concatenate(probabilities)
     scale_probability_array = np.concatenate(scale_probabilities)
+    corrected_scale_probability_array = np.concatenate(
+        corrected_scale_probabilities
+    )
     gate_array = np.concatenate(scale_gates)
     return {
         "fused": _classification_metrics(labels_array, probability_array),
@@ -1062,7 +1273,26 @@ def evaluate_trials(
             )
             for index, scale in enumerate(model.scales)
         },
+        "by_scale_prior_corrected": {
+            scale_key(scale): _classification_metrics(
+                labels_array, corrected_scale_probability_array[:, index]
+            )
+            for index, scale in enumerate(model.scales)
+        },
         "mean_scale_class_gate": gate_array.mean(axis=0).tolist(),
+        "pyramid_residual_weight": float(
+            torch.sigmoid(model.pyramid_residual_logit.detach()).cpu()
+        ),
+        "estimated_target_prior": (
+            target_prior_estimator.estimated_prior.cpu().tolist()
+            if target_prior_estimator is not None
+            else None
+        ),
+        "prior_logit_adjustment": (
+            prior_adjustment.cpu().tolist()
+            if prior_adjustment is not None
+            else [0.0] * NUM_CLASSES
+        ),
     }
 
 
@@ -1232,6 +1462,8 @@ def run_fold(
         domain_mode=spec.domain_mode,
         detach_domain_probability=True,
         relation_strength=args.relation_strength,
+        pyramid_weight_floor=args.pyramid_weight_floor,
+        pyramid_residual_initial=args.pyramid_residual_initial,
     ).to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     optimizer = torch.optim.AdamW(
@@ -1239,6 +1471,19 @@ def run_fold(
     )
     scheduler = _scheduler(optimizer, iterations, args.warmup_iterations)
     source_class_priors = _natural_source_class_priors(prepared, device)
+    effective_source_class_priors = _effective_source_class_priors(
+        prepared, args.source_balance_alpha, device
+    )
+    target_prior_estimator = TargetPriorEstimator(
+        len(prepared.datasets),
+        len(spec.scales),
+        NUM_CLASSES,
+        effective_source_class_priors.mean(dim=0),
+        device,
+        momentum=args.prior_momentum,
+        ridge=args.prior_ridge,
+        prior_floor=args.prior_floor,
+    )
     prototype_bank = None
     if spec.use_prototypes:
         prototype_bank = PrototypeBank(
@@ -1305,6 +1550,8 @@ def run_fold(
             args.scale_classification_weight,
             args.gate_supervision_weight,
             args.gate_teacher_temperature,
+            target_prior_estimator,
+            args.prior_correction_strength,
         )
         if iteration == 1 or iteration % args.log_interval == 0 or iteration == iterations:
             training_trace.append(record)
@@ -1329,6 +1576,8 @@ def run_fold(
                     f"{spec.name}/seed{seed}/S{subject:02d}"
                 ),
                 prototype_bank,
+                target_prior_estimator,
+                args.prior_correction_strength,
             )
             target_evaluation_trace.append(
                 {"iteration": iteration, "evaluation": candidate_evaluation}
@@ -1377,7 +1626,7 @@ def run_fold(
                 args.target_eval_interval if is_target_selected else None
             ),
             "selected_iteration": selected_iteration,
-            "target_probability_correction": False,
+            "target_probability_correction": True,
         },
         "source_trials": {
             name: len(dataset)
@@ -1389,6 +1638,14 @@ def run_fold(
             name: prior.cpu().tolist()
             for name, prior in zip(
                 prepared.domain_names, source_class_priors, strict=True
+            )
+        },
+        "source_effective_sampling_priors": {
+            name: prior.cpu().tolist()
+            for name, prior in zip(
+                prepared.domain_names,
+                effective_source_class_priors,
+                strict=True,
             )
         },
         "target_subject": subject,
@@ -1408,6 +1665,12 @@ def run_fold(
             "dropout": args.dropout,
             "spatial_topk": args.spatial_topk,
             "relation_strength": args.relation_strength,
+            "pyramid_weight_floor": args.pyramid_weight_floor,
+            "pyramid_residual_initial": args.pyramid_residual_initial,
+            "fusion_output": (
+                "one class-specific feature per emotion, scored by the "
+                "matching classifier row"
+            ),
             "issue_7_independence_boundary": (
                 "scale logits precede all cross-scale context and relation fusion"
             ),
@@ -1432,6 +1695,12 @@ def run_fold(
             "relation_temperature": args.relation_temperature,
             "relation_uniform_mix": args.relation_uniform_mix,
             "relation_strength": args.relation_strength,
+            "pyramid_weight_floor": args.pyramid_weight_floor,
+            "pyramid_residual_initial": args.pyramid_residual_initial,
+            "prior_correction_strength": args.prior_correction_strength,
+            "prior_momentum": args.prior_momentum,
+            "prior_ridge": args.prior_ridge,
+            "prior_floor": args.prior_floor,
             "scale_classification_weight": args.scale_classification_weight,
             "gate_supervision_weight": args.gate_supervision_weight,
             "gate_teacher_temperature": args.gate_teacher_temperature,
@@ -1445,6 +1714,13 @@ def run_fold(
         },
         "final_prototype_bank": (
             prototype_bank.state() if prototype_bank is not None else None
+        ),
+        "final_target_prior_estimator": target_prior_estimator.state(),
+        "final_learned_scale_class_relation_residual": (
+            model.scale_class_relation_residual.detach().cpu().tolist()
+        ),
+        "final_pyramid_residual_weight": float(
+            torch.sigmoid(model.pyramid_residual_logit.detach()).cpu()
         ),
         "training_trace": training_trace,
         "target_evaluation_trace": target_evaluation_trace,
@@ -1492,6 +1768,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--relation-temperature", type=float, default=0.25)
     parser.add_argument("--relation-uniform-mix", type=float, default=0.10)
     parser.add_argument("--relation-strength", type=float, default=1.0)
+    parser.add_argument("--pyramid-weight-floor", type=float, default=0.10)
+    parser.add_argument("--pyramid-residual-initial", type=float, default=0.20)
+    parser.add_argument("--prior-correction-strength", type=float, default=0.50)
+    parser.add_argument("--prior-momentum", type=float, default=0.99)
+    parser.add_argument("--prior-ridge", type=float, default=0.10)
+    parser.add_argument("--prior-floor", type=float, default=0.03)
     parser.add_argument("--scale-classification-weight", type=float, default=0.30)
     parser.add_argument("--gate-supervision-weight", type=float, default=0.10)
     parser.add_argument("--gate-teacher-temperature", type=float, default=0.25)
@@ -1584,6 +1866,18 @@ def validate_args(args, spec: ExperimentSpec) -> None:
         raise ValueError("relation and gate temperatures must be positive")
     if not 0 <= args.relation_uniform_mix <= 1:
         raise ValueError("relation-uniform-mix must be within [0,1]")
+    if not 0 <= args.pyramid_weight_floor < 1:
+        raise ValueError("pyramid-weight-floor must be within [0,1)")
+    if not 0 < args.pyramid_residual_initial < 1:
+        raise ValueError("pyramid-residual-initial must be within (0,1)")
+    if args.prior_correction_strength < 0:
+        raise ValueError("prior-correction-strength must be nonnegative")
+    if not 0 <= args.prior_momentum < 1:
+        raise ValueError("prior-momentum must be within [0,1)")
+    if args.prior_ridge < 0:
+        raise ValueError("prior-ridge must be nonnegative")
+    if not 0 <= args.prior_floor < 1.0 / NUM_CLASSES:
+        raise ValueError("prior-floor must be within [0,1/classes)")
     if min(
         args.relation_strength,
         args.scale_classification_weight,
@@ -1613,8 +1907,9 @@ def main() -> None:
         f"sources={spec.source_domains}; scales={spec.scales}; device={device}"
     )
     tqdm.write(
-        "Method: source-anchored scale-class relation graph; independent "
-        "per-scale logits precede all cross-scale context and fusion"
+        "Method: prior-aware class-conditional weighted feature pyramid; "
+        "independent per-scale logits precede all prior estimation, "
+        "cross-scale context, and fusion"
     )
     if args.evaluation_protocol == EVALUATION_PROTOCOL_CAGA_TARGET_BEST:
         tqdm.write(
@@ -1624,8 +1919,8 @@ def main() -> None:
         )
     else:
         tqdm.write(
-            "Protocol: fixed 1000 iterations, raw fused logits, no checkpoint "
-            "selection, one final target evaluation"
+            "Protocol: fixed 1000 iterations, unlabeled multiscale prior "
+            "correction, no checkpoint selection, one final target evaluation"
         )
     prepared = prepare_sources(args.data_dir, spec.source_domains, spec.scales)
     for seed in args.random_seeds:
