@@ -14,8 +14,8 @@ MPUS_GA/
 ├── scripts/             # nohup-friendly experiment launcher
 ├── tests/               # preprocessing and trial-model tests
 ├── data_processed/      # generated 1 s / 2 s / 4 s NPZ files
-├── results_class_conditional_multiscale/  # exactly A0..A7 and main
-└── logs/class_conditional_multiscale/     # fixed suite + A0..A7 + main logs
+├── results_bidirectional_full_ablation/   # paired A/B ablations and Main
+└── logs/bidirectional_full_ablation/      # 16 experiment logs + suite.log
 ```
 
 The original CAGA-SGA implementation remains in the repository root and is not
@@ -247,7 +247,7 @@ correction strength defaults to zero: the estimate is diagnostic-only and
 cannot change final logits, pseudo-labels, domain alignment, or prototypes.
 This isolation is intentional because direct label-shift inversion was unstable
 under cross-dataset conditional shift. A nonzero correction remains an explicit
-experimental option rather than part of A6/B6 defaults.
+experimental option rather than part of the paired Main defaults.
 
 The same source soft-confusion statistics provide two one-sided cross-scale
 bias signals. The first compares target soft-probability and hard-decision
@@ -311,13 +311,12 @@ over valid pseudo classes, so the negative majority cannot dominate adaptation
 through sample count. This balances optimization contributions without
 forcing the target prediction prior to be uniform.
 
-New fixed-final A6/B6 runs use isolated paths:
+The complete bidirectional fixed-final suite uses isolated paths:
 
 ```text
-results_boundary_reliable_pyramid/A6/
-results_boundary_reliable_pyramid/B6/
-logs/boundary_reliable_pyramid/A6.log
-logs/boundary_reliable_pyramid/B6.log
+results_bidirectional_full_ablation/{A0,B0,...,A6,B6,A_main,B_main}/
+logs/bidirectional_full_ablation/{A0,B0,...,A6,B6,A_main,B_main}.log
+logs/bidirectional_full_ablation/suite.log
 ```
 
 Result JSON files record the source relation matrix, learned 3 x 3 residual,
@@ -342,7 +341,7 @@ iteration 301, after the classifier has completed the source-only adaptation
 warmup. This prevents biased early target predictions from changing later
 fusion weights during warmup.
 
-The final prediction is the argmax of the relation-weighted logits plus the
+The Main final prediction is the argmax of the relation-weighted logits plus the
 small pyramid residual and the jointly bounded source-excess/boundary-attractor
 suppression. No target-prior correction is applied by default. Neither bias
 detector, the final evidence refresh, nor the diagnostic prior estimator
@@ -359,8 +358,9 @@ The comparison protocol remains fixed:
 - training runs for exactly 1000 iterations without validation or checkpoint
   selection;
 - target labels are accessed once for final trial-level evaluation;
-- final predictions use bounded source-excess and boundary-attractor
-  suppression but no target-prior correction;
+- Main final predictions use bounded source-excess and boundary-attractor
+  suppression; each ablation records which component is disabled, and none
+  uses target-prior correction;
 - random seeds 42, 43, and 44 and all target subjects run by default.
 
 ### CAGA-SGA-style target-selected comparison
@@ -380,67 +380,63 @@ target-evaluation trace, the selected iteration, selection criterion, and
 number of target evaluations. Use an isolated result root so these files do
 not overwrite fixed-final results.
 
-For the controlled A6/B6 comparison, keep the experiment tags unchanged and
+For a controlled target-selected comparison, use the paired Main tags and
 change only the evaluation protocol:
 
 ```text
-results_caga_target_selected/A6/
-results_caga_target_selected/B6/
-logs/caga_target_selected/A6.log
-logs/caga_target_selected/B6.log
+results_caga_target_selected/A_main/
+results_caga_target_selected/B_main/
+logs/caga_target_selected/A_main.log
+logs/caga_target_selected/B_main.log
 ```
 
 The formal experiment matrix is:
 
-| Tag | Purpose |
+Every `A`/`B` pair has identical architecture, losses, and hyperparameters;
+only the transfer direction changes. `A` means SEED-VII to SEED-V and `B`
+means SEED-V to SEED-VII.
+
+| Paired tags | Purpose |
 |---|---|
-| A0 / A1 / A2 | 1 s / 2 s / 4 s single-scale baselines with the same class-conditional framework |
-| A3 | naive multiscale attention with fused-only CDAN and no prototype reliability |
-| A4 | multiscale attention with global per-scale alignment and no class prototypes |
-| A5 | class-conditional alignment and prototypes, but uniform 1/2/4 s fusion |
-| A6 / A7 | full multiscale method with only SEED-VII / only SEED-IV as source |
-| main | full two-source, three-scale, class-conditional method |
-| B6 | A6 architecture in the reverse SEED-V to SEED-VII direction |
+| A0 / B0 | 1 s single-scale baseline; cross-scale suppressors are inapplicable |
+| A1 / B1 | 2 s single-scale baseline; cross-scale suppressors are inapplicable |
+| A2 / B2 | 4 s single-scale baseline; cross-scale suppressors are inapplicable |
+| A3 / B3 | uniform 1/2/4 s fusion instead of class-conditional reliability fusion |
+| A4 / B4 | relation-weighted logit fusion with the feature pyramid genuinely absent |
+| A5 / B5 | source-excess suppression retained, boundary-attractor suppression removed |
+| A6 / B6 | both source-excess and boundary-attractor suppression removed |
+| A_main / B_main | complete boundary-reliable class-conditional weighted pyramid |
 
 On CSU, start the complete dual-GPU suite from the `MPUS_GA` directory:
 
 ```bash
-bash scripts/run_main_A0_A7_suite.sh
+bash scripts/run_bidirectional_full_ablation_suite.sh
 ```
 
-The controller detaches itself with `nohup`, then runs two independent queues:
-physical GPU 0 receives `A0 A2 A4 A6 main`, and physical GPU 1 receives
-`A1 A3 A5 A7`. Each GPU starts its next experiment immediately after its own
-current experiment exits; there is no GPU-idle polling. It creates exactly nine
-experiment result directories and ten fixed logs under
-`logs/class_conditional_multiscale/`: `suite.log`, `A0.log` through `A7.log`,
-and `main.log`. A new launch overwrites these ten logs. It writes no PID,
-status, or JSONL side files. Training traces are embedded in each fold's result
-JSON.
+The controller detaches itself with `nohup` and maintains a global FIFO order:
+`A0, B0, A1, B1, ..., A6, B6, A_main, B_main`. Physical GPUs 0 and 1 each
+receive one experiment initially. Whenever either experiment finishes, that
+same GPU receives the next queued experiment after three seconds. Thus at most
+two experiments run concurrently, a faster GPU never waits for the other
+queue, and there is no GPU-idle polling.
+
+The script creates 16 result directories, 16 experiment logs, and one
+`suite.log`. The suite log records each experiment ID, start time, end time,
+and physical GPU. It writes no PID, status, or JSONL side files. A new launch
+overwrites these 17 logs; completed result JSON files are skipped unless
+`OVERWRITE=1` is set.
 
 Override the default fold set when doing a smoke run, for example:
 
 ```bash
 TARGET_SUBJECTS=1 RANDOM_SEEDS="42" \
-  bash scripts/run_main_A0_A7_suite.sh
+  bash scripts/run_bidirectional_full_ablation_suite.sh
 ```
 
-Results are written under
-`results_class_conditional_multiscale/{A0,A1,A2,A3,A4,A5,A6,A7,main}/`.
-Completed folds are skipped by default; set `OVERWRITE=1` on the controller to
-replace them.
-
-B6 is intentionally not part of the dual-GPU suite. It uses the same model and
-optimization settings as A6, but runs 20 SEED-VII target subjects for seeds 42,
-43, and 44 (60 folds). Source normalization is fitted on SEED-V only. Under the
-default `fixed_final` protocol, target labels remain unavailable until the
-single final evaluation; under `caga_target_best`, they are accessed at the
-configured evaluation interval for target-Accuracy model selection. Use a
-separate `--result-root` and log path for each bidirectional comparison run so
-historical `results_seedv2vii/B6/` outputs are not overwritten. The current
-independent-scale/warmup verification run stores A6 and B6 together under
-`results_independent_scale_warmup_fix/{A6,B6}/` and its logs under
-`logs/independent_scale_warmup_fix/`.
+With the defaults, every A experiment contains 3 seeds x 16 subjects = 48
+folds, and every B experiment contains 3 seeds x 20 subjects = 60 folds. The
+complete suite therefore produces 864 fold JSON files. Source normalization is
+always fitted only on the configured source dataset.
 
 ## Signal processing
 

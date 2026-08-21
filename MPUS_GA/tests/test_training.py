@@ -28,6 +28,7 @@ from MPUS_GA.trial_temporal.train import (  # noqa: E402
     TargetPriorEstimator,
     _adaptation_ramp,
     _class_balanced_domain_ce,
+    _gate_supervision_loss,
     _should_evaluate_target,
     _target_evaluation_is_better,
     _target_subjects,
@@ -119,6 +120,44 @@ def test_weighted_pyramid_keeps_one_feature_per_class() -> None:
         (1.0 - residual_weight) * expected_anchor
         + residual_weight * pyramid_logits,
     )
+
+
+def test_feature_pyramid_ablation_uses_only_relation_weighted_logits() -> None:
+    model = _small_model(
+        scales=(1.0, 2.0, 4.0),
+        num_domains=2,
+        use_feature_pyramid=False,
+    )
+    embeddings = torch.randn(4, 3, 32)
+    logits = torch.randn(4, 3, 3)
+    reliability = torch.tensor(
+        [[0.7, 0.2, 0.3], [0.2, 0.7, 0.2], [0.1, 0.1, 0.5]]
+    )
+    (
+        fused_logits,
+        _,
+        class_weight,
+        pyramid_class_weight,
+        _,
+        pyramid_logits,
+        residual_weight,
+    ) = model._fuse(embeddings, logits, reliability)
+    expected = (class_weight * logits).sum(dim=1)
+    torch.testing.assert_close(fused_logits, expected)
+    torch.testing.assert_close(pyramid_logits, expected)
+    torch.testing.assert_close(pyramid_class_weight, class_weight)
+    torch.testing.assert_close(residual_weight, torch.tensor(0.0))
+    assert len(model.pyramid_projections) == 0
+    assert not model.use_feature_pyramid
+
+
+def test_uniform_fusion_has_no_inactive_gate_supervision_constant() -> None:
+    logits = torch.randn(4, 3, 3, requires_grad=True)
+    uniform_weight = torch.full((4, 3, 3), 1.0 / 3.0)
+    loss = _gate_supervision_loss(
+        logits, uniform_weight, torch.tensor([0, 1, 2, 0]), 0.25
+    )
+    torch.testing.assert_close(loss, torch.tensor(0.0))
 
 
 def test_target_prior_estimator_recovers_multiscale_label_shift() -> None:
@@ -603,31 +642,62 @@ def test_prototype_alignment_is_differentiable() -> None:
 def test_experiment_matrix_and_adaptation_schedule() -> None:
     assert EXPERIMENT_ORDER == (
         "A0",
+        "B0",
         "A1",
+        "B1",
         "A2",
+        "B2",
         "A3",
+        "B3",
         "A4",
+        "B4",
         "A5",
+        "B5",
         "A6",
-        "A7",
-        "main",
         "B6",
+        "A_main",
+        "B_main",
     )
     assert set(EXPERIMENTS) == set(EXPERIMENT_ORDER)
     assert EXPERIMENTS["A0"].scales == (1.0,)
     assert EXPERIMENTS["A1"].scales == (2.0,)
     assert EXPERIMENTS["A2"].scales == (4.0,)
-    assert EXPERIMENTS["A3"].domain_mode == "fused_conditional"
-    assert not EXPERIMENTS["A4"].use_prototypes
-    assert EXPERIMENTS["A5"].fusion_mode == "uniform"
-    assert EXPERIMENTS["A6"].source_domains == ("seed_vii",)
-    assert EXPERIMENTS["A7"].source_domains == ("seed_iv",)
+    assert not EXPERIMENTS["A0"].use_feature_pyramid
+    assert EXPERIMENTS["A3"].fusion_mode == "uniform"
+    assert not EXPERIMENTS["A4"].use_feature_pyramid
+    assert EXPERIMENTS["A5"].use_source_excess_suppression
+    assert not EXPERIMENTS["A5"].use_boundary_attractor_suppression
+    assert not EXPERIMENTS["A6"].use_source_excess_suppression
+    assert not EXPERIMENTS["A6"].use_boundary_attractor_suppression
+    assert EXPERIMENTS["A_main"].use_feature_pyramid
+    assert EXPERIMENTS["A_main"].use_source_excess_suppression
+    assert EXPERIMENTS["A_main"].use_boundary_attractor_suppression
+    assert EXPERIMENTS["A_main"].source_domains == ("seed_vii",)
     assert EXPERIMENTS["B6"].source_domains == ("seed_v",)
     assert EXPERIMENTS["B6"].target_dataset == "seed_vii"
     assert EXPERIMENTS["B6"].target_subject_count == 20
     assert EXPERIMENTS["B6"].target_trials == 80
     assert EXPERIMENTS["B6"].scales == EXPERIMENTS["A6"].scales
     assert EXPERIMENTS["B6"].fusion_mode == EXPERIMENTS["A6"].fusion_mode
+    paired_fields = (
+        "ablation",
+        "scales",
+        "fusion_mode",
+        "domain_mode",
+        "use_prototypes",
+        "use_feature_pyramid",
+        "use_source_excess_suppression",
+        "use_boundary_attractor_suppression",
+        "domain_weight",
+        "prototype_weight",
+    )
+    for ablation in (*map(str, range(7)), "main"):
+        a_name = f"A_{ablation}" if ablation == "main" else f"A{ablation}"
+        b_name = f"B_{ablation}" if ablation == "main" else f"B{ablation}"
+        for field in paired_fields:
+            assert getattr(EXPERIMENTS[a_name], field) == getattr(
+                EXPERIMENTS[b_name], field
+            )
     assert _target_subjects("all", 20) == list(range(1, 21))
     assert _adaptation_ramp(300, 300, 600) == 0.0
     assert 0.0 < _adaptation_ramp(450, 300, 600) < 1.0
@@ -832,7 +902,7 @@ def test_target_prototype_updates_start_after_adaptation_warmup() -> None:
             scheduler,
             device,
             iteration=iteration,
-            spec=EXPERIMENTS["B6"],
+            spec=EXPERIMENTS["B_main"],
             source_class_priors=torch.tensor([[0.20, 0.20, 0.60]]),
             prototype_bank=bank,
             label_smoothing=0.1,
@@ -900,7 +970,7 @@ def test_b6_single_source_training_step() -> None:
         scheduler,
         device,
         iteration=600,
-        spec=EXPERIMENTS["B6"],
+        spec=EXPERIMENTS["B_main"],
         source_class_priors=torch.tensor([[0.20, 0.20, 0.60]]),
         prototype_bank=bank,
         label_smoothing=0.1,
