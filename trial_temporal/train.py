@@ -39,8 +39,8 @@ from .model import MultiScaleMultiSourceDANN
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = PACKAGE_DIR / "data_processed"
-DEFAULT_RESULT_ROOT = PACKAGE_DIR / "results_weighted_pyramid_residual_fix"
-VARIANT = "class-conditional-weighted-feature-pyramid-residual-fix"
+DEFAULT_RESULT_ROOT = PACKAGE_DIR / "results_common_bias_suppressed_pyramid"
+VARIANT = "class-conditional-common-bias-suppressed-weighted-pyramid"
 CLASS_NAMES = ("positive", "neutral", "negative")
 EVALUATION_PROTOCOL_FIXED_FINAL = "fixed_final"
 EVALUATION_PROTOCOL_CAGA_TARGET_BEST = "caga_target_best"
@@ -404,6 +404,7 @@ class TargetPriorEstimator:
         class_count: int,
         source_prior: torch.Tensor,
         device: torch.device,
+        natural_source_prior: torch.Tensor | None = None,
         momentum: float = 0.99,
         ridge: float = 0.10,
         prior_floor: float = 0.03,
@@ -423,10 +424,18 @@ class TargetPriorEstimator:
         self.prior_floor = float(prior_floor)
         anchor = source_prior.detach().float().to(device).clamp_min(1e-8)
         self.source_prior = anchor / anchor.sum()
+        natural_anchor = (
+            source_prior if natural_source_prior is None else natural_source_prior
+        )
+        if natural_anchor.shape != (class_count,):
+            raise ValueError("natural_source_prior must be [classes]")
+        natural_anchor = natural_anchor.detach().float().to(device).clamp_min(1e-8)
+        self.natural_source_prior = natural_anchor / natural_anchor.sum()
         identity = torch.eye(class_count, device=device)
         self.source_confusion = identity.view(
             1, 1, class_count, class_count
         ).expand(domain_count, scale_count, -1, -1).clone()
+        self.source_hard_confusion = self.source_confusion.clone()
         self.source_initialized = torch.zeros(
             domain_count,
             scale_count,
@@ -440,6 +449,7 @@ class TargetPriorEstimator:
         self.target_mean_probability = self.source_prior.unsqueeze(0).expand(
             scale_count, -1
         ).clone()
+        self.target_hard_frequency = self.target_mean_probability.clone()
         self.target_initialized = False
         self.target_updates = 0
         self.estimated_prior = self.source_prior.clone()
@@ -452,6 +462,7 @@ class TargetPriorEstimator:
         labels: torch.Tensor,
     ) -> None:
         probability = F.softmax(scale_logits.detach(), dim=-1)
+        hard_prediction = probability.argmax(dim=-1)
         if probability.shape[1:] != self.source_confusion.shape[1:3]:
             raise ValueError("source scale logits do not match prior estimator")
         for class_index in range(self.source_prior.numel()):
@@ -459,6 +470,9 @@ class TargetPriorEstimator:
             if not torch.any(selected):
                 continue
             observation = probability[selected].mean(dim=0)
+            hard_observation = F.one_hot(
+                hard_prediction[selected], num_classes=self.source_prior.numel()
+            ).float().mean(dim=0)
             for scale_index in range(probability.shape[1]):
                 index = (domain_index, scale_index, class_index)
                 column = self.source_confusion[
@@ -468,10 +482,22 @@ class TargetPriorEstimator:
                     column.mul_(self.momentum).add_(
                         observation[scale_index], alpha=1.0 - self.momentum
                     )
+                    hard_column = self.source_hard_confusion[
+                        domain_index, scale_index, :, class_index
+                    ]
+                    hard_column.mul_(self.momentum).add_(
+                        hard_observation[scale_index],
+                        alpha=1.0 - self.momentum,
+                    )
                 else:
                     column.copy_(observation[scale_index])
+                    hard_column = self.source_hard_confusion[
+                        domain_index, scale_index, :, class_index
+                    ]
+                    hard_column.copy_(hard_observation[scale_index])
                     self.source_initialized[index] = True
                 column.div_(column.sum().clamp_min(1e-8))
+                hard_column.div_(hard_column.sum().clamp_min(1e-8))
                 self.source_updates[index] += 1
 
     @torch.no_grad()
@@ -480,12 +506,19 @@ class TargetPriorEstimator:
         if probability.shape[1:] != self.target_mean_probability.shape:
             raise ValueError("target scale logits do not match prior estimator")
         observation = probability.mean(dim=0)
+        hard_observation = F.one_hot(
+            probability.argmax(dim=-1), num_classes=self.source_prior.numel()
+        ).float().mean(dim=0)
         if self.target_initialized:
             self.target_mean_probability.mul_(self.momentum).add_(
                 observation, alpha=1.0 - self.momentum
             )
+            self.target_hard_frequency.mul_(self.momentum).add_(
+                hard_observation, alpha=1.0 - self.momentum
+            )
         else:
             self.target_mean_probability.copy_(observation)
+            self.target_hard_frequency.copy_(hard_observation)
             self.target_initialized = True
         self.target_updates += 1
         self._solve()
@@ -517,14 +550,132 @@ class TargetPriorEstimator:
         return float(strength) * ratio.clamp(-2.0, 2.0)
 
     @torch.no_grad()
+    def source_prediction_reference(self) -> torch.Tensor:
+        """Expected per-scale predictions under the natural source prior."""
+
+        confusion = self.source_confusion.mean(dim=0)
+        return torch.einsum(
+            "spk,k->sp", confusion, self.natural_source_prior
+        ).clamp_min(1e-8)
+
+    @torch.no_grad()
+    def source_class_precision(self) -> torch.Tensor:
+        """Per-scale/class source precision implied by soft confusion."""
+
+        confusion = self.source_confusion.mean(dim=0)
+        true_positive_mass = torch.diagonal(
+            confusion, dim1=1, dim2=2
+        ) * self.natural_source_prior.unsqueeze(0)
+        return (
+            true_positive_mass / self.source_prediction_reference()
+        ).clamp(0.0, 1.0)
+
+    @torch.no_grad()
+    def source_hard_prediction_reference(self) -> torch.Tensor:
+        """Expected per-scale hard-vote rates under the natural source prior."""
+
+        confusion = self.source_hard_confusion.mean(dim=0)
+        return torch.einsum(
+            "spk,k->sp", confusion, self.natural_source_prior
+        ).clamp_min(1e-8)
+
+    @torch.no_grad()
+    def source_hard_class_precision(self) -> torch.Tensor:
+        """Per-scale/class source precision of independent hard decisions."""
+
+        confusion = self.source_hard_confusion.mean(dim=0)
+        true_positive_mass = torch.diagonal(
+            confusion, dim1=1, dim2=2
+        ) * self.natural_source_prior.unsqueeze(0)
+        return (
+            true_positive_mass / self.source_hard_prediction_reference()
+        ).clamp(0.0, 1.0)
+
+    @torch.no_grad()
+    def common_bias_adjustment(
+        self,
+        strength: float,
+        relative_tolerance: float,
+        maximum_adjustment: float,
+    ) -> torch.Tensor:
+        """Return a bounded, one-sided penalty for shared scale bias.
+
+        A class is suppressed only when at least half of the independent
+        scales exceed their source-calibrated prediction reference. The
+        excess is weighted by source false-positive risk, so a reliable class
+        is protected while a class that commonly attracts false positives is
+        penalized. No fused prediction or target label enters this estimate.
+        """
+
+        if strength < 0:
+            raise ValueError("common-bias strength must be nonnegative")
+        if relative_tolerance < 0:
+            raise ValueError("common-bias tolerance must be nonnegative")
+        if maximum_adjustment < 0:
+            raise ValueError("maximum common-bias adjustment must be nonnegative")
+        adjustment = torch.zeros_like(self.source_prior)
+        if (
+            strength == 0
+            or maximum_adjustment == 0
+            or not self.target_initialized
+            or self.target_mean_probability.shape[0] < 2
+            or not bool(self.source_initialized.all())
+        ):
+            return adjustment
+        soft_reference = self.source_prediction_reference()
+        soft_log_excess = (
+            torch.log(self.target_mean_probability.clamp_min(1e-8))
+            - torch.log(soft_reference)
+            - math.log1p(relative_tolerance)
+        ).clamp_min(0.0)
+        hard_reference = self.source_hard_prediction_reference()
+        hard_log_excess = (
+            torch.log(self.target_hard_frequency.clamp_min(1e-8))
+            - torch.log(hard_reference)
+            - math.log1p(relative_tolerance)
+        ).clamp_min(0.0)
+        log_excess = torch.maximum(soft_log_excess, hard_log_excess)
+        # For three scales the median is positive only if at least two scales
+        # report excess evidence. This rejects a single noisy temporal scale.
+        common_excess = log_excess.median(dim=0).values
+        precision = 0.5 * (
+            self.source_class_precision()
+            + self.source_hard_class_precision()
+        )
+        false_positive_risk = 1.0 - precision.mean(dim=0)
+        penalty = float(strength) * false_positive_risk * common_excess
+        return -penalty.clamp(max=float(maximum_adjustment))
+
+    @torch.no_grad()
     def state(self) -> dict:
         return {
             "source_prior_anchor": self.source_prior.cpu().tolist(),
+            "natural_source_prior_anchor": (
+                self.natural_source_prior.cpu().tolist()
+            ),
             "estimated_target_prior": self.estimated_prior.cpu().tolist(),
             "target_mean_probability_by_scale": (
                 self.target_mean_probability.cpu().tolist()
             ),
+            "target_hard_frequency_by_scale": (
+                self.target_hard_frequency.cpu().tolist()
+            ),
             "source_soft_confusion": self.source_confusion.cpu().tolist(),
+            "source_hard_confusion": (
+                self.source_hard_confusion.cpu().tolist()
+            ),
+            "source_prediction_reference_by_scale": (
+                self.source_prediction_reference().cpu().tolist()
+            ),
+            "source_class_precision_by_scale": (
+                self.source_class_precision().cpu().tolist()
+            ),
+            "source_hard_prediction_reference_by_scale": (
+                self.source_hard_prediction_reference().cpu().tolist()
+            ),
+            "source_hard_class_precision_by_scale": (
+                self.source_hard_class_precision().cpu().tolist()
+            ),
             "source_initialized": self.source_initialized.cpu().tolist(),
             "source_updates": self.source_updates.cpu().tolist(),
             "target_updates": self.target_updates,
@@ -935,6 +1086,9 @@ def train_step(
     gate_teacher_temperature: float = 0.25,
     target_prior_estimator: TargetPriorEstimator | None = None,
     prior_correction_strength: float = 0.0,
+    common_bias_strength: float = 2.0,
+    common_bias_relative_tolerance: float = 0.10,
+    common_bias_max_adjustment: float = 0.50,
 ) -> dict:
     if "y" in target_batch:
         raise RuntimeError("Target adaptation batch unexpectedly contains labels")
@@ -958,6 +1112,26 @@ def train_step(
         and ramp > 0
         else None
     )
+    common_bias_adjustment = (
+        target_prior_estimator.common_bias_adjustment(
+            common_bias_strength * ramp,
+            common_bias_relative_tolerance,
+            common_bias_max_adjustment,
+        )
+        if target_prior_estimator is not None
+        and common_bias_strength > 0
+        and ramp > 0
+        else None
+    )
+    target_logit_adjustment = None
+    if prior_adjustment is not None or common_bias_adjustment is not None:
+        target_logit_adjustment = torch.zeros(
+            NUM_CLASSES, device=device, dtype=torch.float32
+        )
+        if prior_adjustment is not None:
+            target_logit_adjustment.add_(prior_adjustment)
+        if common_bias_adjustment is not None:
+            target_logit_adjustment.add_(common_bias_adjustment)
     source_outputs = []
     source_labels = []
     for batch in source_batches:
@@ -978,7 +1152,7 @@ def train_step(
         target_mask,
         grl_alpha=ramp,
         scale_class_reliability=reliability,
-        class_logit_adjustment=prior_adjustment,
+        class_logit_adjustment=target_logit_adjustment,
     )
 
     target_consensus = independent_scale_consensus(
@@ -1167,6 +1341,16 @@ def train_step(
             if prior_adjustment is not None
             else [0.0] * NUM_CLASSES
         )
+        record["common_bias_logit_adjustment"] = (
+            common_bias_adjustment.cpu().tolist()
+            if common_bias_adjustment is not None
+            else [0.0] * NUM_CLASSES
+        )
+        record["target_logit_adjustment"] = (
+            target_logit_adjustment.detach().cpu().tolist()
+            if target_logit_adjustment is not None
+            else [0.0] * NUM_CLASSES
+        )
     if prototype_bank is not None:
         record["joint_source_scale_class_weights"] = (
             prototype_bank.joint_weights().cpu().tolist()
@@ -1220,6 +1404,9 @@ def evaluate_trials(
     prototype_bank: PrototypeBank | None,
     target_prior_estimator: TargetPriorEstimator | None = None,
     prior_correction_strength: float = 0.0,
+    common_bias_strength: float = 2.0,
+    common_bias_relative_tolerance: float = 0.10,
+    common_bias_max_adjustment: float = 0.50,
 ) -> dict:
     model.eval()
     probabilities = []
@@ -1239,6 +1426,24 @@ def evaluate_trials(
         and prior_correction_strength > 0
         else None
     )
+    common_bias_adjustment = (
+        target_prior_estimator.common_bias_adjustment(
+            common_bias_strength,
+            common_bias_relative_tolerance,
+            common_bias_max_adjustment,
+        )
+        if target_prior_estimator is not None and common_bias_strength > 0
+        else None
+    )
+    target_logit_adjustment = None
+    if prior_adjustment is not None or common_bias_adjustment is not None:
+        target_logit_adjustment = torch.zeros(
+            NUM_CLASSES, device=device, dtype=torch.float32
+        )
+        if prior_adjustment is not None:
+            target_logit_adjustment.add_(prior_adjustment)
+        if common_bias_adjustment is not None:
+            target_logit_adjustment.add_(common_bias_adjustment)
     with torch.no_grad():
         for batch in tqdm(
             loader,
@@ -1255,7 +1460,7 @@ def evaluate_trials(
                 mask,
                 compute_domain=False,
                 scale_class_reliability=reliability,
-                class_logit_adjustment=prior_adjustment,
+                class_logit_adjustment=target_logit_adjustment,
             )
             probabilities.append(output["probability"].cpu().numpy())
             scale_probabilities.append(
@@ -1287,7 +1492,7 @@ def evaluate_trials(
             )
             for index, scale in enumerate(model.scales)
         },
-        "by_scale_prior_corrected": {
+        "by_scale_adjusted": {
             scale_key(scale): _classification_metrics(
                 labels_array, corrected_scale_probability_array[:, index]
             )
@@ -1309,6 +1514,38 @@ def evaluate_trials(
             prior_adjustment.cpu().tolist()
             if prior_adjustment is not None
             else [0.0] * NUM_CLASSES
+        ),
+        "common_bias_logit_adjustment": (
+            common_bias_adjustment.cpu().tolist()
+            if common_bias_adjustment is not None
+            else [0.0] * NUM_CLASSES
+        ),
+        "target_logit_adjustment": (
+            target_logit_adjustment.cpu().tolist()
+            if target_logit_adjustment is not None
+            else [0.0] * NUM_CLASSES
+        ),
+        "source_prediction_reference_by_scale": (
+            target_prior_estimator.source_prediction_reference().cpu().tolist()
+            if target_prior_estimator is not None
+            else None
+        ),
+        "source_class_precision_by_scale": (
+            target_prior_estimator.source_class_precision().cpu().tolist()
+            if target_prior_estimator is not None
+            else None
+        ),
+        "source_hard_prediction_reference_by_scale": (
+            target_prior_estimator.source_hard_prediction_reference()
+            .cpu()
+            .tolist()
+            if target_prior_estimator is not None
+            else None
+        ),
+        "source_hard_class_precision_by_scale": (
+            target_prior_estimator.source_hard_class_precision().cpu().tolist()
+            if target_prior_estimator is not None
+            else None
         ),
     }
 
@@ -1497,6 +1734,7 @@ def run_fold(
         NUM_CLASSES,
         effective_source_class_priors.mean(dim=0),
         device,
+        natural_source_prior=source_class_priors.mean(dim=0),
         momentum=args.prior_momentum,
         ridge=args.prior_ridge,
         prior_floor=args.prior_floor,
@@ -1569,6 +1807,9 @@ def run_fold(
             args.gate_teacher_temperature,
             target_prior_estimator,
             args.prior_correction_strength,
+            args.common_bias_strength,
+            args.common_bias_relative_tolerance,
+            args.common_bias_max_adjustment,
         )
         if iteration == 1 or iteration % args.log_interval == 0 or iteration == iterations:
             training_trace.append(record)
@@ -1595,6 +1836,9 @@ def run_fold(
                 prototype_bank,
                 target_prior_estimator,
                 args.prior_correction_strength,
+                args.common_bias_strength,
+                args.common_bias_relative_tolerance,
+                args.common_bias_max_adjustment,
             )
             target_evaluation_trace.append(
                 {"iteration": iteration, "evaluation": candidate_evaluation}
@@ -1645,6 +1889,11 @@ def run_fold(
             "selected_iteration": selected_iteration,
             "target_probability_correction": (
                 args.prior_correction_strength > 0
+                or args.common_bias_strength > 0
+            ),
+            "target_prior_correction": args.prior_correction_strength > 0,
+            "cross_scale_common_bias_suppression": (
+                args.common_bias_strength > 0
             ),
         },
         "source_trials": {
@@ -1717,6 +1966,13 @@ def run_fold(
             "pyramid_weight_floor": args.pyramid_weight_floor,
             "pyramid_residual_initial": args.pyramid_residual_initial,
             "prior_correction_strength": args.prior_correction_strength,
+            "common_bias_strength": args.common_bias_strength,
+            "common_bias_relative_tolerance": (
+                args.common_bias_relative_tolerance
+            ),
+            "common_bias_max_adjustment": (
+                args.common_bias_max_adjustment
+            ),
             "prior_momentum": args.prior_momentum,
             "prior_ridge": args.prior_ridge,
             "prior_floor": args.prior_floor,
@@ -1790,6 +2046,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pyramid-weight-floor", type=float, default=0.10)
     parser.add_argument("--pyramid-residual-initial", type=float, default=0.05)
     parser.add_argument("--prior-correction-strength", type=float, default=0.0)
+    parser.add_argument("--common-bias-strength", type=float, default=2.0)
+    parser.add_argument(
+        "--common-bias-relative-tolerance", type=float, default=0.10
+    )
+    parser.add_argument(
+        "--common-bias-max-adjustment", type=float, default=0.50
+    )
     parser.add_argument("--prior-momentum", type=float, default=0.99)
     parser.add_argument("--prior-ridge", type=float, default=0.10)
     parser.add_argument("--prior-floor", type=float, default=0.03)
@@ -1891,6 +2154,12 @@ def validate_args(args, spec: ExperimentSpec) -> None:
         raise ValueError("pyramid-residual-initial must be within (0,1)")
     if args.prior_correction_strength < 0:
         raise ValueError("prior-correction-strength must be nonnegative")
+    if min(
+        args.common_bias_strength,
+        args.common_bias_relative_tolerance,
+        args.common_bias_max_adjustment,
+    ) < 0:
+        raise ValueError("common-bias parameters must be nonnegative")
     if not 0 <= args.prior_momentum < 1:
         raise ValueError("prior-momentum must be within [0,1)")
     if args.prior_ridge < 0:
@@ -1927,8 +2196,9 @@ def main() -> None:
     )
     tqdm.write(
         "Method: relation-weighted logit anchor plus class-conditional "
-        "weighted feature pyramid; independent per-scale logits precede all "
-        "diagnostic prior estimation, cross-scale context, and fusion"
+        "weighted feature pyramid and source-calibrated common-bias "
+        "suppression; independent per-scale logits precede all bias "
+        "estimation, cross-scale context, and fusion"
     )
     if args.evaluation_protocol == EVALUATION_PROTOCOL_CAGA_TARGET_BEST:
         tqdm.write(
@@ -1938,7 +2208,8 @@ def main() -> None:
         )
     else:
         tqdm.write(
-            "Protocol: fixed 1000 iterations, diagnostic-only target-prior "
+            "Protocol: fixed 1000 iterations, source-calibrated cross-scale "
+            "common-bias suppression, diagnostic-only target-prior "
             "estimation, no checkpoint selection, one final target evaluation"
         )
     prepared = prepare_sources(args.data_dir, spec.source_domains, spec.scales)

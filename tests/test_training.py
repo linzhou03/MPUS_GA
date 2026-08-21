@@ -154,6 +154,74 @@ def test_target_prior_estimator_recovers_multiscale_label_shift() -> None:
     assert abs(float(adjustment[2])) < 1e-4
 
 
+def test_common_bias_suppression_requires_shared_excess_and_false_positive_risk() -> None:
+    estimator = TargetPriorEstimator(
+        domain_count=1,
+        scale_count=3,
+        class_count=3,
+        source_prior=torch.tensor([0.25, 0.25, 0.50]),
+        natural_source_prior=torch.tensor([0.20, 0.20, 0.60]),
+        device=torch.device("cpu"),
+        momentum=0.0,
+    )
+    soft_confusion = torch.tensor(
+        [
+            [0.80, 0.10, 0.10],
+            [0.10, 0.70, 0.30],
+            [0.10, 0.20, 0.60],
+        ]
+    )
+    estimator.source_confusion[0] = soft_confusion.unsqueeze(0).expand(3, -1, -1)
+    estimator.source_hard_confusion[0] = soft_confusion.unsqueeze(0).expand(
+        3, -1, -1
+    )
+    estimator.source_initialized.fill_(True)
+    estimator.target_initialized = True
+    estimator.target_mean_probability.copy_(
+        torch.tensor(
+            [
+                [0.20, 0.50, 0.30],
+                [0.20, 0.50, 0.30],
+                [0.30, 0.30, 0.40],
+            ]
+        )
+    )
+    estimator.target_hard_frequency.copy_(estimator.target_mean_probability)
+    adjustment = estimator.common_bias_adjustment(2.0, 0.10, 0.50)
+    assert adjustment[1] < 0
+    assert adjustment[0] == 0
+    assert adjustment[2] == 0
+    assert adjustment.min() >= -0.50
+
+    # A single noisy scale cannot trigger the median cross-scale detector.
+    estimator.target_mean_probability.copy_(
+        torch.tensor(
+            [
+                [0.20, 0.50, 0.30],
+                [0.25, 0.30, 0.45],
+                [0.25, 0.30, 0.45],
+            ]
+        )
+    )
+    estimator.target_hard_frequency.copy_(estimator.target_mean_probability)
+    isolated = estimator.common_bias_adjustment(2.0, 0.10, 0.50)
+    torch.testing.assert_close(isolated, torch.zeros(3))
+
+    # Common low-confidence hard decisions are caught even when mean soft
+    # probabilities stay below the excess threshold.
+    estimator.target_hard_frequency.copy_(
+        torch.tensor(
+            [
+                [0.20, 0.50, 0.30],
+                [0.20, 0.50, 0.30],
+                [0.30, 0.30, 0.40],
+            ]
+        )
+    )
+    hard_vote_bias = estimator.common_bias_adjustment(2.0, 0.10, 0.50)
+    assert hard_vote_bias[1] < 0
+
+
 def test_scale_logits_are_independent_before_cross_scale_context() -> None:
     model = _small_model(scales=(1.0, 2.0), num_domains=2)
     model.eval()
@@ -536,6 +604,7 @@ def test_multiscale_relation_graph_train_step_updates_class_edges() -> None:
     assert record["prototype_updates_active"]
     assert "estimated_target_prior" in record
     assert record["prior_logit_adjustment"] == [0.0, 0.0, 0.0]
+    assert record["common_bias_logit_adjustment"] == [0.0, 0.0, 0.0]
     assert prior.source_initialized.all()
     assert prior.target_updates == 1
 
