@@ -250,6 +250,33 @@ The comparison protocol remains fixed:
 - final predictions use uncorrected raw fused logits;
 - random seeds 42, 43, and 44 and all target subjects run by default.
 
+### CAGA-SGA-style target-selected comparison
+
+The optional `--evaluation-protocol caga_target_best` mode reproduces the
+model-selection paradigm of the public CAGA-SGA code while leaving this
+project's model, data, losses, optimizer, and 1000-iteration training budget
+unchanged. It evaluates the complete labeled target subject every 50
+iterations by default and reports the candidate with the highest target
+Accuracy. A tie retains the earlier candidate, matching CAGA-SGA's strict
+`val_acc > best_val_acc` update rule.
+
+This mode deliberately uses target labels for model selection. They still do
+not enter the adaptation batches, losses, or gradients, but the reported score
+is not a label-blind fixed-final UDA result. Each result JSON records the full
+target-evaluation trace, the selected iteration, selection criterion, and
+number of target evaluations. Use an isolated result root so these files do
+not overwrite fixed-final results.
+
+For the controlled A6/B6 comparison, keep the experiment tags unchanged and
+change only the evaluation protocol:
+
+```text
+results_caga_target_selected/A6/
+results_caga_target_selected/B6/
+logs/caga_target_selected/A6.log
+logs/caga_target_selected/B6.log
+```
+
 The formal experiment matrix is:
 
 | Tag | Purpose |
@@ -292,9 +319,11 @@ replace them.
 
 B6 is intentionally not part of the dual-GPU suite. It uses the same model and
 optimization settings as A6, but runs 20 SEED-VII target subjects for seeds 42,
-43, and 44 (60 folds). Source normalization is fitted on SEED-V only; target
-labels remain unavailable until the single final evaluation of each fold. Use
-a separate `--result-root` and log path for each bidirectional comparison run so
+43, and 44 (60 folds). Source normalization is fitted on SEED-V only. Under the
+default `fixed_final` protocol, target labels remain unavailable until the
+single final evaluation; under `caga_target_best`, they are accessed at the
+configured evaluation interval for target-Accuracy model selection. Use a
+separate `--result-root` and log path for each bidirectional comparison run so
 historical `results_seedv2vii/B6/` outputs are not overwritten. The current
 independent-scale/warmup verification run stores A6 and B6 together under
 `results_independent_scale_warmup_fix/{A6,B6}/` and its logs under

@@ -20,10 +20,14 @@ from MPUS_GA.trial_temporal.model import (  # noqa: E402
     MultiScaleMultiSourceDANN,
 )
 from MPUS_GA.trial_temporal.train import (  # noqa: E402
+    EVALUATION_PROTOCOL_CAGA_TARGET_BEST,
+    EVALUATION_PROTOCOL_FIXED_FINAL,
     EXPERIMENT_ORDER,
     EXPERIMENTS,
     PrototypeBank,
     _adaptation_ramp,
+    _should_evaluate_target,
+    _target_evaluation_is_better,
     _target_subjects,
     train_step,
 )
@@ -202,6 +206,35 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
     assert _adaptation_ramp(300, 300, 600) == 0.0
     assert 0.0 < _adaptation_ramp(450, 300, 600) < 1.0
     assert _adaptation_ramp(600, 300, 600) == 1.0
+
+
+def test_target_evaluation_schedule_keeps_fixed_and_caga_protocols_separate() -> None:
+    assert not _should_evaluate_target(
+        EVALUATION_PROTOCOL_FIXED_FINAL, 50, 1000, 50
+    )
+    assert _should_evaluate_target(
+        EVALUATION_PROTOCOL_FIXED_FINAL, 1000, 1000, 50
+    )
+    assert _should_evaluate_target(
+        EVALUATION_PROTOCOL_CAGA_TARGET_BEST, 50, 1000, 50
+    )
+    assert not _should_evaluate_target(
+        EVALUATION_PROTOCOL_CAGA_TARGET_BEST, 51, 1000, 50
+    )
+    assert _should_evaluate_target(
+        EVALUATION_PROTOCOL_CAGA_TARGET_BEST, 1000, 1000, 50
+    )
+
+
+def test_caga_target_selection_uses_accuracy_and_retains_earliest_tie() -> None:
+    incumbent = {"fused": {"accuracy": 0.6, "balanced_accuracy": 0.7}}
+    lower_accuracy = {"fused": {"accuracy": 0.59, "balanced_accuracy": 0.9}}
+    tied_accuracy = {"fused": {"accuracy": 0.6, "balanced_accuracy": 0.8}}
+    higher_accuracy = {"fused": {"accuracy": 0.61, "balanced_accuracy": 0.5}}
+    assert _target_evaluation_is_better(incumbent, None)
+    assert not _target_evaluation_is_better(lower_accuracy, incumbent)
+    assert not _target_evaluation_is_better(tied_accuracy, incumbent)
+    assert _target_evaluation_is_better(higher_accuracy, incumbent)
 
 
 def test_full_train_step_uses_unlabeled_target_and_updates_bank() -> None:
