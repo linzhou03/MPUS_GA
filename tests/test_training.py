@@ -75,7 +75,7 @@ def test_class_conditional_fusion_uses_external_scale_class_reliability() -> Non
     embeddings = torch.randn(3, 2, 32)
     logits = torch.randn(3, 2, 3)
     reliability = torch.tensor([[0.9, 0.2, 0.5], [0.1, 0.8, 0.5]])
-    _, _, class_weight, _, _, _ = model._fuse(
+    _, _, class_weight, _, _, _, _ = model._fuse(
         embeddings, logits, reliability
     )
     torch.testing.assert_close(
@@ -96,6 +96,7 @@ def test_weighted_pyramid_keeps_one_feature_per_class() -> None:
         fused_logits,
         fused_embedding,
         class_weight,
+        pyramid_class_weight,
         class_features,
         pyramid_logits,
         residual_weight,
@@ -103,10 +104,20 @@ def test_weighted_pyramid_keeps_one_feature_per_class() -> None:
     assert fused_logits.shape == (4, 3)
     assert fused_embedding.shape == (4, 32)
     assert class_weight.shape == (4, 3, 3)
+    assert pyramid_class_weight.shape == (4, 3, 3)
     assert class_features.shape == (4, 3, 32)
     assert pyramid_logits.shape == (4, 3)
     torch.testing.assert_close(class_weight.sum(dim=1), torch.ones(4, 3))
-    torch.testing.assert_close(residual_weight, torch.tensor(0.2))
+    torch.testing.assert_close(
+        pyramid_class_weight.sum(dim=1), torch.ones(4, 3)
+    )
+    torch.testing.assert_close(residual_weight, torch.tensor(0.05))
+    expected_anchor = (class_weight * logits).sum(dim=1)
+    torch.testing.assert_close(
+        fused_logits,
+        (1.0 - residual_weight) * expected_anchor
+        + residual_weight * pyramid_logits,
+    )
 
 
 def test_target_prior_estimator_recovers_multiscale_label_shift() -> None:
@@ -524,6 +535,7 @@ def test_multiscale_relation_graph_train_step_updates_class_edges() -> None:
     assert record["gate_supervision"] >= 0
     assert record["prototype_updates_active"]
     assert "estimated_target_prior" in record
+    assert record["prior_logit_adjustment"] == [0.0, 0.0, 0.0]
     assert prior.source_initialized.all()
     assert prior.target_updates == 1
 

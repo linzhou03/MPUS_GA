@@ -39,8 +39,8 @@ from .model import MultiScaleMultiSourceDANN
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = PACKAGE_DIR / "data_processed"
-DEFAULT_RESULT_ROOT = PACKAGE_DIR / "results_prior_aware_weighted_pyramid"
-VARIANT = "prior-aware-class-conditional-weighted-feature-pyramid"
+DEFAULT_RESULT_ROOT = PACKAGE_DIR / "results_weighted_pyramid_residual_fix"
+VARIANT = "class-conditional-weighted-feature-pyramid-residual-fix"
 CLASS_NAMES = ("positive", "neutral", "negative")
 EVALUATION_PROTOCOL_FIXED_FINAL = "fixed_final"
 EVALUATION_PROTOCOL_CAGA_TARGET_BEST = "caga_target_best"
@@ -934,7 +934,7 @@ def train_step(
     gate_supervision_weight: float = 0.10,
     gate_teacher_temperature: float = 0.25,
     target_prior_estimator: TargetPriorEstimator | None = None,
-    prior_correction_strength: float = 0.50,
+    prior_correction_strength: float = 0.0,
 ) -> dict:
     if "y" in target_batch:
         raise RuntimeError("Target adaptation batch unexpectedly contains labels")
@@ -954,6 +954,8 @@ def train_step(
             prior_correction_strength * ramp
         )
         if target_prior_estimator is not None
+        and prior_correction_strength > 0
+        and ramp > 0
         else None
     )
     source_outputs = []
@@ -1105,6 +1107,9 @@ def train_step(
         source_weights = prototype_bank.source_weights(source_class_priors)
 
     mean_gate = target_output["scale_class_weight"].detach().mean(dim=0)
+    mean_pyramid_gate = target_output[
+        "pyramid_scale_class_weight"
+    ].detach().mean(dim=0)
     consensus_statistics = target_consensus.statistics(NUM_CLASSES)
     if not adaptation_active:
         consensus_statistics["active_class_counts"] = [0] * NUM_CLASSES
@@ -1141,6 +1146,9 @@ def train_step(
         "target_scale_consensus": consensus_statistics,
         "source_weights": [float(value) for value in source_weights.detach()],
         "mean_target_scale_class_gate": mean_gate.cpu().tolist(),
+        "mean_target_pyramid_scale_class_gate": (
+            mean_pyramid_gate.cpu().tolist()
+        ),
         "pyramid_residual_weight": float(
             target_output["pyramid_residual_weight"].detach()
         ),
@@ -1211,13 +1219,14 @@ def evaluate_trials(
     description: str,
     prototype_bank: PrototypeBank | None,
     target_prior_estimator: TargetPriorEstimator | None = None,
-    prior_correction_strength: float = 0.50,
+    prior_correction_strength: float = 0.0,
 ) -> dict:
     model.eval()
     probabilities = []
     scale_probabilities = []
     corrected_scale_probabilities = []
     scale_gates = []
+    pyramid_scale_gates = []
     labels = []
     reliability = (
         prototype_bank.scale_class_reliability()
@@ -1227,6 +1236,7 @@ def evaluate_trials(
     prior_adjustment = (
         target_prior_estimator.logit_adjustment(prior_correction_strength)
         if target_prior_estimator is not None
+        and prior_correction_strength > 0
         else None
     )
     with torch.no_grad():
@@ -1257,6 +1267,9 @@ def evaluate_trials(
                 ).cpu().numpy()
             )
             scale_gates.append(output["scale_class_weight"].cpu().numpy())
+            pyramid_scale_gates.append(
+                output["pyramid_scale_class_weight"].cpu().numpy()
+            )
             labels.append(batch["y"].numpy())
     labels_array = np.concatenate(labels)
     probability_array = np.concatenate(probabilities)
@@ -1265,6 +1278,7 @@ def evaluate_trials(
         corrected_scale_probabilities
     )
     gate_array = np.concatenate(scale_gates)
+    pyramid_gate_array = np.concatenate(pyramid_scale_gates)
     return {
         "fused": _classification_metrics(labels_array, probability_array),
         "by_scale": {
@@ -1280,6 +1294,9 @@ def evaluate_trials(
             for index, scale in enumerate(model.scales)
         },
         "mean_scale_class_gate": gate_array.mean(axis=0).tolist(),
+        "mean_pyramid_scale_class_gate": (
+            pyramid_gate_array.mean(axis=0).tolist()
+        ),
         "pyramid_residual_weight": float(
             torch.sigmoid(model.pyramid_residual_logit.detach()).cpu()
         ),
@@ -1626,7 +1643,9 @@ def run_fold(
                 args.target_eval_interval if is_target_selected else None
             ),
             "selected_iteration": selected_iteration,
-            "target_probability_correction": True,
+            "target_probability_correction": (
+                args.prior_correction_strength > 0
+            ),
         },
         "source_trials": {
             name: len(dataset)
@@ -1769,8 +1788,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--relation-uniform-mix", type=float, default=0.10)
     parser.add_argument("--relation-strength", type=float, default=1.0)
     parser.add_argument("--pyramid-weight-floor", type=float, default=0.10)
-    parser.add_argument("--pyramid-residual-initial", type=float, default=0.20)
-    parser.add_argument("--prior-correction-strength", type=float, default=0.50)
+    parser.add_argument("--pyramid-residual-initial", type=float, default=0.05)
+    parser.add_argument("--prior-correction-strength", type=float, default=0.0)
     parser.add_argument("--prior-momentum", type=float, default=0.99)
     parser.add_argument("--prior-ridge", type=float, default=0.10)
     parser.add_argument("--prior-floor", type=float, default=0.03)
@@ -1907,9 +1926,9 @@ def main() -> None:
         f"sources={spec.source_domains}; scales={spec.scales}; device={device}"
     )
     tqdm.write(
-        "Method: prior-aware class-conditional weighted feature pyramid; "
-        "independent per-scale logits precede all prior estimation, "
-        "cross-scale context, and fusion"
+        "Method: relation-weighted logit anchor plus class-conditional "
+        "weighted feature pyramid; independent per-scale logits precede all "
+        "diagnostic prior estimation, cross-scale context, and fusion"
     )
     if args.evaluation_protocol == EVALUATION_PROTOCOL_CAGA_TARGET_BEST:
         tqdm.write(
@@ -1919,8 +1938,8 @@ def main() -> None:
         )
     else:
         tqdm.write(
-            "Protocol: fixed 1000 iterations, unlabeled multiscale prior "
-            "correction, no checkpoint selection, one final target evaluation"
+            "Protocol: fixed 1000 iterations, diagnostic-only target-prior "
+            "estimation, no checkpoint selection, one final target evaluation"
         )
     prepared = prepare_sources(args.data_dir, spec.source_domains, spec.scales)
     for seed in args.random_seeds:
