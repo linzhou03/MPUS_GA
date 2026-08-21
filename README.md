@@ -210,7 +210,7 @@ aligned 1 s / 2 s / 4 s DE sequences [T,62,5]
   -> sample-dependent weights for each scale x emotion-class edge
   -> one weighted pyramid feature for each emotion class
   -> stable residual with the relation-weighted logit fusion
-  -> source-calibrated cross-scale common-bias suppression
+  -> source-excess and cross-scale boundary-attractor suppression
   -> one final-logit trial prediction
 ```
 
@@ -249,19 +249,32 @@ This isolation is intentional because direct label-shift inversion was unstable
 under cross-dataset conditional shift. A nonzero correction remains an explicit
 experimental option rather than part of A6/B6 defaults.
 
-The same source soft-confusion statistics provide a separate, one-sided
-cross-scale common-bias suppressor. For each scale and class, the expected
-soft-probability and hard-decision rates under the natural source prior, plus
-their corresponding source precision, are computed. Raw target probabilities
-and hard-vote frequencies maintain separate EMAs for 1 s, 2 s, and 4 s. A class
-is penalized only when the median relative excess over either calibrated
-reference is positive, which requires at least two of the three scales to
-exceed the same reference. The hard-vote path catches low-confidence common
-bias that may not increase mean soft probability. The penalty is multiplied by
-the combined source false-positive risk, starts after iteration 300, follows
-the adaptation ramp, and is clipped to at most 0.5 logit. It can only suppress
-an unsupported class; it can never boost one. The default strength is 2.0 with
-a 10% relative tolerance.
+The same source soft-confusion statistics provide two one-sided cross-scale
+bias signals. The first compares target soft-probability and hard-decision
+rates against their natural-source references. The second detects a
+decision-boundary attractor: a scale chooses a class as argmax substantially
+more often than the total soft-probability mass assigned to that class. Its
+per-scale signal is
+`relu(log(hard_frequency / mean_probability) - log(1.15))`. Taking the median
+over 1 s, 2 s, and 4 s means at least two independent scale heads must report
+the same class-specific problem. A legitimate confident target-prior shift,
+where hard frequency and probability mass rise together, does not trigger this
+second signal.
+
+Both signals are multiplied by the combined soft/hard source false-positive
+risk, start after iteration 300, follow the adaptation ramp, and share a total
+cap of 0.5 logit. They can only suppress a suspect class and can never boost
+one. The source-excess and boundary-attractor strengths both default to 2.0;
+their relative tolerances are 10% and 15%, respectively.
+
+Training uses the target evidence EMA available from the preceding update. At
+every reported evaluation, the final model makes an extra deterministic pass
+over the complete `UnlabeledMultiScaleView` and recomputes raw independent
+scale probability means and hard frequencies. This fresh snapshot is used only
+for the boundary-attractor term; the longer-horizon source-excess term retains
+its training EMA. The refresh loader cannot contain `y`, so this closes the gap
+between training-time EMA and final-classifier drift without using target
+labels for calibration.
 
 Target pseudo-label evidence is constructed from the adjusted but still
 independent per-scale probabilities. A target trial is eligible only when its
@@ -277,7 +290,8 @@ The hard issue-7 boundary is therefore:
 each scale input -> its own embedding -> its own logits
                                         |
 all independent evidence ---------------+
-  -> source-calibrated common-bias detection + diagnostic target-prior estimate
+  -> source-excess + hard/soft boundary-attractor detection
+  -> diagnostic target-prior estimate + final unlabeled evidence refresh
   -> bounded class suppression + independent-scale consensus
   -> source relation + learnable 3 x 3 residual + sample importance
   -> positive / neutral / negative weighted pyramid features
@@ -300,18 +314,19 @@ forcing the target prediction prior to be uniform.
 New fixed-final A6/B6 runs use isolated paths:
 
 ```text
-results_common_bias_suppressed_pyramid/A6/
-results_common_bias_suppressed_pyramid/B6/
-logs/common_bias_suppressed_pyramid/A6.log
-logs/common_bias_suppressed_pyramid/B6.log
+results_boundary_reliable_pyramid/A6/
+results_boundary_reliable_pyramid/B6/
+logs/boundary_reliable_pyramid/A6.log
+logs/boundary_reliable_pyramid/B6.log
 ```
 
 Result JSON files record the source relation matrix, learned 3 x 3 residual,
 sample gate, source prediction reference and precision for every scale/class,
-three-scale target evidence, common-bias and total logit adjustments, estimated
-target prior, pyramid residual weight, per-class target pseudo-label counts,
-worst-class recall, and recall gap. Raw and adjusted per-scale metrics are both
-retained.
+three-scale training EMA and final unlabeled target evidence, separate
+source-excess and boundary-attractor adjustments, their bounded total logit
+adjustment, estimated target prior, pyramid residual weight, per-class target
+pseudo-label counts, worst-class recall, and recall gap. Raw and adjusted
+per-scale metrics are both retained.
 
 The full method maintains EMA prototypes for every source-domain/scale/class
 combination from source truth labels and scale/class target prototypes from
@@ -328,9 +343,10 @@ warmup. This prevents biased early target predictions from changing later
 fusion weights during warmup.
 
 The final prediction is the argmax of the relation-weighted logits plus the
-small pyramid residual and the bounded common-bias suppression. No target-prior
-correction is applied by default. Neither the common-bias detector nor the
-diagnostic prior estimator accesses target labels. The old
+small pyramid residual and the jointly bounded source-excess/boundary-attractor
+suppression. No target-prior correction is applied by default. Neither bias
+detector, the final evidence refresh, nor the diagnostic prior estimator
+accesses target labels. The old
 supervised contrastive, InfoMax, and 1-second-teacher consistency losses are not
 part of this experiment family. Source inverse-frequency sampling remains
 softened to alpha=0.4; domain and prototype adaptation start after iteration
@@ -343,8 +359,8 @@ The comparison protocol remains fixed:
 - training runs for exactly 1000 iterations without validation or checkpoint
   selection;
 - target labels are accessed once for final trial-level evaluation;
-- final predictions use bounded cross-scale common-bias suppression but no
-  target-prior correction;
+- final predictions use bounded source-excess and boundary-attractor
+  suppression but no target-prior correction;
 - random seeds 42, 43, and 44 and all target subjects run by default.
 
 ### CAGA-SGA-style target-selected comparison

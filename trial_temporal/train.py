@@ -39,8 +39,8 @@ from .model import MultiScaleMultiSourceDANN
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = PACKAGE_DIR / "data_processed"
-DEFAULT_RESULT_ROOT = PACKAGE_DIR / "results_common_bias_suppressed_pyramid"
-VARIANT = "class-conditional-common-bias-suppressed-weighted-pyramid"
+DEFAULT_RESULT_ROOT = PACKAGE_DIR / "results_boundary_reliable_pyramid"
+VARIANT = "class-conditional-boundary-reliable-weighted-pyramid"
 CLASS_NAMES = ("positive", "neutral", "negative")
 EVALUATION_PROTOCOL_FIXED_FINAL = "fixed_final"
 EVALUATION_PROTOCOL_CAGA_TARGET_BEST = "caga_target_best"
@@ -64,6 +64,22 @@ class ExperimentSpec:
     target_trials: int = 45
     domain_weight: float = 0.2
     prototype_weight: float = 0.1
+
+
+@dataclass(frozen=True)
+class TargetEvidenceSnapshot:
+    """Complete unlabeled-target evidence from independent scale heads."""
+
+    mean_probability: torch.Tensor
+    hard_frequency: torch.Tensor
+    trials: int
+
+    def state(self) -> dict:
+        return {
+            "mean_probability_by_scale": self.mean_probability.cpu().tolist(),
+            "hard_frequency_by_scale": self.hard_frequency.cpu().tolist(),
+            "trials": self.trials,
+        }
 
 
 EXPERIMENT_ORDER = (
@@ -252,7 +268,7 @@ def _target_loaders(
     iterations: int,
     seed: int,
     pin_memory: bool,
-) -> tuple[DataLoader, DataLoader]:
+) -> tuple[DataLoader, DataLoader, DataLoader]:
     unlabeled = UnlabeledMultiScaleView(target)
     sampler = RandomSampler(
         unlabeled,
@@ -268,6 +284,7 @@ def _target_loaders(
     }
     return (
         DataLoader(unlabeled, sampler=sampler, drop_last=True, **common),
+        DataLoader(unlabeled, shuffle=False, drop_last=False, **common),
         DataLoader(target, shuffle=False, drop_last=False, **common),
     )
 
@@ -598,53 +615,131 @@ class TargetPriorEstimator:
         relative_tolerance: float,
         maximum_adjustment: float,
     ) -> torch.Tensor:
-        """Return a bounded, one-sided penalty for shared scale bias.
+        """Compatibility wrapper for source-reference excess suppression."""
 
-        A class is suppressed only when at least half of the independent
-        scales exceed their source-calibrated prediction reference. The
-        excess is weighted by source false-positive risk, so a reliable class
-        is protected while a class that commonly attracts false positives is
-        penalized. No fused prediction or target label enters this estimate.
+        return self.common_bias_adjustments(
+            source_excess_strength=strength,
+            source_relative_tolerance=relative_tolerance,
+            boundary_strength=0.0,
+            boundary_ratio_tolerance=0.0,
+            maximum_adjustment=maximum_adjustment,
+        )["combined"]
+
+    @torch.no_grad()
+    def common_bias_adjustments(
+        self,
+        source_excess_strength: float,
+        source_relative_tolerance: float,
+        boundary_strength: float,
+        boundary_ratio_tolerance: float,
+        maximum_adjustment: float,
+        boundary_mean_probability: torch.Tensor | None = None,
+        boundary_hard_frequency: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Return source-excess, boundary-attractor, and combined penalties.
+
+        Source excess detects a class whose target prediction mass exceeds its
+        natural-source reference. Boundary attraction detects a different
+        failure: independent scale heads choose the same class much more often
+        than the probability mass they assign to it. Both require agreement
+        from at least half the scales and are weighted by source false-positive
+        risk. Neither fused predictions nor target labels enter either signal.
         """
 
-        if strength < 0:
-            raise ValueError("common-bias strength must be nonnegative")
-        if relative_tolerance < 0:
-            raise ValueError("common-bias tolerance must be nonnegative")
+        if min(source_excess_strength, boundary_strength) < 0:
+            raise ValueError("common-bias strengths must be nonnegative")
+        if min(source_relative_tolerance, boundary_ratio_tolerance) < 0:
+            raise ValueError("common-bias tolerances must be nonnegative")
         if maximum_adjustment < 0:
             raise ValueError("maximum common-bias adjustment must be nonnegative")
-        adjustment = torch.zeros_like(self.source_prior)
+        zero = torch.zeros_like(self.source_prior)
+        empty = {
+            "source_excess": zero.clone(),
+            "boundary_attractor": zero.clone(),
+            "combined": zero.clone(),
+            "false_positive_risk": zero.clone(),
+            "source_common_log_excess": zero.clone(),
+            "boundary_common_log_ratio": zero.clone(),
+        }
         if (
-            strength == 0
+            (source_excess_strength == 0 and boundary_strength == 0)
             or maximum_adjustment == 0
             or not self.target_initialized
             or self.target_mean_probability.shape[0] < 2
             or not bool(self.source_initialized.all())
         ):
-            return adjustment
-        soft_reference = self.source_prediction_reference()
-        soft_log_excess = (
-            torch.log(self.target_mean_probability.clamp_min(1e-8))
-            - torch.log(soft_reference)
-            - math.log1p(relative_tolerance)
-        ).clamp_min(0.0)
-        hard_reference = self.source_hard_prediction_reference()
-        hard_log_excess = (
-            torch.log(self.target_hard_frequency.clamp_min(1e-8))
-            - torch.log(hard_reference)
-            - math.log1p(relative_tolerance)
-        ).clamp_min(0.0)
-        log_excess = torch.maximum(soft_log_excess, hard_log_excess)
-        # For three scales the median is positive only if at least two scales
-        # report excess evidence. This rejects a single noisy temporal scale.
-        common_excess = log_excess.median(dim=0).values
+            return empty
+
+        boundary_probability = (
+            self.target_mean_probability
+            if boundary_mean_probability is None
+            else boundary_mean_probability.detach().to(
+                self.target_mean_probability
+            )
+        )
+        boundary_hard = (
+            self.target_hard_frequency
+            if boundary_hard_frequency is None
+            else boundary_hard_frequency.detach().to(
+                self.target_hard_frequency
+            )
+        )
+        if (
+            boundary_probability.shape != self.target_mean_probability.shape
+            or boundary_hard.shape != self.target_hard_frequency.shape
+        ):
+            raise ValueError("boundary evidence must be [scales, classes]")
+
         precision = 0.5 * (
             self.source_class_precision()
             + self.source_hard_class_precision()
         )
         false_positive_risk = 1.0 - precision.mean(dim=0)
-        penalty = float(strength) * false_positive_risk * common_excess
-        return -penalty.clamp(max=float(maximum_adjustment))
+
+        soft_reference = self.source_prediction_reference()
+        soft_log_excess = (
+            torch.log(self.target_mean_probability.clamp_min(1e-8))
+            - torch.log(soft_reference)
+            - math.log1p(source_relative_tolerance)
+        ).clamp_min(0.0)
+        hard_reference = self.source_hard_prediction_reference()
+        hard_log_excess = (
+            torch.log(self.target_hard_frequency.clamp_min(1e-8))
+            - torch.log(hard_reference)
+            - math.log1p(source_relative_tolerance)
+        ).clamp_min(0.0)
+        log_excess = torch.maximum(soft_log_excess, hard_log_excess)
+        # For three scales the median is positive only if at least two scales
+        # report excess evidence. This rejects a single noisy temporal scale.
+        common_excess = log_excess.median(dim=0).values
+        source_penalty = (
+            float(source_excess_strength)
+            * false_positive_risk
+            * common_excess
+        )
+
+        boundary_log_ratio = (
+            torch.log(boundary_hard.clamp_min(1e-8))
+            - torch.log(boundary_probability.clamp_min(1e-8))
+            - math.log1p(boundary_ratio_tolerance)
+        ).clamp_min(0.0)
+        boundary_common_ratio = boundary_log_ratio.median(dim=0).values
+        boundary_penalty = (
+            float(boundary_strength)
+            * false_positive_risk
+            * boundary_common_ratio
+        )
+        combined_penalty = (source_penalty + boundary_penalty).clamp(
+            max=float(maximum_adjustment)
+        )
+        return {
+            "source_excess": -source_penalty,
+            "boundary_attractor": -boundary_penalty,
+            "combined": -combined_penalty,
+            "false_positive_risk": false_positive_risk,
+            "source_common_log_excess": common_excess,
+            "boundary_common_log_ratio": boundary_common_ratio,
+        }
 
     @torch.no_grad()
     def state(self) -> dict:
@@ -1088,6 +1183,8 @@ def train_step(
     prior_correction_strength: float = 0.0,
     common_bias_strength: float = 2.0,
     common_bias_relative_tolerance: float = 0.10,
+    boundary_bias_strength: float = 2.0,
+    boundary_bias_ratio_tolerance: float = 0.15,
     common_bias_max_adjustment: float = 0.50,
 ) -> dict:
     if "y" in target_batch:
@@ -1112,15 +1209,22 @@ def train_step(
         and ramp > 0
         else None
     )
-    common_bias_adjustment = (
-        target_prior_estimator.common_bias_adjustment(
-            common_bias_strength * ramp,
-            common_bias_relative_tolerance,
-            common_bias_max_adjustment,
+    common_bias_components = (
+        target_prior_estimator.common_bias_adjustments(
+            source_excess_strength=common_bias_strength * ramp,
+            source_relative_tolerance=common_bias_relative_tolerance,
+            boundary_strength=boundary_bias_strength * ramp,
+            boundary_ratio_tolerance=boundary_bias_ratio_tolerance,
+            maximum_adjustment=common_bias_max_adjustment,
         )
         if target_prior_estimator is not None
-        and common_bias_strength > 0
+        and (common_bias_strength > 0 or boundary_bias_strength > 0)
         and ramp > 0
+        else None
+    )
+    common_bias_adjustment = (
+        common_bias_components["combined"]
+        if common_bias_components is not None
         else None
     )
     target_logit_adjustment = None
@@ -1346,6 +1450,21 @@ def train_step(
             if common_bias_adjustment is not None
             else [0.0] * NUM_CLASSES
         )
+        record["source_excess_logit_adjustment"] = (
+            common_bias_components["source_excess"].cpu().tolist()
+            if common_bias_components is not None
+            else [0.0] * NUM_CLASSES
+        )
+        record["boundary_attractor_logit_adjustment"] = (
+            common_bias_components["boundary_attractor"].cpu().tolist()
+            if common_bias_components is not None
+            else [0.0] * NUM_CLASSES
+        )
+        record["boundary_common_log_ratio"] = (
+            common_bias_components["boundary_common_log_ratio"].cpu().tolist()
+            if common_bias_components is not None
+            else [0.0] * NUM_CLASSES
+        )
         record["target_logit_adjustment"] = (
             target_logit_adjustment.detach().cpu().tolist()
             if target_logit_adjustment is not None
@@ -1396,6 +1515,54 @@ def _classification_metrics(labels: np.ndarray, probability: np.ndarray) -> dict
     }
 
 
+@torch.no_grad()
+def collect_unlabeled_target_evidence(
+    model: MultiScaleMultiSourceDANN,
+    loader: DataLoader,
+    device: torch.device,
+    description: str,
+) -> TargetEvidenceSnapshot:
+    """Refresh raw scale evidence on the complete target set without labels."""
+
+    model.eval()
+    probability_sum = None
+    hard_sum = None
+    trials = 0
+    for batch in tqdm(
+        loader,
+        desc=description,
+        unit="batch",
+        leave=False,
+        dynamic_ncols=True,
+    ):
+        if "y" in batch:
+            raise RuntimeError(
+                "Target evidence refresh must use an unlabeled target view"
+            )
+        x, mask = _batch_to_device(batch, device)
+        output = model(x, mask, compute_domain=False)
+        probability = F.softmax(output["scale_logits"], dim=-1)
+        hard = F.one_hot(
+            probability.argmax(dim=-1), num_classes=NUM_CLASSES
+        ).float()
+        batch_probability_sum = probability.sum(dim=0)
+        batch_hard_sum = hard.sum(dim=0)
+        if probability_sum is None:
+            probability_sum = batch_probability_sum
+            hard_sum = batch_hard_sum
+        else:
+            probability_sum.add_(batch_probability_sum)
+            hard_sum.add_(batch_hard_sum)
+        trials += probability.shape[0]
+    if probability_sum is None or hard_sum is None or trials == 0:
+        raise RuntimeError("Target evidence refresh received no target trials")
+    return TargetEvidenceSnapshot(
+        mean_probability=probability_sum / trials,
+        hard_frequency=hard_sum / trials,
+        trials=trials,
+    )
+
+
 def evaluate_trials(
     model: MultiScaleMultiSourceDANN,
     loader: DataLoader,
@@ -1406,7 +1573,10 @@ def evaluate_trials(
     prior_correction_strength: float = 0.0,
     common_bias_strength: float = 2.0,
     common_bias_relative_tolerance: float = 0.10,
+    boundary_bias_strength: float = 2.0,
+    boundary_bias_ratio_tolerance: float = 0.15,
     common_bias_max_adjustment: float = 0.50,
+    final_target_evidence: TargetEvidenceSnapshot | None = None,
 ) -> dict:
     model.eval()
     probabilities = []
@@ -1426,13 +1596,31 @@ def evaluate_trials(
         and prior_correction_strength > 0
         else None
     )
-    common_bias_adjustment = (
-        target_prior_estimator.common_bias_adjustment(
-            common_bias_strength,
-            common_bias_relative_tolerance,
-            common_bias_max_adjustment,
+    common_bias_components = (
+        target_prior_estimator.common_bias_adjustments(
+            source_excess_strength=common_bias_strength,
+            source_relative_tolerance=common_bias_relative_tolerance,
+            boundary_strength=boundary_bias_strength,
+            boundary_ratio_tolerance=boundary_bias_ratio_tolerance,
+            maximum_adjustment=common_bias_max_adjustment,
+            boundary_mean_probability=(
+                final_target_evidence.mean_probability
+                if final_target_evidence is not None
+                else None
+            ),
+            boundary_hard_frequency=(
+                final_target_evidence.hard_frequency
+                if final_target_evidence is not None
+                else None
+            ),
         )
-        if target_prior_estimator is not None and common_bias_strength > 0
+        if target_prior_estimator is not None
+        and (common_bias_strength > 0 or boundary_bias_strength > 0)
+        else None
+    )
+    common_bias_adjustment = (
+        common_bias_components["combined"]
+        if common_bias_components is not None
         else None
     )
     target_logit_adjustment = None
@@ -1519,6 +1707,31 @@ def evaluate_trials(
             common_bias_adjustment.cpu().tolist()
             if common_bias_adjustment is not None
             else [0.0] * NUM_CLASSES
+        ),
+        "source_excess_logit_adjustment": (
+            common_bias_components["source_excess"].cpu().tolist()
+            if common_bias_components is not None
+            else [0.0] * NUM_CLASSES
+        ),
+        "boundary_attractor_logit_adjustment": (
+            common_bias_components["boundary_attractor"].cpu().tolist()
+            if common_bias_components is not None
+            else [0.0] * NUM_CLASSES
+        ),
+        "boundary_common_log_ratio": (
+            common_bias_components["boundary_common_log_ratio"].cpu().tolist()
+            if common_bias_components is not None
+            else [0.0] * NUM_CLASSES
+        ),
+        "source_false_positive_risk": (
+            common_bias_components["false_positive_risk"].cpu().tolist()
+            if common_bias_components is not None
+            else [0.0] * NUM_CLASSES
+        ),
+        "final_unlabeled_target_evidence": (
+            final_target_evidence.state()
+            if final_target_evidence is not None
+            else None
         ),
         "target_logit_adjustment": (
             target_logit_adjustment.cpu().tolist()
@@ -1692,7 +1905,7 @@ def run_fold(
         )
         for domain_index, dataset in enumerate(prepared.datasets)
     ]
-    target_loader, test_loader = _target_loaders(
+    target_loader, target_evidence_loader, test_loader = _target_loaders(
         target,
         args.target_batch_size,
         iterations,
@@ -1809,6 +2022,8 @@ def run_fold(
             args.prior_correction_strength,
             args.common_bias_strength,
             args.common_bias_relative_tolerance,
+            args.boundary_bias_strength,
+            args.boundary_bias_ratio_tolerance,
             args.common_bias_max_adjustment,
         )
         if iteration == 1 or iteration % args.log_interval == 0 or iteration == iterations:
@@ -1825,6 +2040,15 @@ def run_fold(
             iterations,
             args.target_eval_interval,
         ):
+            final_target_evidence = collect_unlabeled_target_evidence(
+                model,
+                target_evidence_loader,
+                device,
+                (
+                    f"Unlabeled evidence I{iteration:04d} "
+                    f"{spec.name}/seed{seed}/S{subject:02d}"
+                ),
+            )
             candidate_evaluation = evaluate_trials(
                 model,
                 test_loader,
@@ -1838,7 +2062,10 @@ def run_fold(
                 args.prior_correction_strength,
                 args.common_bias_strength,
                 args.common_bias_relative_tolerance,
+                args.boundary_bias_strength,
+                args.boundary_bias_ratio_tolerance,
                 args.common_bias_max_adjustment,
+                final_target_evidence,
             )
             target_evaluation_trace.append(
                 {"iteration": iteration, "evaluation": candidate_evaluation}
@@ -1890,10 +2117,18 @@ def run_fold(
             "target_probability_correction": (
                 args.prior_correction_strength > 0
                 or args.common_bias_strength > 0
+                or args.boundary_bias_strength > 0
             ),
             "target_prior_correction": args.prior_correction_strength > 0,
             "cross_scale_common_bias_suppression": (
                 args.common_bias_strength > 0
+                or args.boundary_bias_strength > 0
+            ),
+            "boundary_attractor_suppression": (
+                args.boundary_bias_strength > 0
+            ),
+            "final_target_evidence": (
+                "complete_unlabeled_target_refresh_from_independent_scale_logits"
             ),
         },
         "source_trials": {
@@ -1969,6 +2204,10 @@ def run_fold(
             "common_bias_strength": args.common_bias_strength,
             "common_bias_relative_tolerance": (
                 args.common_bias_relative_tolerance
+            ),
+            "boundary_bias_strength": args.boundary_bias_strength,
+            "boundary_bias_ratio_tolerance": (
+                args.boundary_bias_ratio_tolerance
             ),
             "common_bias_max_adjustment": (
                 args.common_bias_max_adjustment
@@ -2049,6 +2288,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--common-bias-strength", type=float, default=2.0)
     parser.add_argument(
         "--common-bias-relative-tolerance", type=float, default=0.10
+    )
+    parser.add_argument("--boundary-bias-strength", type=float, default=2.0)
+    parser.add_argument(
+        "--boundary-bias-ratio-tolerance", type=float, default=0.15
     )
     parser.add_argument(
         "--common-bias-max-adjustment", type=float, default=0.50
@@ -2157,6 +2400,8 @@ def validate_args(args, spec: ExperimentSpec) -> None:
     if min(
         args.common_bias_strength,
         args.common_bias_relative_tolerance,
+        args.boundary_bias_strength,
+        args.boundary_bias_ratio_tolerance,
         args.common_bias_max_adjustment,
     ) < 0:
         raise ValueError("common-bias parameters must be nonnegative")
@@ -2196,9 +2441,9 @@ def main() -> None:
     )
     tqdm.write(
         "Method: relation-weighted logit anchor plus class-conditional "
-        "weighted feature pyramid and source-calibrated common-bias "
-        "suppression; independent per-scale logits precede all bias "
-        "estimation, cross-scale context, and fusion"
+        "weighted feature pyramid, source-calibrated common-bias suppression, "
+        "and hard/soft boundary-attractor suppression; independent per-scale "
+        "logits precede all bias estimation, cross-scale context, and fusion"
     )
     if args.evaluation_protocol == EVALUATION_PROTOCOL_CAGA_TARGET_BEST:
         tqdm.write(
@@ -2209,8 +2454,9 @@ def main() -> None:
     else:
         tqdm.write(
             "Protocol: fixed 1000 iterations, source-calibrated cross-scale "
-            "common-bias suppression, diagnostic-only target-prior "
-            "estimation, no checkpoint selection, one final target evaluation"
+            "common-bias suppression with a final complete unlabeled-target "
+            "evidence refresh, diagnostic-only target-prior estimation, no "
+            "checkpoint selection, one final labeled target evaluation"
         )
     prepared = prepare_sources(args.data_dir, spec.source_domains, spec.scales)
     for seed in args.random_seeds:
