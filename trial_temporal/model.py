@@ -220,6 +220,7 @@ class MultiScaleMultiSourceDANN(nn.Module):
         relation_strength: float = 1.0,
         pyramid_weight_floor: float = 0.10,
         pyramid_residual_initial: float = 0.05,
+        use_feature_pyramid: bool = True,
     ) -> None:
         super().__init__()
         self.scales = tuple(sorted(map(float, scales)))
@@ -248,6 +249,7 @@ class MultiScaleMultiSourceDANN(nn.Module):
         self.detach_domain_probability = bool(detach_domain_probability)
         self.relation_strength = float(relation_strength)
         self.pyramid_weight_floor = float(pyramid_weight_floor)
+        self.use_feature_pyramid = bool(use_feature_pyramid)
 
         self.spatial = WindowSpatialEncoder(
             d_model,
@@ -298,26 +300,35 @@ class MultiScaleMultiSourceDANN(nn.Module):
         self.scale_class_relation_residual = nn.Parameter(
             torch.zeros(len(self.scales), num_classes)
         )
-        self.pyramid_projections = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.LayerNorm(d_model),
-                    nn.Linear(d_model, d_model),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                    nn.Linear(d_model, d_model),
-                )
-                for _ in self.scales
-            ]
-        )
-        for projection in self.pyramid_projections:
-            nn.init.zeros_(projection[-1].weight)
-            nn.init.zeros_(projection[-1].bias)
-        self.pyramid_output_norm = nn.LayerNorm(d_model)
-        residual_logit = math.log(
-            pyramid_residual_initial / (1.0 - pyramid_residual_initial)
-        )
-        self.pyramid_residual_logit = nn.Parameter(torch.tensor(residual_logit))
+        self.pyramid_projections = nn.ModuleList()
+        self.pyramid_output_norm: nn.Module = nn.Identity()
+        if self.use_feature_pyramid:
+            self.pyramid_projections = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.LayerNorm(d_model),
+                        nn.Linear(d_model, d_model),
+                        nn.GELU(),
+                        nn.Dropout(dropout),
+                        nn.Linear(d_model, d_model),
+                    )
+                    for _ in self.scales
+                ]
+            )
+            for projection in self.pyramid_projections:
+                nn.init.zeros_(projection[-1].weight)
+                nn.init.zeros_(projection[-1].bias)
+            self.pyramid_output_norm = nn.LayerNorm(d_model)
+            residual_logit = math.log(
+                pyramid_residual_initial / (1.0 - pyramid_residual_initial)
+            )
+            self.pyramid_residual_logit = nn.Parameter(
+                torch.tensor(residual_logit)
+            )
+        else:
+            self.register_buffer(
+                "pyramid_residual_logit", torch.tensor(float("-inf"))
+            )
 
         self.grl = GRL(alpha=1.0)
         self.scale_domain_heads = nn.ModuleList()
@@ -406,6 +417,26 @@ class MultiScaleMultiSourceDANN(nn.Module):
                 + self.pyramid_weight_floor * uniform
             )
 
+        relation_weighted_logits = (class_weight * scale_logits).sum(dim=1)
+        if not self.use_feature_pyramid:
+            class_features = torch.einsum(
+                "bsc,bsd->bcd", class_weight, scale_embeddings
+            )
+            class_mass = F.softmax(relation_weighted_logits.detach(), dim=-1)
+            fused_embedding = torch.einsum(
+                "bc,bcd->bd", class_mass, class_features
+            )
+            residual_weight = relation_weighted_logits.new_zeros(())
+            return (
+                relation_weighted_logits,
+                fused_embedding,
+                class_weight,
+                class_weight,
+                class_features,
+                relation_weighted_logits,
+                residual_weight,
+            )
+
         projected_levels = torch.stack(
             [
                 scale_embeddings[:, index] + projection(
@@ -428,7 +459,6 @@ class MultiScaleMultiSourceDANN(nn.Module):
         # Preserve the previous relation-guided logit fusion as the stable
         # anchor. The weighted pyramid is an additive refinement, not a
         # replacement by a weaker uniform scale ensemble.
-        relation_weighted_logits = (class_weight * scale_logits).sum(dim=1)
         residual_weight = torch.sigmoid(self.pyramid_residual_logit)
         fused_logits = (
             (1.0 - residual_weight) * relation_weighted_logits

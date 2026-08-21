@@ -39,7 +39,7 @@ from .model import MultiScaleMultiSourceDANN
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = PACKAGE_DIR / "data_processed"
-DEFAULT_RESULT_ROOT = PACKAGE_DIR / "results_boundary_reliable_pyramid"
+DEFAULT_RESULT_ROOT = PACKAGE_DIR / "results_bidirectional_full_ablation"
 VARIANT = "class-conditional-boundary-reliable-weighted-pyramid"
 CLASS_NAMES = ("positive", "neutral", "negative")
 EVALUATION_PROTOCOL_FIXED_FINAL = "fixed_final"
@@ -54,11 +54,16 @@ EVALUATION_PROTOCOLS = (
 class ExperimentSpec:
     name: str
     description: str
+    transfer_direction: str
+    ablation: str
     source_domains: tuple[str, ...]
     scales: tuple[float, ...]
     fusion_mode: str
     domain_mode: str
     use_prototypes: bool
+    use_feature_pyramid: bool = True
+    use_source_excess_suppression: bool = True
+    use_boundary_attractor_suppression: bool = True
     target_dataset: str = "seed_v"
     target_subject_count: int = 16
     target_trials: int = 45
@@ -82,115 +87,121 @@ class TargetEvidenceSnapshot:
         }
 
 
-EXPERIMENT_ORDER = (
-    "A0",
-    "A1",
-    "A2",
-    "A3",
-    "A4",
-    "A5",
-    "A6",
-    "A7",
-    "main",
-    "B6",
-)
-EXPERIMENTS = {
-    "A0": ExperimentSpec(
-        "A0",
-        "1-second only with class-conditional multi-source alignment",
-        ("seed_vii", "seed_iv"),
-        (1.0,),
-        "class_conditional",
-        "scale_conditional",
-        True,
-    ),
-    "A1": ExperimentSpec(
-        "A1",
-        "2-second only with class-conditional multi-source alignment",
-        ("seed_vii", "seed_iv"),
-        (2.0,),
-        "class_conditional",
-        "scale_conditional",
-        True,
-    ),
-    "A2": ExperimentSpec(
-        "A2",
-        "4-second only with class-conditional multi-source alignment",
-        ("seed_vii", "seed_iv"),
-        (4.0,),
-        "class_conditional",
-        "scale_conditional",
-        True,
-    ),
-    "A3": ExperimentSpec(
-        "A3",
-        "naive multiscale attention with fused-only conditional alignment",
-        ("seed_vii", "seed_iv"),
-        (1.0, 2.0, 4.0),
-        "attention",
-        "fused_conditional",
-        False,
-        prototype_weight=0.0,
-    ),
-    "A4": ExperimentSpec(
-        "A4",
-        "multiscale attention with non-class-conditional per-scale alignment",
-        ("seed_vii", "seed_iv"),
-        (1.0, 2.0, 4.0),
-        "attention",
-        "scale_global",
-        False,
-        prototype_weight=0.0,
-    ),
-    "A5": ExperimentSpec(
-        "A5",
-        "class-conditional alignment with uniform multiscale fusion",
-        ("seed_vii", "seed_iv"),
-        (1.0, 2.0, 4.0),
-        "uniform",
-        "scale_conditional",
-        True,
-    ),
-    "A6": ExperimentSpec(
-        "A6",
-        "full method with SEED-VII as the only source",
-        ("seed_vii",),
-        (1.0, 2.0, 4.0),
-        "class_conditional",
-        "scale_conditional",
-        True,
-    ),
-    "A7": ExperimentSpec(
-        "A7",
-        "full method with SEED-IV as the only source",
-        ("seed_iv",),
-        (1.0, 2.0, 4.0),
-        "class_conditional",
-        "scale_conditional",
-        True,
-    ),
-    "main": ExperimentSpec(
-        "main",
-        "class-conditional source-scale reliability and dynamic class fusion",
-        ("seed_vii", "seed_iv"),
-        (1.0, 2.0, 4.0),
-        "class_conditional",
-        "scale_conditional",
-        True,
-    ),
-    "B6": ExperimentSpec(
-        "B6",
-        "SEED-V to SEED-VII with the A6 full single-source model",
-        ("seed_v",),
-        (1.0, 2.0, 4.0),
-        "class_conditional",
-        "scale_conditional",
-        True,
-        target_dataset="seed_vii",
-        target_subject_count=20,
-        target_trials=80,
-    ),
+_ABLATION_DEFINITIONS = {
+    "0": {
+        "description": "1-second single-scale baseline",
+        "scales": (1.0,),
+        "use_feature_pyramid": False,
+        "use_source_excess_suppression": False,
+        "use_boundary_attractor_suppression": False,
+    },
+    "1": {
+        "description": "2-second single-scale baseline",
+        "scales": (2.0,),
+        "use_feature_pyramid": False,
+        "use_source_excess_suppression": False,
+        "use_boundary_attractor_suppression": False,
+    },
+    "2": {
+        "description": "4-second single-scale baseline",
+        "scales": (4.0,),
+        "use_feature_pyramid": False,
+        "use_source_excess_suppression": False,
+        "use_boundary_attractor_suppression": False,
+    },
+    "3": {
+        "description": "uniform 1/2/4-second multiscale fusion",
+        "scales": (1.0, 2.0, 4.0),
+        "fusion_mode": "uniform",
+    },
+    "4": {
+        "description": "relation-weighted logits without the feature pyramid",
+        "scales": (1.0, 2.0, 4.0),
+        "use_feature_pyramid": False,
+    },
+    "5": {
+        "description": "source-excess suppression without boundary attraction",
+        "scales": (1.0, 2.0, 4.0),
+        "use_boundary_attractor_suppression": False,
+    },
+    "6": {
+        "description": "no source-excess or boundary-attractor suppression",
+        "scales": (1.0, 2.0, 4.0),
+        "use_source_excess_suppression": False,
+        "use_boundary_attractor_suppression": False,
+    },
+    "main": {
+        "description": "complete class-conditional boundary-reliable pyramid",
+        "scales": (1.0, 2.0, 4.0),
+    },
 }
+
+_TRANSFER_DIRECTIONS = {
+    "A": {
+        "description": "SEED-VII to SEED-V",
+        "source_domains": ("seed_vii",),
+        "target_dataset": "seed_v",
+        "target_subject_count": 16,
+        "target_trials": 45,
+    },
+    "B": {
+        "description": "SEED-V to SEED-VII",
+        "source_domains": ("seed_v",),
+        "target_dataset": "seed_vii",
+        "target_subject_count": 20,
+        "target_trials": 80,
+    },
+}
+
+EXPERIMENT_ORDER = tuple(
+    name
+    for ablation in (*map(str, range(7)), "main")
+    for name in (
+        f"A_{ablation}" if ablation == "main" else f"A{ablation}",
+        f"B_{ablation}" if ablation == "main" else f"B{ablation}",
+    )
+)
+
+
+def _build_experiments() -> dict[str, ExperimentSpec]:
+    experiments = {}
+    for ablation in (*map(str, range(7)), "main"):
+        definition = _ABLATION_DEFINITIONS[ablation]
+        for direction, transfer in _TRANSFER_DIRECTIONS.items():
+            name = (
+                f"{direction}_main"
+                if ablation == "main"
+                else f"{direction}{ablation}"
+            )
+            experiments[name] = ExperimentSpec(
+                name=name,
+                description=(
+                    f"{transfer['description']}; {definition['description']}"
+                ),
+                transfer_direction=direction,
+                ablation=ablation,
+                source_domains=transfer["source_domains"],
+                scales=definition["scales"],
+                fusion_mode=definition.get("fusion_mode", "class_conditional"),
+                domain_mode="scale_conditional",
+                use_prototypes=True,
+                use_feature_pyramid=definition.get(
+                    "use_feature_pyramid", True
+                ),
+                use_source_excess_suppression=definition.get(
+                    "use_source_excess_suppression", True
+                ),
+                use_boundary_attractor_suppression=definition.get(
+                    "use_boundary_attractor_suppression", True
+                ),
+                target_dataset=transfer["target_dataset"],
+                target_subject_count=transfer["target_subject_count"],
+                target_trials=transfer["target_trials"],
+            )
+    return experiments
+
+
+EXPERIMENTS = _build_experiments()
 
 
 def set_seed(seed: int, device: torch.device) -> None:
@@ -1064,7 +1075,7 @@ def _gate_supervision_loss(
 ) -> torch.Tensor:
     """Teach the true-class gate which independent scale has lower error."""
 
-    if scale_logits.shape[1] == 1:
+    if scale_logits.shape[1] == 1 or not scale_class_weight.requires_grad:
         return scale_logits.sum() * 0.0
     true_logit = scale_logits.gather(
         2,
@@ -1189,6 +1200,10 @@ def train_step(
 ) -> dict:
     if "y" in target_batch:
         raise RuntimeError("Target adaptation batch unexpectedly contains labels")
+    if not spec.use_source_excess_suppression:
+        common_bias_strength = 0.0
+    if not spec.use_boundary_attractor_suppression:
+        boundary_bias_strength = 0.0
     model.train()
     optimizer.zero_grad(set_to_none=True)
     ramp = _adaptation_ramp(
@@ -1931,6 +1946,7 @@ def run_fold(
         relation_strength=args.relation_strength,
         pyramid_weight_floor=args.pyramid_weight_floor,
         pyramid_residual_initial=args.pyramid_residual_initial,
+        use_feature_pyramid=spec.use_feature_pyramid,
     ).to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     optimizer = torch.optim.AdamW(
@@ -1951,6 +1967,16 @@ def run_fold(
         momentum=args.prior_momentum,
         ridge=args.prior_ridge,
         prior_floor=args.prior_floor,
+    )
+    common_bias_strength = (
+        args.common_bias_strength
+        if spec.use_source_excess_suppression
+        else 0.0
+    )
+    boundary_bias_strength = (
+        args.boundary_bias_strength
+        if spec.use_boundary_attractor_suppression
+        else 0.0
     )
     prototype_bank = None
     if spec.use_prototypes:
@@ -2020,9 +2046,9 @@ def run_fold(
             args.gate_teacher_temperature,
             target_prior_estimator,
             args.prior_correction_strength,
-            args.common_bias_strength,
+            common_bias_strength,
             args.common_bias_relative_tolerance,
-            args.boundary_bias_strength,
+            boundary_bias_strength,
             args.boundary_bias_ratio_tolerance,
             args.common_bias_max_adjustment,
         )
@@ -2060,9 +2086,9 @@ def run_fold(
                 prototype_bank,
                 target_prior_estimator,
                 args.prior_correction_strength,
-                args.common_bias_strength,
+                common_bias_strength,
                 args.common_bias_relative_tolerance,
-                args.boundary_bias_strength,
+                boundary_bias_strength,
                 args.boundary_bias_ratio_tolerance,
                 args.common_bias_max_adjustment,
                 final_target_evidence,
@@ -2116,16 +2142,17 @@ def run_fold(
             "selected_iteration": selected_iteration,
             "target_probability_correction": (
                 args.prior_correction_strength > 0
-                or args.common_bias_strength > 0
-                or args.boundary_bias_strength > 0
+                or common_bias_strength > 0
+                or boundary_bias_strength > 0
             ),
             "target_prior_correction": args.prior_correction_strength > 0,
             "cross_scale_common_bias_suppression": (
-                args.common_bias_strength > 0
-                or args.boundary_bias_strength > 0
+                common_bias_strength > 0
+                or boundary_bias_strength > 0
             ),
+            "source_excess_suppression": common_bias_strength > 0,
             "boundary_attractor_suppression": (
-                args.boundary_bias_strength > 0
+                boundary_bias_strength > 0
             ),
             "final_target_evidence": (
                 "complete_unlabeled_target_refresh_from_independent_scale_logits"
@@ -2158,6 +2185,7 @@ def run_fold(
             "scales": list(spec.scales),
             "fusion_mode": spec.fusion_mode,
             "domain_mode": spec.domain_mode,
+            "use_feature_pyramid": spec.use_feature_pyramid,
             "channel_attention": True,
             "d_model": args.d_model,
             "num_heads": args.num_heads,
@@ -2202,10 +2230,12 @@ def run_fold(
             "pyramid_residual_initial": args.pyramid_residual_initial,
             "prior_correction_strength": args.prior_correction_strength,
             "common_bias_strength": args.common_bias_strength,
+            "effective_common_bias_strength": common_bias_strength,
             "common_bias_relative_tolerance": (
                 args.common_bias_relative_tolerance
             ),
             "boundary_bias_strength": args.boundary_bias_strength,
+            "effective_boundary_bias_strength": boundary_bias_strength,
             "boundary_bias_ratio_tolerance": (
                 args.boundary_bias_ratio_tolerance
             ),
