@@ -10,8 +10,8 @@ from pathlib import Path
 import numpy as np
 
 
-PROJECT_DIR = Path(__file__).resolve().parent
-DEFAULT_DATA_DIR = PROJECT_DIR / "data_processed"
+PACKAGE_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_DATA_DIR = PACKAGE_DIR / "data_processed"
 
 
 def validate_file(path: Path) -> dict:

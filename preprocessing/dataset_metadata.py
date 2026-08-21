@@ -29,6 +29,13 @@ EMOTION_TO_ORIGINAL_SEED_V = {
     "happy": 4,
 }
 
+EMOTION_TO_ORIGINAL_SEED_IV = {
+    "neutral": 0,
+    "sad": 1,
+    "fear": 2,
+    "happy": 3,
+}
+
 EMOTION_TO_THREE_CLASS = {
     "happy": 0,
     "surprise": 0,
@@ -69,6 +76,24 @@ SEED_V_EMOTIONS = {
     ],
 }
 
+SEED_IV_SESSION_LABELS = {
+    1: (1, 2, 3, 0, 2, 0, 0, 1, 0, 1, 2, 1, 1, 1, 2, 3, 2, 2, 3, 3, 0, 3, 0, 3),
+    2: (2, 1, 3, 0, 0, 2, 0, 2, 3, 3, 2, 3, 2, 0, 1, 1, 2, 1, 0, 3, 0, 1, 3, 1),
+    3: (1, 2, 2, 1, 3, 3, 3, 1, 1, 2, 1, 0, 2, 3, 3, 0, 2, 3, 0, 0, 2, 0, 1, 0),
+}
+
+SEED_IV_LABEL_TO_EMOTION = {
+    0: "neutral",
+    1: "sad",
+    2: "fear",
+    3: "happy",
+}
+
+SEED_IV_EMOTIONS = {
+    session: tuple(SEED_IV_LABEL_TO_EMOTION[label] for label in labels)
+    for session, labels in SEED_IV_SESSION_LABELS.items()
+}
+
 SEED_VII_SPECIAL_TRIGGER_START = {
     "14_20221015_1.cnt": "14:25:34",
     "9_20221111_3.cnt": "14:01:27",
@@ -87,6 +112,42 @@ def parse_seed_vii_filename(path: Path) -> tuple[int, int]:
     if not match:
         raise ValueError(f"Unexpected SEED-VII filename: {path.name}")
     return int(match.group(1)), int(match.group(3))
+
+
+def parse_seed_iv_filename(path: Path) -> tuple[int, int]:
+    match = re.fullmatch(r"(\d+)_(\d{8})\.mat", path.name)
+    if not match:
+        raise ValueError(f"Unexpected SEED-IV filename: {path.name}")
+    try:
+        session = int(path.parent.name)
+    except ValueError as exc:
+        raise ValueError(
+            f"SEED-IV file must be inside session directory 1, 2, or 3: {path}"
+        ) from exc
+    if session not in SEED_IV_SESSION_LABELS:
+        raise ValueError(
+            f"SEED-IV file must be inside session directory 1, 2, or 3: {path}"
+        )
+    return int(match.group(1)), session
+
+
+def load_channel_names(channel_file: Path) -> tuple[str, ...]:
+    if not channel_file.is_file():
+        raise FileNotFoundError(f"Channel order file not found: {channel_file}")
+    workbook = load_workbook(channel_file, read_only=True, data_only=True)
+    try:
+        channels = tuple(
+            str(row[0]).strip()
+            for row in workbook.active.iter_rows(values_only=True)
+            if row[0] is not None and str(row[0]).strip()
+        )
+    finally:
+        workbook.close()
+    if len(channels) != 62 or len(set(channels)) != 62:
+        raise ValueError(
+            f"Expected 62 unique channel names in {channel_file}, got {len(channels)}"
+        )
+    return channels
 
 
 def load_seed_vii_emotions(label_file: Path) -> dict[int, str]:
