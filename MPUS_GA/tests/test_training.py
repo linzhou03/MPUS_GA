@@ -31,6 +31,7 @@ from MPUS_GA.trial_temporal.train import (  # noqa: E402
     _should_evaluate_target,
     _target_evaluation_is_better,
     _target_subjects,
+    collect_unlabeled_target_evidence,
     independent_scale_consensus,
     train_step,
 )
@@ -220,6 +221,175 @@ def test_common_bias_suppression_requires_shared_excess_and_false_positive_risk(
     )
     hard_vote_bias = estimator.common_bias_adjustment(2.0, 0.10, 0.50)
     assert hard_vote_bias[1] < 0
+
+
+def test_boundary_attractor_requires_shared_hard_soft_gap() -> None:
+    estimator = TargetPriorEstimator(
+        domain_count=1,
+        scale_count=3,
+        class_count=3,
+        source_prior=torch.tensor([0.25, 0.25, 0.50]),
+        natural_source_prior=torch.tensor([0.20, 0.20, 0.60]),
+        device=torch.device("cpu"),
+        momentum=0.0,
+    )
+    confusion = torch.tensor(
+        [
+            [0.80, 0.10, 0.10],
+            [0.10, 0.70, 0.30],
+            [0.10, 0.20, 0.60],
+        ]
+    )
+    estimator.source_confusion[0] = confusion.unsqueeze(0).expand(3, -1, -1)
+    estimator.source_hard_confusion[0] = confusion.unsqueeze(0).expand(
+        3, -1, -1
+    )
+    estimator.source_initialized.fill_(True)
+    estimator.target_initialized = True
+    probability = torch.tensor(
+        [
+            [0.25, 0.35, 0.40],
+            [0.25, 0.35, 0.40],
+            [0.25, 0.35, 0.40],
+        ]
+    )
+    estimator.target_mean_probability.copy_(probability)
+    estimator.target_hard_frequency.copy_(probability)
+
+    shared_hard = torch.tensor(
+        [
+            [0.15, 0.55, 0.30],
+            [0.20, 0.50, 0.30],
+            [0.25, 0.35, 0.40],
+        ]
+    )
+    shared = estimator.common_bias_adjustments(
+        source_excess_strength=0.0,
+        source_relative_tolerance=0.10,
+        boundary_strength=2.0,
+        boundary_ratio_tolerance=0.15,
+        maximum_adjustment=0.50,
+        boundary_mean_probability=probability,
+        boundary_hard_frequency=shared_hard,
+    )
+    assert shared["boundary_attractor"][1] < 0
+    assert shared["combined"][1] < 0
+    assert shared["combined"].min() >= -0.50
+    assert shared["boundary_attractor"][0] == 0
+    assert shared["boundary_attractor"][2] == 0
+
+    # One noisy temporal scale is rejected by the cross-scale median.
+    isolated_hard = probability.clone()
+    isolated_hard[0] = torch.tensor([0.15, 0.55, 0.30])
+    isolated = estimator.common_bias_adjustments(
+        source_excess_strength=0.0,
+        source_relative_tolerance=0.10,
+        boundary_strength=2.0,
+        boundary_ratio_tolerance=0.15,
+        maximum_adjustment=0.50,
+        boundary_mean_probability=probability,
+        boundary_hard_frequency=isolated_hard,
+    )
+    torch.testing.assert_close(isolated["combined"], torch.zeros(3))
+
+    # A confident target class shift has hard rates matching probability mass
+    # and is not mistaken for a decision-boundary attractor.
+    legitimate = estimator.common_bias_adjustments(
+        source_excess_strength=0.0,
+        source_relative_tolerance=0.10,
+        boundary_strength=2.0,
+        boundary_ratio_tolerance=0.15,
+        maximum_adjustment=0.50,
+        boundary_mean_probability=probability,
+        boundary_hard_frequency=probability,
+    )
+    torch.testing.assert_close(legitimate["combined"], torch.zeros(3))
+
+
+def test_final_unlabeled_refresh_changes_only_boundary_component() -> None:
+    estimator = TargetPriorEstimator(
+        1,
+        3,
+        3,
+        torch.tensor([0.25, 0.25, 0.50]),
+        torch.device("cpu"),
+        momentum=0.0,
+    )
+    confusion = torch.tensor(
+        [
+            [0.80, 0.10, 0.10],
+            [0.10, 0.70, 0.30],
+            [0.10, 0.20, 0.60],
+        ]
+    )
+    estimator.source_confusion[0] = confusion.unsqueeze(0).expand(3, -1, -1)
+    estimator.source_hard_confusion[0] = confusion.unsqueeze(0).expand(
+        3, -1, -1
+    )
+    estimator.source_initialized.fill_(True)
+    estimator.target_initialized = True
+    probability = torch.tensor(
+        [[0.25, 0.35, 0.40], [0.25, 0.35, 0.40], [0.25, 0.35, 0.40]]
+    )
+    estimator.target_mean_probability.copy_(probability)
+    estimator.target_hard_frequency.copy_(probability)
+    arguments = {
+        "source_excess_strength": 2.0,
+        "source_relative_tolerance": 0.10,
+        "boundary_strength": 2.0,
+        "boundary_ratio_tolerance": 0.15,
+        "maximum_adjustment": 0.50,
+    }
+    ema = estimator.common_bias_adjustments(**arguments)
+    final = estimator.common_bias_adjustments(
+        **arguments,
+        boundary_mean_probability=probability,
+        boundary_hard_frequency=torch.tensor(
+            [[0.15, 0.55, 0.30], [0.20, 0.50, 0.30], [0.25, 0.35, 0.40]]
+        ),
+    )
+    torch.testing.assert_close(ema["source_excess"], final["source_excess"])
+    assert ema["boundary_attractor"][1] == 0
+    assert final["boundary_attractor"][1] < 0
+
+
+def test_complete_target_evidence_refresh_is_unlabeled() -> None:
+    class FixedScaleModel:
+        def eval(self):
+            return self
+
+        def __call__(self, x, mask, compute_domain=False):
+            batch_size = next(iter(x.values())).shape[0]
+            logits = torch.tensor(
+                [[4.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 4.0]]
+            )
+            return {"scale_logits": logits.unsqueeze(0).expand(batch_size, -1, -1)}
+
+    batch = {
+        "x": {"1s": torch.zeros(2, 1, 62, 5)},
+        "mask": {"1s": torch.ones(2, 1, dtype=torch.bool)},
+    }
+    snapshot = collect_unlabeled_target_evidence(
+        FixedScaleModel(), [batch], torch.device("cpu"), "test evidence"
+    )
+    assert snapshot.trials == 2
+    assert snapshot.mean_probability.shape == (3, 3)
+    assert snapshot.hard_frequency.tolist() == [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ]
+
+    labeled_batch = dict(batch)
+    labeled_batch["y"] = torch.tensor([0, 1])
+    raised = False
+    try:
+        collect_unlabeled_target_evidence(
+            FixedScaleModel(), [labeled_batch], torch.device("cpu"), "test"
+        )
+    except RuntimeError as error:
+        raised = "unlabeled target view" in str(error)
+    assert raised
 
 
 def test_scale_logits_are_independent_before_cross_scale_context() -> None:
@@ -605,6 +775,7 @@ def test_multiscale_relation_graph_train_step_updates_class_edges() -> None:
     assert "estimated_target_prior" in record
     assert record["prior_logit_adjustment"] == [0.0, 0.0, 0.0]
     assert record["common_bias_logit_adjustment"] == [0.0, 0.0, 0.0]
+    assert record["boundary_attractor_logit_adjustment"] == [0.0, 0.0, 0.0]
     assert prior.source_initialized.all()
     assert prior.target_updates == 1
 
