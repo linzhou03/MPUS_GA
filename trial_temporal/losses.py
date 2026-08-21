@@ -15,6 +15,7 @@ def class_conditional_prototype_alignment_loss(
     target_probability: torch.Tensor,
     joint_weights: torch.Tensor,
     confidence_threshold: float,
+    target_valid_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, float]:
     """Align each source-domain/scale/class centroid to its target centroid.
 
@@ -38,20 +39,25 @@ def class_conditional_prototype_alignment_loss(
         raise ValueError("joint_weights must be [domains, scales, classes]")
     if any(item.ndim != 3 for item in source_embeddings):
         raise ValueError("source embeddings must be [batch, scales, features]")
+    if target_valid_mask is not None and target_valid_mask.shape != (
+        len(target_embeddings),
+    ):
+        raise ValueError("target_valid_mask must be [batch]")
 
     detached_probability = target_probability.detach()
-    confidence = detached_probability.max(dim=1).values
+    confidence, pseudo_label = detached_probability.max(dim=1)
+    valid = confidence >= confidence_threshold
+    if target_valid_mask is not None:
+        valid = valid & target_valid_mask.detach().bool().to(valid.device)
     confidence_weight = (
         (confidence - confidence_threshold)
         / max(1.0 - confidence_threshold, 1e-6)
     ).clamp(0.0, 1.0)
-    coverage = float((confidence >= confidence_threshold).float().mean())
-    losses = []
-    weights = []
+    coverage = float(valid.float().mean())
+    class_losses = []
     for class_index in range(classes):
-        target_weight = (
-            detached_probability[:, class_index] * confidence_weight
-        )
+        selected_target = valid & (pseudo_label == class_index)
+        target_weight = confidence_weight * selected_target.to(confidence_weight)
         target_mass = target_weight.sum()
         if float(target_mass) <= 1e-6:
             continue
@@ -59,6 +65,8 @@ def class_conditional_prototype_alignment_loss(
             target_embeddings * target_weight[:, None, None]
         ).sum(dim=0) / target_mass.clamp_min(1e-8)
         target_centroid = F.normalize(target_centroid, dim=-1)
+        losses = []
+        weights = []
         for domain_index, (embedding, labels) in enumerate(
             zip(source_embeddings, source_labels, strict=True)
         ):
@@ -74,12 +82,13 @@ def class_conditional_prototype_alignment_loss(
                 weights.append(
                     joint_weights[domain_index, scale_index, class_index]
                 )
-    if not losses:
+        if losses:
+            loss_tensor = torch.stack(losses)
+            weight_tensor = torch.stack(weights).detach().to(loss_tensor)
+            class_losses.append(
+                (loss_tensor * weight_tensor).sum()
+                / weight_tensor.sum().clamp_min(1e-8)
+            )
+    if not class_losses:
         return target_embeddings.sum() * 0.0, coverage
-    loss_tensor = torch.stack(losses)
-    weight_tensor = torch.stack(weights).detach().to(loss_tensor)
-    return (
-        (loss_tensor * weight_tensor).sum()
-        / weight_tensor.sum().clamp_min(1e-8),
-        coverage,
-    )
+    return torch.stack(class_losses).mean(), coverage

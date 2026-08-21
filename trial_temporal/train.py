@@ -40,7 +40,7 @@ from .model import MultiScaleMultiSourceDANN
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_DIR = PACKAGE_DIR / "data_processed"
 DEFAULT_RESULT_ROOT = PACKAGE_DIR / "results_class_conditional_multiscale"
-VARIANT = "class-conditional-multisource-multiscale"
+VARIANT = "source-anchored-scale-class-relation-graph"
 CLASS_NAMES = ("positive", "neutral", "negative")
 EVALUATION_PROTOCOL_FIXED_FINAL = "fixed_final"
 EVALUATION_PROTOCOL_CAGA_TARGET_BEST = "caga_target_best"
@@ -309,8 +309,72 @@ def _adaptation_ramp(
     return 0.5 - 0.5 * math.cos(math.pi * progress)
 
 
+@dataclass(frozen=True)
+class TargetScaleConsensus:
+    """Detached pseudo-label evidence derived only from independent scales."""
+
+    probability: torch.Tensor
+    pseudo_label: torch.Tensor
+    confidence: torch.Tensor
+    valid_mask: torch.Tensor
+    vote_count: torch.Tensor
+    js_divergence: torch.Tensor
+
+    def statistics(self, class_count: int) -> dict:
+        valid_labels = self.pseudo_label[self.valid_mask]
+        counts = torch.bincount(valid_labels, minlength=class_count)
+        return {
+            "coverage": float(self.valid_mask.float().mean()),
+            "class_counts": counts.cpu().tolist(),
+            "mean_confidence": float(self.confidence.mean()),
+            "mean_js_divergence": float(self.js_divergence.mean()),
+            "mean_vote_count": float(self.vote_count.float().mean()),
+        }
+
+
+@torch.no_grad()
+def independent_scale_consensus(
+    scale_logits: torch.Tensor,
+    confidence_threshold: float,
+    js_divergence_threshold: float,
+    minimum_votes: int,
+) -> TargetScaleConsensus:
+    """Build target pseudo-labels before relation-guided fusion (issue 7)."""
+
+    if scale_logits.ndim != 3:
+        raise ValueError("scale_logits must be [batch, scales, classes]")
+    scale_probability = F.softmax(scale_logits.detach(), dim=-1)
+    consensus = scale_probability.mean(dim=1)
+    confidence, pseudo_label = consensus.max(dim=1)
+    vote_count = (scale_probability.argmax(dim=-1) == pseudo_label[:, None]).sum(
+        dim=1
+    )
+    consensus_safe = consensus.clamp_min(1e-8)
+    js_divergence = (
+        scale_probability
+        * (
+            torch.log(scale_probability.clamp_min(1e-8))
+            - torch.log(consensus_safe[:, None, :])
+        )
+    ).sum(dim=-1).mean(dim=1)
+    required_votes = min(max(int(minimum_votes), 1), scale_logits.shape[1])
+    valid = (
+        (confidence >= confidence_threshold)
+        & (vote_count >= required_votes)
+        & (js_divergence <= js_divergence_threshold)
+    )
+    return TargetScaleConsensus(
+        probability=consensus,
+        pseudo_label=pseudo_label,
+        confidence=confidence,
+        valid_mask=valid,
+        vote_count=vote_count,
+        js_divergence=js_divergence,
+    )
+
+
 class PrototypeBank:
-    """EMA source/target prototypes indexed by domain, scale, and class."""
+    """EMA prototypes plus a source-anchored scale-class relation graph."""
 
     def __init__(
         self,
@@ -322,10 +386,16 @@ class PrototypeBank:
         temperature: float,
         uniform_mix: float,
         device: torch.device,
+        relation_momentum: float = 0.99,
+        relation_temperature: float = 0.25,
+        relation_uniform_mix: float = 0.10,
     ) -> None:
         self.momentum = float(momentum)
         self.temperature = float(temperature)
         self.uniform_mix = float(uniform_mix)
+        self.relation_momentum = float(relation_momentum)
+        self.relation_temperature = float(relation_temperature)
+        self.relation_uniform_mix = float(relation_uniform_mix)
         self.source = torch.zeros(
             domain_count, scale_count, class_count, feature_dim, device=device
         )
@@ -337,6 +407,20 @@ class PrototypeBank:
         )
         self.target_initialized = torch.zeros(
             scale_count, class_count, dtype=torch.bool, device=device
+        )
+        self.source_relation = torch.full(
+            (domain_count, scale_count, class_count),
+            1.0 / scale_count,
+            device=device,
+        )
+        self.source_relation_initialized = torch.zeros(
+            domain_count, class_count, dtype=torch.bool, device=device
+        )
+        self.source_relation_updates = torch.zeros(
+            domain_count, class_count, dtype=torch.long, device=device
+        )
+        self.target_class_updates = torch.zeros(
+            class_count, dtype=torch.long, device=device
         )
 
     @torch.no_grad()
@@ -374,20 +458,84 @@ class PrototypeBank:
                 )
 
     @torch.no_grad()
+    def update_source_relation(
+        self,
+        domain_index: int,
+        scale_logits: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> None:
+        """Estimate scale-to-class edges from class-wise source margins."""
+
+        if scale_logits.ndim != 3:
+            raise ValueError("scale_logits must be [batch, scales, classes]")
+        if scale_logits.shape[1:3] != self.source_relation.shape[1:3]:
+            raise ValueError("scale_logits do not match relation graph shape")
+        detached = scale_logits.detach()
+        for class_index in range(self.source_relation.shape[2]):
+            selected = labels == class_index
+            if not torch.any(selected):
+                continue
+            class_logits = detached[selected]
+            correct = class_logits[:, :, class_index]
+            other_mask = torch.ones(
+                class_logits.shape[-1], dtype=torch.bool, device=detached.device
+            )
+            other_mask[class_index] = False
+            strongest_other = class_logits[:, :, other_mask].amax(dim=-1)
+            mean_margin = (correct - strongest_other).mean(dim=0)
+            relation = F.softmax(
+                mean_margin / self.relation_temperature, dim=0
+            )
+            index = (domain_index, class_index)
+            if bool(self.source_relation_initialized[index]):
+                self.source_relation[domain_index, :, class_index].mul_(
+                    self.relation_momentum
+                ).add_(relation, alpha=1.0 - self.relation_momentum)
+                self.source_relation[domain_index, :, class_index].div_(
+                    self.source_relation[domain_index, :, class_index]
+                    .sum()
+                    .clamp_min(1e-8)
+                )
+            else:
+                self.source_relation[domain_index, :, class_index].copy_(
+                    relation
+                )
+                self.source_relation_initialized[index] = True
+            self.source_relation_updates[index] += 1
+
+    @torch.no_grad()
+    def source_relation_weights(self) -> torch.Tensor:
+        uniform = torch.full_like(
+            self.source_relation, 1.0 / self.source_relation.shape[1]
+        )
+        mixed = (
+            (1.0 - self.relation_uniform_mix) * self.source_relation
+            + self.relation_uniform_mix * uniform
+        )
+        return mixed / mixed.sum(dim=1, keepdim=True).clamp_min(1e-8)
+
+    @torch.no_grad()
     def update_target(
         self,
         embeddings: torch.Tensor,
         probability: torch.Tensor,
         confidence_threshold: float,
+        valid_mask: torch.Tensor | None = None,
     ) -> float:
         probability = probability.detach()
-        confidence = probability.max(dim=1).values
+        confidence, pseudo_label = probability.max(dim=1)
+        valid = confidence >= confidence_threshold
+        if valid_mask is not None:
+            if valid_mask.shape != valid.shape:
+                raise ValueError("valid_mask must be [batch]")
+            valid = valid & valid_mask.detach().bool().to(valid.device)
         confidence_weight = (
             (confidence - confidence_threshold)
             / max(1.0 - confidence_threshold, 1e-6)
         ).clamp(0.0, 1.0)
         for class_index in range(self.target.shape[1]):
-            weight = probability[:, class_index] * confidence_weight
+            selected = valid & (pseudo_label == class_index)
+            weight = selected.to(confidence_weight) * confidence_weight
             mass = weight.sum()
             if float(mass) <= 1e-6:
                 continue
@@ -400,14 +548,16 @@ class PrototypeBank:
                     (scale_index, class_index),
                     centroids[scale_index],
                 )
-        return float((confidence >= confidence_threshold).float().mean())
+            self.target_class_updates[class_index] += int(selected.sum())
+        return float(valid.float().mean())
 
     @torch.no_grad()
     def joint_weights(self) -> torch.Tensor:
         domains, scales, classes, _ = self.source.shape
-        result = self.source.new_full(
-            (domains, scales, classes), 1.0 / (domains * scales)
-        )
+        source_relation = self.source_relation_weights()
+        result = source_relation / source_relation.sum(
+            dim=(0, 1), keepdim=True
+        ).clamp_min(1e-8)
         for class_index in range(classes):
             target_ready = self.target_initialized[:, class_index]
             source_ready = self.source_initialized[:, :, class_index]
@@ -419,7 +569,10 @@ class PrototypeBank:
                 self.source[:, :, class_index],
                 self.target[:, class_index],
             )
-            logits = (similarity / self.temperature).masked_fill(~valid, -1e9)
+            logits = (
+                torch.log(source_relation[:, :, class_index].clamp_min(1e-8))
+                + similarity / self.temperature
+            ).masked_fill(~valid, -1e9)
             learned = F.softmax(logits.flatten(), dim=0).reshape(domains, scales)
             uniform = torch.full_like(learned, 1.0 / learned.numel())
             result[:, :, class_index] = (
@@ -468,40 +621,135 @@ class PrototypeBank:
                 domain_values.append(scale_values)
             distances.append(domain_values)
         return {
+            "source_scale_class_relation": (
+                self.source_relation_weights().cpu().tolist()
+            ),
+            "source_relation_initialized": (
+                self.source_relation_initialized.cpu().tolist()
+            ),
+            "source_relation_updates": self.source_relation_updates.cpu().tolist(),
             "joint_source_scale_class_weights": self.joint_weights().cpu().tolist(),
             "scale_class_reliability": self.scale_class_reliability().cpu().tolist(),
             "source_initialized": self.source_initialized.cpu().tolist(),
             "target_initialized": self.target_initialized.cpu().tolist(),
+            "target_class_updates": self.target_class_updates.cpu().tolist(),
             "prototype_cosine_distance": distances,
         }
+
+
+def _scale_classification_loss(
+    scale_logits: torch.Tensor,
+    labels: torch.Tensor,
+    label_smoothing: float,
+) -> torch.Tensor:
+    if scale_logits.shape[1] == 1:
+        return scale_logits.sum() * 0.0
+    repeated_labels = labels[:, None].expand(-1, scale_logits.shape[1]).reshape(-1)
+    return F.cross_entropy(
+        scale_logits.reshape(-1, scale_logits.shape[-1]),
+        repeated_labels,
+        label_smoothing=label_smoothing,
+    )
+
+
+def _gate_supervision_loss(
+    scale_logits: torch.Tensor,
+    scale_class_weight: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """Teach the true-class gate which independent scale has lower error."""
+
+    if scale_logits.shape[1] == 1:
+        return scale_logits.sum() * 0.0
+    true_logit = scale_logits.gather(
+        2,
+        labels[:, None, None].expand(-1, scale_logits.shape[1], 1),
+    ).squeeze(-1)
+    log_normalizer = torch.logsumexp(scale_logits, dim=-1)
+    per_scale_nll = -(true_logit - log_normalizer)
+    teacher = F.softmax(-per_scale_nll.detach() / temperature, dim=1)
+    predicted = scale_class_weight.gather(
+        2,
+        labels[:, None, None].expand(-1, scale_logits.shape[1], 1),
+    ).squeeze(-1)
+    predicted = predicted / predicted.sum(dim=1, keepdim=True).clamp_min(1e-8)
+    return F.kl_div(
+        torch.log(predicted.clamp_min(1e-8)), teacher, reduction="batchmean"
+    )
+
+
+def _class_balanced_domain_ce(
+    logits: torch.Tensor,
+    domain_index: int,
+    class_labels: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+) -> torch.Tensor | None:
+    if valid_mask is None:
+        valid_mask = torch.ones_like(class_labels, dtype=torch.bool)
+    else:
+        valid_mask = valid_mask.bool().to(class_labels.device)
+    domain_labels = torch.full(
+        (len(logits),), domain_index, dtype=torch.long, device=logits.device
+    )
+    sample_loss = F.cross_entropy(logits, domain_labels, reduction="none")
+    class_losses = []
+    for class_index in range(NUM_CLASSES):
+        selected = valid_mask & (class_labels == class_index)
+        if torch.any(selected):
+            class_losses.append(sample_loss[selected].mean())
+    if not class_losses:
+        return None
+    return torch.stack(class_losses).mean()
 
 
 def _domain_loss(
     source_outputs: list[dict],
     target_output: dict,
+    source_labels: list[torch.Tensor],
+    target_consensus: TargetScaleConsensus,
 ) -> tuple[torch.Tensor, list[float]]:
+    if not torch.any(target_consensus.valid_mask):
+        if target_output["scale_domain_logits"] is not None:
+            logits = target_output["scale_domain_logits"]
+            return logits.sum() * 0.0, [0.0] * logits.shape[1]
+        logits = target_output["fused_domain_logits"]
+        return logits.sum() * 0.0, [0.0]
     all_outputs = source_outputs + [target_output]
+    all_class_labels = source_labels + [target_consensus.pseudo_label]
+    all_valid_masks = [None] * len(source_outputs) + [target_consensus.valid_mask]
     if target_output["scale_domain_logits"] is not None:
         scale_losses = []
         for scale_index in range(target_output["scale_domain_logits"].shape[1]):
             domain_losses = []
-            for domain_index, output in enumerate(all_outputs):
-                logits = output["scale_domain_logits"][:, scale_index]
-                labels = torch.full(
-                    (len(logits),), domain_index, dtype=torch.long, device=logits.device
+            for domain_index, (output, class_labels, valid_mask) in enumerate(
+                zip(
+                    all_outputs,
+                    all_class_labels,
+                    all_valid_masks,
+                    strict=True,
                 )
-                domain_losses.append(F.cross_entropy(logits, labels))
+            ):
+                logits = output["scale_domain_logits"][:, scale_index]
+                loss = _class_balanced_domain_ce(
+                    logits, domain_index, class_labels, valid_mask
+                )
+                if loss is not None:
+                    domain_losses.append(loss)
             scale_losses.append(torch.stack(domain_losses).mean())
         return torch.stack(scale_losses).mean(), [
             float(item.detach()) for item in scale_losses
         ]
     domain_losses = []
-    for domain_index, output in enumerate(all_outputs):
+    for domain_index, (output, class_labels, valid_mask) in enumerate(
+        zip(all_outputs, all_class_labels, all_valid_masks, strict=True)
+    ):
         logits = output["fused_domain_logits"]
-        labels = torch.full(
-            (len(logits),), domain_index, dtype=torch.long, device=logits.device
+        loss = _class_balanced_domain_ce(
+            logits, domain_index, class_labels, valid_mask
         )
-        domain_losses.append(F.cross_entropy(logits, labels))
+        if loss is not None:
+            domain_losses.append(loss)
     loss = torch.stack(domain_losses).mean()
     return loss, [float(loss.detach())]
 
@@ -522,7 +770,14 @@ def train_step(
     adaptation_warmup_iterations: int,
     adaptation_ramp_end: int,
     pseudo_confidence_threshold: float,
+    consensus_jsd_threshold: float = 0.15,
+    consensus_minimum_votes: int = 2,
+    scale_classification_weight: float = 0.30,
+    gate_supervision_weight: float = 0.10,
+    gate_teacher_temperature: float = 0.25,
 ) -> dict:
+    if "y" in target_batch:
+        raise RuntimeError("Target adaptation batch unexpectedly contains labels")
     model.train()
     optimizer.zero_grad(set_to_none=True)
     ramp = _adaptation_ramp(
@@ -531,7 +786,7 @@ def train_step(
     adaptation_active = iteration > adaptation_warmup_iterations
     reliability = (
         prototype_bank.scale_class_reliability()
-        if prototype_bank is not None and adaptation_active
+        if prototype_bank is not None
         else None
     )
     source_outputs = []
@@ -556,14 +811,42 @@ def train_step(
         scale_class_reliability=reliability,
     )
 
-    classification_by_source = torch.stack(
+    target_consensus = independent_scale_consensus(
+        target_output["scale_logits"],
+        pseudo_confidence_threshold,
+        consensus_jsd_threshold,
+        consensus_minimum_votes,
+    )
+
+    fused_classification_by_source = torch.stack(
         [
             F.cross_entropy(
                 output["logits"], labels, label_smoothing=label_smoothing
             )
-            for output, labels in zip(
-                source_outputs, source_labels, strict=True
+            for output, labels in zip(source_outputs, source_labels, strict=True)
+        ]
+    )
+    scale_classification_by_source = torch.stack(
+        [
+            _scale_classification_loss(
+                output["scale_logits"], labels, label_smoothing
             )
+            for output, labels in zip(source_outputs, source_labels, strict=True)
+        ]
+    )
+    classification_by_source = (
+        fused_classification_by_source
+        + scale_classification_weight * scale_classification_by_source
+    )
+    gate_supervision_by_source = torch.stack(
+        [
+            _gate_supervision_loss(
+                output["scale_logits"],
+                output["scale_class_weight"],
+                labels,
+                gate_teacher_temperature,
+            )
+            for output, labels in zip(source_outputs, source_labels, strict=True)
         ]
     )
     source_weights = (
@@ -574,31 +857,44 @@ def train_step(
         )
     )
     classification_loss = (classification_by_source * source_weights).sum()
-    domain_loss, domain_by_scale = _domain_loss(source_outputs, target_output)
+    gate_supervision_loss = (
+        gate_supervision_by_source * source_weights
+    ).sum()
+    domain_loss, domain_by_scale = _domain_loss(
+        source_outputs,
+        target_output,
+        source_labels,
+        target_consensus,
+    )
     if prototype_bank is not None and adaptation_active:
         prototype_loss, pseudo_coverage = (
             class_conditional_prototype_alignment_loss(
                 [output["scale_embeddings"] for output in source_outputs],
                 source_labels,
                 target_output["scale_embeddings"],
-                target_output["probability"],
+                target_consensus.probability,
                 prototype_bank.joint_weights(),
                 pseudo_confidence_threshold,
+                target_consensus.valid_mask,
             )
         )
     else:
         prototype_loss = target_output["logits"].sum() * 0.0
         pseudo_coverage = float(
             (
-                target_output["probability"].max(dim=1).values
-                >= pseudo_confidence_threshold
+                target_consensus.valid_mask
             )
             .float()
             .mean()
         )
-    total_loss = classification_loss + ramp * (
-        spec.domain_weight * domain_loss
-        + spec.prototype_weight * prototype_loss
+    total_loss = (
+        classification_loss
+        + gate_supervision_weight * gate_supervision_loss
+        + ramp
+        * (
+            spec.domain_weight * domain_loss
+            + spec.prototype_weight * prototype_loss
+        )
     )
     total_loss.backward()
     gradient_norm = torch.nn.utils.clip_grad_norm_(
@@ -614,11 +910,15 @@ def train_step(
             prototype_bank.update_source(
                 domain_index, output["scale_embeddings"], labels
             )
+            prototype_bank.update_source_relation(
+                domain_index, output["scale_logits"], labels
+            )
         if adaptation_active:
             pseudo_coverage = prototype_bank.update_target(
                 target_output["scale_embeddings"],
-                target_output["probability"],
+                target_consensus.probability,
                 pseudo_confidence_threshold,
+                target_consensus.valid_mask,
             )
         else:
             pseudo_coverage = 0.0
@@ -626,6 +926,17 @@ def train_step(
         source_weights = prototype_bank.source_weights(source_class_priors)
 
     mean_gate = target_output["scale_class_weight"].detach().mean(dim=0)
+    consensus_statistics = target_consensus.statistics(NUM_CLASSES)
+    if not adaptation_active:
+        consensus_statistics["active_class_counts"] = [0] * NUM_CLASSES
+        consensus_statistics["active_coverage"] = 0.0
+    else:
+        consensus_statistics["active_class_counts"] = consensus_statistics[
+            "class_counts"
+        ]
+        consensus_statistics["active_coverage"] = consensus_statistics[
+            "coverage"
+        ]
     record = {
         "iteration": iteration,
         "adaptation_ramp": ramp,
@@ -634,6 +945,13 @@ def train_step(
         ),
         "total": float(total_loss.detach()),
         "classification": float(classification_loss.detach()),
+        "fused_classification": float(
+            (fused_classification_by_source * source_weights).sum().detach()
+        ),
+        "scale_classification": float(
+            (scale_classification_by_source * source_weights).sum().detach()
+        ),
+        "gate_supervision": float(gate_supervision_loss.detach()),
         "classification_by_source": [
             float(value) for value in classification_by_source.detach()
         ],
@@ -641,6 +959,7 @@ def train_step(
         "domain_by_scale": domain_by_scale,
         "prototype": float(prototype_loss.detach()),
         "pseudo_label_coverage": pseudo_coverage,
+        "target_scale_consensus": consensus_statistics,
         "source_weights": [float(value) for value in source_weights.detach()],
         "mean_target_scale_class_gate": mean_gate.cpu().tolist(),
         "gradient_norm": float(gradient_norm),
@@ -649,6 +968,9 @@ def train_step(
     if prototype_bank is not None:
         record["joint_source_scale_class_weights"] = (
             prototype_bank.joint_weights().cpu().tolist()
+        )
+        record["source_scale_class_relation"] = (
+            prototype_bank.source_relation_weights().cpu().tolist()
         )
         record["scale_class_reliability"] = reliability.cpu().tolist()
     return record
@@ -670,6 +992,8 @@ def _classification_metrics(labels: np.ndarray, probability: np.ndarray) -> dict
         "macro_f1": float(
             f1_score(labels, prediction, average="macro", zero_division=0)
         ),
+        "worst_class_recall": float(recall.min()),
+        "recall_gap": float(recall.max() - recall.min()),
         "confusion_matrix": matrix.tolist(),
         "per_class_recall": {
             name: float(value) for name, value in zip(CLASS_NAMES, recall, strict=True)
@@ -782,6 +1106,12 @@ def _write_summary(result_dir: Path) -> None:
             "balanced_accuracy",
         ),
         "trial_macro_f1": ("evaluation", "fused", "macro_f1"),
+        "worst_class_recall": (
+            "evaluation",
+            "fused",
+            "worst_class_recall",
+        ),
+        "recall_gap": ("evaluation", "fused", "recall_gap"),
     }
     for class_name in CLASS_NAMES:
         metric_paths[f"recall_{class_name}"] = (
@@ -901,6 +1231,7 @@ def run_fold(
         fusion_mode=spec.fusion_mode,
         domain_mode=spec.domain_mode,
         detach_domain_probability=True,
+        relation_strength=args.relation_strength,
     ).to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     optimizer = torch.optim.AdamW(
@@ -919,6 +1250,9 @@ def run_fold(
             args.reliability_temperature,
             args.reliability_uniform_mix,
             device,
+            relation_momentum=args.relation_momentum,
+            relation_temperature=args.relation_temperature,
+            relation_uniform_mix=args.relation_uniform_mix,
         )
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -966,6 +1300,11 @@ def run_fold(
             args.adaptation_warmup_iterations,
             args.adaptation_ramp_end,
             args.pseudo_confidence_threshold,
+            args.consensus_jsd_threshold,
+            args.consensus_minimum_votes,
+            args.scale_classification_weight,
+            args.gate_supervision_weight,
+            args.gate_teacher_temperature,
         )
         if iteration == 1 or iteration % args.log_interval == 0 or iteration == iterations:
             training_trace.append(record)
@@ -1068,6 +1407,10 @@ def run_fold(
             "dim_feedforward": args.dim_feedforward,
             "dropout": args.dropout,
             "spatial_topk": args.spatial_topk,
+            "relation_strength": args.relation_strength,
+            "issue_7_independence_boundary": (
+                "scale logits precede all cross-scale context and relation fusion"
+            ),
         },
         "optimization": {
             "source_batch_size": args.source_batch_size,
@@ -1085,6 +1428,15 @@ def run_fold(
             "prototype_momentum": args.prototype_momentum,
             "reliability_temperature": args.reliability_temperature,
             "reliability_uniform_mix": args.reliability_uniform_mix,
+            "relation_momentum": args.relation_momentum,
+            "relation_temperature": args.relation_temperature,
+            "relation_uniform_mix": args.relation_uniform_mix,
+            "relation_strength": args.relation_strength,
+            "scale_classification_weight": args.scale_classification_weight,
+            "gate_supervision_weight": args.gate_supervision_weight,
+            "gate_teacher_temperature": args.gate_teacher_temperature,
+            "consensus_jsd_threshold": args.consensus_jsd_threshold,
+            "consensus_minimum_votes": args.consensus_minimum_votes,
             "removed_losses": [
                 "supervised_contrastive",
                 "information_maximization",
@@ -1136,6 +1488,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prototype-momentum", type=float, default=0.90)
     parser.add_argument("--reliability-temperature", type=float, default=0.15)
     parser.add_argument("--reliability-uniform-mix", type=float, default=0.10)
+    parser.add_argument("--relation-momentum", type=float, default=0.99)
+    parser.add_argument("--relation-temperature", type=float, default=0.25)
+    parser.add_argument("--relation-uniform-mix", type=float, default=0.10)
+    parser.add_argument("--relation-strength", type=float, default=1.0)
+    parser.add_argument("--scale-classification-weight", type=float, default=0.30)
+    parser.add_argument("--gate-supervision-weight", type=float, default=0.10)
+    parser.add_argument("--gate-teacher-temperature", type=float, default=0.25)
+    parser.add_argument("--consensus-jsd-threshold", type=float, default=0.15)
+    parser.add_argument("--consensus-minimum-votes", type=int, default=2)
     parser.add_argument("--channel-attention-reduction", type=int, default=4)
     parser.add_argument("--d-model", type=int, default=96)
     parser.add_argument("--num-heads", type=int, default=4)
@@ -1217,6 +1578,21 @@ def validate_args(args, spec: ExperimentSpec) -> None:
         raise ValueError("reliability-temperature must be positive")
     if not 0 <= args.reliability_uniform_mix <= 1:
         raise ValueError("reliability-uniform-mix must be within [0,1]")
+    if not 0 <= args.relation_momentum < 1:
+        raise ValueError("relation-momentum must be within [0,1)")
+    if args.relation_temperature <= 0 or args.gate_teacher_temperature <= 0:
+        raise ValueError("relation and gate temperatures must be positive")
+    if not 0 <= args.relation_uniform_mix <= 1:
+        raise ValueError("relation-uniform-mix must be within [0,1]")
+    if min(
+        args.relation_strength,
+        args.scale_classification_weight,
+        args.gate_supervision_weight,
+        args.consensus_jsd_threshold,
+    ) < 0:
+        raise ValueError("relation/loss weights and JSD threshold are nonnegative")
+    if args.consensus_minimum_votes < 1:
+        raise ValueError("consensus-minimum-votes must be positive")
     if args.channel_attention_reduction < 1:
         raise ValueError("channel-attention-reduction must be positive")
 
@@ -1235,6 +1611,10 @@ def main() -> None:
     tqdm.write(
         f"Experiment={spec.name}: {spec.description}; "
         f"sources={spec.source_domains}; scales={spec.scales}; device={device}"
+    )
+    tqdm.write(
+        "Method: source-anchored scale-class relation graph; independent "
+        "per-scale logits precede all cross-scale context and fusion"
     )
     if args.evaluation_protocol == EVALUATION_PROTOCOL_CAGA_TARGET_BEST:
         tqdm.write(

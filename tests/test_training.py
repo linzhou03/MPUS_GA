@@ -26,9 +26,11 @@ from MPUS_GA.trial_temporal.train import (  # noqa: E402
     EXPERIMENTS,
     PrototypeBank,
     _adaptation_ramp,
+    _class_balanced_domain_ce,
     _should_evaluate_target,
     _target_evaluation_is_better,
     _target_subjects,
+    independent_scale_consensus,
     train_step,
 )
 
@@ -105,6 +107,37 @@ def test_scale_logits_are_independent_before_cross_scale_context() -> None:
     )
 
 
+def test_relation_graph_changes_only_fusion_not_independent_scale_logits() -> None:
+    model = _small_model(scales=(1.0, 2.0), num_domains=2)
+    model.eval()
+    x = {
+        "1s": torch.randn(3, 2, 62, 5),
+        "2s": torch.randn(3, 2, 62, 5),
+    }
+    mask = {
+        "1s": torch.ones(3, 2, dtype=torch.bool),
+        "2s": torch.ones(3, 2, dtype=torch.bool),
+    }
+    first_relation = torch.tensor([[0.95, 0.05, 0.50], [0.05, 0.95, 0.50]])
+    second_relation = torch.tensor([[0.05, 0.95, 0.50], [0.95, 0.05, 0.50]])
+    with torch.no_grad():
+        first = model(
+            x,
+            mask,
+            compute_domain=False,
+            scale_class_reliability=first_relation,
+        )
+        second = model(
+            x,
+            mask,
+            compute_domain=False,
+            scale_class_reliability=second_relation,
+        )
+    torch.testing.assert_close(first["scale_embeddings"], second["scale_embeddings"])
+    torch.testing.assert_close(first["scale_logits"], second["scale_logits"])
+    assert not torch.allclose(first["logits"], second["logits"])
+
+
 def test_scale_conditional_domain_head_detaches_classifier_probability() -> None:
     model = _small_model()
     x = {"1s": torch.randn(3, 2, 62, 5)}
@@ -147,6 +180,60 @@ def test_prototype_bank_retains_missing_classes_and_normalizes_weights() -> None
     torch.testing.assert_close(
         bank.scale_class_reliability().sum(dim=0), torch.ones(3)
     )
+
+
+def test_source_scale_class_relation_is_class_normalized_and_count_invariant() -> None:
+    device = torch.device("cpu")
+    labels = torch.tensor([0, 1, 2])
+    logits = torch.zeros(3, 3, 3)
+    logits[0, 0, 0] = 5.0
+    logits[1, 1, 1] = 5.0
+    logits[2, 2, 2] = 5.0
+    first = PrototypeBank(1, 3, 3, 4, 0.9, 0.15, 0.1, device)
+    second = PrototypeBank(1, 3, 3, 4, 0.9, 0.15, 0.1, device)
+    first.update_source_relation(0, logits, labels)
+    duplicated_logits = torch.cat((logits, logits[2:].repeat(8, 1, 1)))
+    duplicated_labels = torch.cat((labels, labels[2:].repeat(8)))
+    second.update_source_relation(0, duplicated_logits, duplicated_labels)
+    first_relation = first.source_relation_weights()[0]
+    second_relation = second.source_relation_weights()[0]
+    torch.testing.assert_close(first_relation.sum(dim=0), torch.ones(3))
+    torch.testing.assert_close(first_relation, second_relation)
+    assert torch.equal(first_relation.argmax(dim=0), torch.tensor([0, 1, 2]))
+
+
+def test_independent_scale_consensus_uses_votes_without_fused_predictions() -> None:
+    logits = torch.tensor(
+        [
+            [[8.0, 0.0, 0.0], [7.0, 0.0, 0.0], [6.0, 0.0, 0.0]],
+            [[8.0, 0.0, 0.0], [0.0, 8.0, 0.0], [0.0, 0.0, 8.0]],
+            [[0.0, 8.0, 0.0], [0.0, 7.0, 0.0], [0.0, 0.0, 0.0]],
+        ]
+    )
+    consensus = independent_scale_consensus(
+        logits,
+        confidence_threshold=0.6,
+        js_divergence_threshold=1.0,
+        minimum_votes=2,
+    )
+    assert consensus.valid_mask.tolist() == [True, False, True]
+    assert consensus.pseudo_label.tolist() == [0, 0, 1]
+    assert consensus.vote_count.tolist() == [3, 1, 2]
+
+
+def test_class_balanced_domain_loss_ignores_majority_duplication() -> None:
+    logits = torch.tensor(
+        [[2.0, -1.0], [1.0, -0.5], [0.5, 0.0]], requires_grad=True
+    )
+    labels = torch.tensor([0, 1, 2])
+    original = _class_balanced_domain_ce(logits, 0, labels)
+    duplicated_logits = torch.cat((logits, logits[2:].repeat(8, 1)))
+    duplicated_labels = torch.cat((labels, labels[2:].repeat(8)))
+    duplicated = _class_balanced_domain_ce(
+        duplicated_logits, 0, duplicated_labels
+    )
+    assert original is not None and duplicated is not None
+    torch.testing.assert_close(original, duplicated)
 
 
 def test_prototype_alignment_is_differentiable() -> None:
@@ -282,6 +369,88 @@ def test_full_train_step_uses_unlabeled_target_and_updates_bank() -> None:
     assert bank.source_initialized.all()
 
 
+def test_multiscale_relation_graph_train_step_updates_class_edges() -> None:
+    device = torch.device("cpu")
+    model = _small_model(scales=(1.0, 2.0, 4.0), num_domains=2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    labels = torch.tensor([0, 1, 2])
+
+    def features() -> dict:
+        return {
+            key: torch.randn(3, 2, 62, 5)
+            for key in ("1s", "2s", "4s")
+        }
+
+    masks = {
+        key: torch.ones(3, 2, dtype=torch.bool)
+        for key in ("1s", "2s", "4s")
+    }
+    source_batch = {
+        "x": features(),
+        "mask": masks,
+        "y": labels,
+        "domain_id": torch.zeros(3, dtype=torch.long),
+    }
+    target_batch = {
+        "x": features(),
+        "mask": masks,
+        "domain_id": torch.ones(3, dtype=torch.long),
+    }
+    bank = PrototypeBank(1, 3, 3, 32, 0.9, 0.15, 0.1, device)
+    record = train_step(
+        model,
+        [source_batch],
+        target_batch,
+        optimizer,
+        scheduler,
+        device,
+        iteration=301,
+        spec=EXPERIMENTS["A6"],
+        source_class_priors=torch.tensor([[0.3, 0.1, 0.6]]),
+        prototype_bank=bank,
+        label_smoothing=0.1,
+        gradient_clip=5.0,
+        adaptation_warmup_iterations=300,
+        adaptation_ramp_end=600,
+        pseudo_confidence_threshold=0.0,
+        consensus_jsd_threshold=1.0,
+        consensus_minimum_votes=1,
+    )
+    assert bank.source_relation_initialized.all()
+    torch.testing.assert_close(
+        bank.source_relation_weights().sum(dim=1), torch.ones(1, 3)
+    )
+    assert record["scale_classification"] > 0
+    assert record["gate_supervision"] >= 0
+    assert record["prototype_updates_active"]
+
+
+def test_train_step_rejects_target_labels_before_model_access() -> None:
+    raised = False
+    try:
+        train_step(
+            None,
+            [],
+            {"y": torch.tensor([0])},
+            None,
+            None,
+            torch.device("cpu"),
+            1,
+            EXPERIMENTS["A6"],
+            torch.ones(1, 3) / 3,
+            None,
+            0.1,
+            5.0,
+            300,
+            600,
+            0.6,
+        )
+    except RuntimeError as error:
+        raised = "Target adaptation batch" in str(error)
+    assert raised
+
+
 def test_target_prototype_updates_start_after_adaptation_warmup() -> None:
     device = torch.device("cpu")
     model = _small_model(num_domains=2)
@@ -326,7 +495,8 @@ def test_target_prototype_updates_start_after_adaptation_warmup() -> None:
     assert warmup_record["pseudo_label_coverage"] == 0.0
 
     adaptation_record = run(301)
-    assert bank.target_initialized.all()
+    assert bank.target_initialized.any()
+    assert bank.target_class_updates.sum() > 0
     assert adaptation_record["prototype_updates_active"]
 
 

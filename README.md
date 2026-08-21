@@ -219,6 +219,63 @@ embedding. Consequently, per-scale metrics are genuine independent-scale
 evidence, and their comparison with the fused output is a valid multiscale
 ablation.
 
+### Source-anchored scale-class relation graph
+
+The current method represents the association between the three temporal
+scales and three emotion classes as a source-supervised bipartite relation
+matrix. For every source domain, the matrix has shape `[3 scales, 3 classes]`.
+Each edge is estimated from the class-wise mean correct-class margin of an
+independent scale classifier, normalized over scales separately for each
+class, updated by EMA, and shrunk slightly toward uniform. Class-wise
+normalization means duplicating majority-class samples cannot increase that
+class's contribution merely through sample count.
+
+During target adaptation, pseudo-label evidence is constructed only by
+averaging the independent per-scale probabilities. A target trial is eligible
+only when its consensus confidence, scale vote count, and Jensen-Shannon
+agreement pass their thresholds. These detached consensus labels update
+scale/class target prototypes after iteration 300. Source-target prototype
+cosine similarity then corrects the source relation matrix, and the resulting
+scale/class reliability enters only the downstream class-dependent fusion
+gate.
+
+The hard issue-7 boundary is therefore:
+
+```text
+each scale input -> its own embedding -> its own logits
+                                        |
+all independent evidence ---------------+
+  -> source scale-class relation + target prototype correction
+  -> cross-scale context and class-dependent fusion
+  -> fused logits
+```
+
+Neither cross-scale context nor relation-graph output can feed back into the
+forward computation of a per-scale embedding or logit. Target pseudo-labels
+also cannot be obtained from relation-guided fused logits. Regression tests
+perturb other-scale inputs and the relation matrix independently and require
+every unaffected per-scale embedding/logit to remain identical.
+
+The source objective adds mean independent-scale classification loss with
+weight 0.3 and a source-label scale-gate supervision loss with weight 0.1.
+Conditional domain and prototype losses use class-wise means before averaging
+over valid pseudo classes, so the negative majority cannot dominate adaptation
+through sample count. This balances optimization contributions without
+forcing the target prediction prior to be uniform.
+
+New fixed-final A6/B6 runs use isolated paths:
+
+```text
+results_scale_class_relation_graph/A6/
+results_scale_class_relation_graph/B6/
+logs/scale_class_relation_graph/A6.log
+logs/scale_class_relation_graph/B6.log
+```
+
+Result JSON files record the source relation matrix, corrected joint
+reliability, per-class target pseudo-label counts, worst-class recall, and the
+maximum per-class recall gap in addition to the existing metrics.
+
 The full method maintains EMA prototypes for every source-domain/scale/class
 combination from source truth labels and scale/class target prototypes from
 high-confidence, unlabeled target predictions. Their cosine agreement controls
