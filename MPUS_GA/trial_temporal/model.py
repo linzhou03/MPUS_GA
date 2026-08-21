@@ -216,6 +216,7 @@ class MultiScaleMultiSourceDANN(nn.Module):
         fusion_mode: str = "class_conditional",
         domain_mode: str = "scale_conditional",
         detach_domain_probability: bool = True,
+        relation_strength: float = 1.0,
     ) -> None:
         super().__init__()
         self.scales = tuple(sorted(map(float, scales)))
@@ -229,6 +230,8 @@ class MultiScaleMultiSourceDANN(nn.Module):
             raise ValueError(f"Unsupported fusion mode: {fusion_mode}")
         if domain_mode not in self.VALID_DOMAIN_MODES:
             raise ValueError(f"Unsupported domain mode: {domain_mode}")
+        if relation_strength < 0:
+            raise ValueError("relation_strength must be nonnegative")
         self.scale_keys = tuple(scale_key(scale) for scale in self.scales)
         self.num_classes = int(num_classes)
         self.num_domains = int(num_domains)
@@ -236,6 +239,7 @@ class MultiScaleMultiSourceDANN(nn.Module):
         self.fusion_mode = fusion_mode
         self.domain_mode = domain_mode
         self.detach_domain_probability = bool(detach_domain_probability)
+        self.relation_strength = float(relation_strength)
 
         self.spatial = WindowSpatialEncoder(
             d_model,
@@ -328,7 +332,9 @@ class MultiScaleMultiSourceDANN(nn.Module):
                     raise ValueError(
                         "scale_class_reliability must be [scales, classes]"
                     )
-                gate_logits = gate_logits + torch.log(reliability.clamp_min(1e-6))
+                gate_logits = gate_logits + self.relation_strength * torch.log(
+                    reliability.clamp_min(1e-6)
+                )
             class_weight = F.softmax(gate_logits, dim=1)
 
         fused_logits = (class_weight * scale_logits).sum(dim=1)
@@ -373,6 +379,11 @@ class MultiScaleMultiSourceDANN(nn.Module):
             sequence = self.spatial(x_by_scale[key], mask_by_scale[key])
             pooled.append(self.temporal[key](sequence, mask_by_scale[key]))
         tokens = torch.stack(pooled, dim=1) + self.scale_embedding.unsqueeze(0)
+
+        # Hard independence boundary: every per-scale classifier consumes only
+        # its own scale token. Cross-scale context and the scale-class relation
+        # graph are downstream fusion mechanisms and can never alter these
+        # embeddings or logits in the forward pass.
         scale_embeddings = self.scale_output_norm(tokens)
         scale_logits = self.classifier(scale_embeddings)
         contextual_scale_embeddings = self.output_norm(self.scale_context(tokens))
