@@ -137,12 +137,6 @@ conda activate BCI
 python main.py --device cuda:0 --target-subjects all
 ```
 
-Run SEED-IV -> SEED-V:
-
-```bash
-python main.py --source-dataset seed-iv --device cuda:0 --target-subjects all
-```
-
 Paper reference values for the two supported transfers are:
 
 | Transfer | Accuracy | Macro-F1 |
@@ -150,9 +144,11 @@ Paper reference values for the two supported transfers are:
 | SEED-VII -> SEED-V | 61.73 ± 3.93% | 62.14 ± 3.79% |
 | SEED-IV -> SEED-V | 70.51 ± 2.19% | 70.79 ± 2.07% |
 
-Useful development arguments include `--target-subjects 1`, `--max-iters`,
-`--batch-size`, `--data-root`, and `--result-dir`. Subject numbers exposed by
-the CLI are one-based.
+Useful arguments include `--target-subjects 1`, `--batch-size`, `--data-root`,
+and `--result-dir`. Subject numbers exposed by the CLI are one-based. The
+training entry point is intentionally locked to SEED-VII -> SEED-V and 1000
+iterations; SEED-IV remains available to `--validate-data-only` but is not part
+of this fixed comparison protocol.
 
 The three-class mapping is imbalanced: SEED-VII has a 30%/10%/60% split,
 SEED-IV has a 25%/25%/50% split, and each SEED-V subject has a 20%/20%/60%
@@ -180,12 +176,23 @@ domain setting is a transparent implementation correction for the supplied
 pre-extracted files, not the paper's stated normalization protocol. The result
 CSV records the selected sampling, pseudo-label, and normalization modes.
 
-The script adapts independently to each target subject and evaluates exactly
-once after the fixed 1000-iteration budget. Target labels are not used for
-training or checkpoint/epoch selection. Results are saved under:
+Both this CAGA-SGA baseline and `MPUS_GA` Trial Temporal share the protocol in
+`MPUS_GA/protocols/fixed_transductive_uda.py`:
+
+- all 20 SEED-VII source subjects and all 1600 labeled source trials train the
+  model;
+- all 45 trials of the current SEED-V target subject participate in adaptation
+  through a view that does not return target labels;
+- training always runs for exactly 1000 iterations;
+- neither target labels nor a source-domain validation split selects an epoch
+  or checkpoint;
+- the iteration-1000 model is evaluated exactly once on those same 45 target
+  trials.
+
+Results from this protocol are isolated from legacy outputs under:
 
 ```text
-./result/
+./result/transductive_fixed1000/
 ```
 
 ---

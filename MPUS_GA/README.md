@@ -1,8 +1,25 @@
 # MPUS-GA multiscale DE project
 
 This subproject is isolated from the CAGA-SGA reproduction code. It rebuilds
-SEED-VII and SEED-V differential-entropy features directly from raw CNT EEG at
+SEED-IV, SEED-V, and SEED-VII differential-entropy features from trial EEG at
 three non-overlapping window lengths: 1 s, 2 s, and 4 s.
+
+## Project layout
+
+```text
+MPUS_GA/
+├── preprocessing/       # raw CNT -> multiscale DE and artifact validation
+├── protocols/           # shared fixed comparison protocol
+├── trial_temporal/      # multiscale data, model, losses, and training entry point
+├── scripts/             # nohup-friendly experiment launcher
+├── tests/               # preprocessing and trial-model tests
+├── data_processed/      # generated 1 s / 2 s / 4 s NPZ files
+├── results_class_conditional_multiscale/  # exactly A0..A7 and main
+└── logs/class_conditional_multiscale/     # fixed suite + A0..A7 + main logs
+```
+
+The original CAGA-SGA implementation remains in the repository root and is not
+imported or moved by this subproject.
 
 ## Data policy
 
@@ -17,6 +34,10 @@ three non-overlapping window lengths: 1 s, 2 s, and 4 s.
 - Recordings without recoverable trial boundaries are never segmented using
   guessed timestamps. They are listed in `seed_vii/manifest.json` under
   `excluded_files`; use `--missing-trigger-policy error` for strict failure.
+- SEED-IV MAT files already contain 24 trial-segmented 62-channel arrays at
+  200 Hz. They are not resampled or segmented again. The single endpoint sample
+  left after complete-second windows is discarded with the normal window
+  remainder.
 
 Three-class mapping:
 
@@ -32,8 +53,10 @@ The default dataset root is inherited from the parent project:
 
 ```text
 /dataset/gzw/seed_series/
+├── eeg_raw/SEED_IV/{1,2,3}/*.mat
 ├── eeg_raw/SEED_VII/*.cnt
 ├── eeg_raw/SEED_V/*.cnt
+├── labels/SEED_IV/Channel Order.xlsx
 └── labels/SEED_VII/emotion_label_and_stimuli_order.xlsx
 ```
 
@@ -47,6 +70,12 @@ data_processed/
 ├── processing_config.json
 ├── processing_summary.json
 ├── validation_report.json
+├── processing_runs/       # immutable per-run records
+├── seed_iv/
+│   ├── manifest.json
+│   ├── window_1s/subject_01_session_1.npz
+│   ├── window_2s/subject_01_session_1.npz
+│   └── window_4s/subject_01_session_1.npz
 ├── seed_vii/
 │   ├── manifest.json
 │   ├── window_1s/subject_01_session_1.npz
@@ -74,8 +103,8 @@ The server BCI environment already contains MNE, NumPy, SciPy, and openpyxl:
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 MNE_DONTWRITE_HOME=true \
-  /home/gzw/anaconda3/envs/BCI/bin/python \
-  MPUS_GA/preprocess.py \
+  /home/gzw/anaconda3/envs/BCI/bin/python -m \
+  MPUS_GA.preprocessing.preprocess \
   --data-root /dataset/gzw/seed_series \
   --datasets seed-vii seed-v \
   --window-seconds 1 2 4
@@ -84,8 +113,8 @@ CUDA_VISIBLE_DEVICES=1 MNE_DONTWRITE_HOME=true \
 Use explicit paths if automatic discovery does not match the server:
 
 ```bash
-MNE_DONTWRITE_HOME=true /home/gzw/anaconda3/envs/BCI/bin/python \
-  MPUS_GA/preprocess.py \
+MNE_DONTWRITE_HOME=true /home/gzw/anaconda3/envs/BCI/bin/python -m \
+  MPUS_GA.preprocessing.preprocess \
   --seed-vii-raw-dir /path/to/SEED_VII/EEG_raw \
   --seed-v-raw-dir /path/to/SEED_V/EEG_raw \
   --seed-vii-label-file /path/to/emotion_label_and_stimuli_order.xlsx
@@ -94,172 +123,182 @@ MNE_DONTWRITE_HOME=true /home/gzw/anaconda3/envs/BCI/bin/python \
 For a small pipeline check:
 
 ```bash
-MNE_DONTWRITE_HOME=true /home/gzw/anaconda3/envs/BCI/bin/python \
-  MPUS_GA/preprocess.py --datasets seed-vii --subjects 1 --window-seconds 1 2 4
+MNE_DONTWRITE_HOME=true /home/gzw/anaconda3/envs/BCI/bin/python -m \
+  MPUS_GA.preprocessing.preprocess \
+  --datasets seed-vii --subjects 1 --window-seconds 1 2 4
 ```
 
 Validate all generated files:
 
 ```bash
-/home/gzw/anaconda3/envs/BCI/bin/python MPUS_GA/validate_processed.py
+/home/gzw/anaconda3/envs/BCI/bin/python -m \
+  MPUS_GA.preprocessing.validate_processed
 ```
 
-## Transfer training
-
-`train_transfer.py` treats every DE window as one 62-node EEG graph. Source
-normalization statistics are fitted once on SEED-VII and applied to SEED-V by
-default. SEED-V labels remain attached only for the final evaluation after the
-fixed training budget; they are not read by normalization, sampling, teacher
-prediction, pseudo-label selection, or optimization.
-
-Stage 0 freezes the CAGA-SGA balanced baseline for the requested three scales.
-SEED-VII and SEED-V are dataset names, not random seeds; optimization uses the
-single fixed random seed 42 by default:
+Process all SEED-IV subjects in the background from the repository root:
 
 ```bash
-MNE_DONTWRITE_HOME=true /home/gzw/anaconda3/envs/BCI/bin/python \
-  MPUS_GA/train_transfer.py \
-  --variant caga-balanced \
-  --window-seconds 1 2 4 \
-  --random-seeds 42 \
-  --target-subjects all \
-  --device cuda:0
+mkdir -p MPUS_GA/logs/preprocessing
+RUN_LOG="MPUS_GA/logs/preprocessing/seed_iv_$(date +%Y%m%d_%H%M%S).log"
+nohup bash MPUS_GA/scripts/run_seed_iv_preprocessing.sh > "${RUN_LOG}" 2>&1 &
+echo "PID=$! LOG=${RUN_LOG}"
 ```
 
-The frozen v1 MVP from the proposal adds an EMA teacher, three stochastic
-teacher passes, entropy-plus-MI reliability, balanced target-node gating,
-separately normalized SS/ST/TT soft edge losses, and the 200+200 iteration graph
-ramp:
+SEED-IV contributes 45 subject-sessions and 135 NPZ artifacts. Its original
+labels are neutral=0, sad=1, fear=2, and happy=3. The retained three-class view
+maps happy to positive, neutral to neutral, and sad/fear to negative.
 
-```bash
-CUDA_VISIBLE_DEVICES=1 MNE_DONTWRITE_HOME=true \
-  /home/gzw/anaconda3/envs/BCI/bin/python \
-  MPUS_GA/train_transfer.py \
-  --variant r-softsga \
-  --window-seconds 1 2 4 \
-  --random-seeds 42 \
-  --target-subjects all \
-  --device cuda:0
-```
+`processing_config.json` describes the stable feature pipeline and does not
+claim a subject subset. Each invocation is recorded separately under
+`processing_runs/`; dataset manifests and `processing_summary.json` inventory
+all NPZ artifacts present on disk rather than only the most recent batch.
 
-`r-softsga-v2` is the diagnostic correction after v1 admitted no target nodes.
-It trains a 200-iteration source warm-up, hard-syncs student to teacher, removes
-the absolute reliability cutoff, ranks candidates by confidence times
-reliability, and retains at most four candidates per predicted class. Based on
-the diagnostic pilot, the confidence floor rises slowly from 0.34 to 0.40. If
-one predicted class alone has no candidate, a 0.334 chance-level fallback may
-supply that missing class; it does not bypass the requirement that all three
-predicted classes be present in the batch. Absolute reliability scales the
-complete target-graph block relative to a 0.05
-reference instead of being erased by within-block normalization. Its JSONL log
-records every iteration, including confidence/reliability quantiles, predicted
-and candidate class counts, and SS/ST/TT activation.
+## Multi-source multiscale training
 
-Run the intended small pilot before any full v2 matrix:
+`trial_temporal/train.py` is the canonical training entry point. It aligns the
+1 s, 2 s, and 4 s windows of each trial. The A-series uses SEED-VII and/or
+SEED-IV as labeled sources and one SEED-V subject as the unlabeled target. B6
+reverses the direction, using all SEED-V trials as the labeled source and one
+SEED-VII subject as the unlabeled target.
 
-```bash
-CUDA_VISIBLE_DEVICES=1 /home/gzw/anaconda3/envs/BCI/bin/python \
-  MPUS_GA/train_transfer.py \
-  --variant r-softsga-v2 \
-  --window-seconds 1 \
-  --random-seeds 42 \
-  --target-subjects 1-4 \
-  --max-iters 400 \
-  --device cuda:0
-```
+### Fixed transductive UDA experiment paradigm
 
-The terminal displays an overall tqdm bar across all scale/subject folds, an
-iteration bar with live losses for the current fold, and a final-evaluation
-batch bar. With one method, three scales, one random seed, and 16 target
-subjects, the overall bar contains 48 folds.
+The experiment is **transductive unsupervised domain adaptation**, not a
+conventional supervised train/test split. Source and target data have different
+roles:
 
-Runs are resumable at subject granularity: an existing `subject_XX.json` is
-skipped unless `--overwrite` is supplied. Results contain both window-level
-metrics and trial-level metrics obtained by averaging all window probabilities
-within a trial. The default output is
-`MPUS_GA/results/<variant>/window_*/random_seed_*`.
+| Experiment | Labeled source pool | Unlabeled target fold | Independent folds |
+|---|---|---|---:|
+| A6, SEED-VII -> SEED-V | all 20 SEED-VII subjects, 1600 trials | all 45 trials of one SEED-V subject | 3 seeds x 16 subjects = 48 |
+| B6, SEED-V -> SEED-VII | all 16 SEED-V subjects, 720 trials | all 80 trials of one SEED-VII subject | 3 seeds x 20 subjects = 60 |
 
-## True trial-level temporal baseline
+There is no held-out subset inside the source dataset. The source sampler draws
+with replacement from the complete labeled source pool, with softened
+inverse-frequency strength `source_balance_alpha=0.4`. There is also no split
+of the current target subject into separate adaptation and evaluation EEG
+subsets. The complete target-subject EEG pool is sampled with replacement for
+unlabeled adaptation, and the same complete pool is traversed once for final
+evaluation. The adaptation view does not return `y`; target labels cannot enter
+normalization, sampling, pseudo-label construction, losses, gradients, or model
+selection.
 
-`train_trial_temporal.py` is the next-stage baseline and is deliberately kept
-separate from the window-based transfer entry point. It groups all windows by
-`(subject_id, session_id, trial_id)`, sorts each group by `window_id`, and pads
-only within the current batch. Its prediction path is:
+Every `(random seed, target subject)` pair initializes and trains a fresh model
+for exactly 1000 iterations. There is no validation phase, early stopping, or
+checkpoint/epoch selection. Target labels are read exactly once, after
+iteration 1000, to report raw fused-logit trial Accuracy, Balanced Accuracy,
+Macro-F1, the confusion matrix, and per-class recall. The evaluated model is
+therefore always the fixed final model, even when an earlier iteration might
+have performed better.
+
+This is deliberately stricter than the public original CAGA-SGA `main.py`,
+which evaluates the same target `test_dataset` after every epoch and retains
+the epoch with the highest target-test Accuracy. The modified CAGA-SGA baseline
+in this repository and MPUS-GA instead share
+`protocols/fixed_transductive_uda.py`: fixed 1000 iterations, no target-label
+checkpoint selection, and one final target evaluation. Results from the public
+target-selected protocol must not be presented as if they used this fixed-final
+protocol.
+
+The prediction path is:
 
 ```text
-DE windows [T,62,5]
-  -> per-window attentive electrode graph encoder
-  -> ordered window embeddings [T,d]
-  -> temporal Transformer
-  -> masked attention pooling
-  -> one trial prediction
+aligned 1 s / 2 s / 4 s DE sequences [T,62,5]
+  -> EEG channel attention and shared dynamic graph encoder
+  -> scale-specific temporal convolution and Transformer encoders
+  -> independent per-scale trial embeddings and classification logits
+  -> cross-scale context used by the class-dependent fusion gate
+  -> source-domain x temporal-scale x emotion-class prototype reliability
+  -> weighted fusion of the independent per-scale logits
+  -> raw fused logits and one trial prediction
 ```
 
-The model uses labeled SEED-VII trials for classification and unlabeled SEED-V
-trials only for domain-adversarial alignment. The target training view does not
-return labels. SEED-VII subjects 17--20 are held out for source-only checkpoint
-selection; target labels are not exposed to optimization or checkpoint
-selection and are consumed by metric computation only after the selected
-checkpoint has been restored. Consequently this entry point reports
-Trial Acc, Trial Balanced Acc, and Trial Macro-F1 only. A Window Acc is not
-defined because the model does not make independent window predictions.
+Per-scale logits are computed before the cross-scale context Transformer, so a
+scale prediction cannot observe another scale's input. The contextualized
+scale embeddings are used only to determine fusion weights and the fused
+embedding. Consequently, per-scale metrics are genuine independent-scale
+evidence, and their comparison with the fused output is a valid multiscale
+ablation.
 
-Run the first 1-second, three-random-seed baseline on physical GPU 0 with:
+The full method maintains EMA prototypes for every source-domain/scale/class
+combination from source truth labels and scale/class target prototypes from
+high-confidence, unlabeled target predictions. Their cosine agreement controls
+which source and which temporal scale is trusted for each class. The same
+structure drives per-scale conditional domain alignment, differentiable
+prototype alignment, and class-dependent multiscale fusion.
+
+Source prototypes may accumulate during the source-only warmup, but target
+prototypes, target-derived reliability, and prototype-alignment loss are all
+disabled through iteration 300. Target prototype initialization begins at
+iteration 301, after the classifier has completed the source-only adaptation
+warmup. This prevents biased early target predictions from changing later
+fusion weights during warmup.
+
+The final prediction is always the argmax of the raw fused logits. There is no
+target-prior probability correction. The old supervised contrastive, InfoMax,
+and 1-second-teacher consistency losses are not part of this experiment family.
+Source inverse-frequency sampling is deliberately softened to alpha=0.4;
+domain and prototype adaptation start after iteration 300 and reach full weight
+at iteration 600.
+
+The comparison protocol remains fixed:
+
+- every configured source dataset contributes its complete labeled trial pool;
+- all trials of the current target subject form the unlabeled target domain;
+- training runs for exactly 1000 iterations without validation or checkpoint
+  selection;
+- target labels are accessed once for final trial-level evaluation;
+- final predictions use uncorrected raw fused logits;
+- random seeds 42, 43, and 44 and all target subjects run by default.
+
+The formal experiment matrix is:
+
+| Tag | Purpose |
+|---|---|
+| A0 / A1 / A2 | 1 s / 2 s / 4 s single-scale baselines with the same class-conditional framework |
+| A3 | naive multiscale attention with fused-only CDAN and no prototype reliability |
+| A4 | multiscale attention with global per-scale alignment and no class prototypes |
+| A5 | class-conditional alignment and prototypes, but uniform 1/2/4 s fusion |
+| A6 / A7 | full multiscale method with only SEED-VII / only SEED-IV as source |
+| main | full two-source, three-scale, class-conditional method |
+| B6 | A6 architecture in the reverse SEED-V to SEED-VII direction |
+
+On CSU, start the complete dual-GPU suite from the `MPUS_GA` directory:
 
 ```bash
-cd /home/gzw/projects/CAGA-SGA
-mkdir -p MPUS_GA/logs/trial_temporal
-RUN_LOG="MPUS_GA/logs/trial_temporal/nohup_$(date +%Y%m%d_%H%M%S).log"
-nohup env PHYSICAL_GPU=0 WINDOW_SECONDS="1" RANDOM_SEEDS="42 43 44" \
-  bash MPUS_GA/run_trial_temporal.sh > "${RUN_LOG}" 2>&1 &
-echo "PID=$! LOG=${RUN_LOG}"
+bash scripts/run_main_A0_A7_suite.sh
 ```
 
-The shell script is resumable at target-subject granularity. Useful overrides
-include `TARGET_SUBJECTS=1-4`, `MAX_ITERS=2`, `BATCH_SIZE=4`, and
-`RESULT_DIR=/path/to/results`. After the 1-second baseline is reviewed, 2 s and
-4 s should be run as separate single-scale ablations before any multiscale
-fusion is introduced.
+The controller detaches itself with `nohup`, then runs two independent queues:
+physical GPU 0 receives `A0 A2 A4 A6 main`, and physical GPU 1 receives
+`A1 A3 A5 A7`. Each GPU starts its next experiment immediately after its own
+current experiment exits; there is no GPU-idle polling. It creates exactly nine
+experiment result directories and ten fixed logs under
+`logs/class_conditional_multiscale/`: `suite.log`, `A0.log` through `A7.log`,
+and `main.log`. A new launch overwrites these ten logs. It writes no PID,
+status, or JSONL side files. Training traces are embedded in each fold's result
+JSON.
 
-For a cheap end-to-end smoke test before the full matrix:
+Override the default fold set when doing a smoke run, for example:
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 /home/gzw/anaconda3/envs/BCI/bin/python \
-  MPUS_GA/train_transfer.py \
-  --variant r-softsga --window-seconds 4 --random-seeds 42 \
-  --target-subjects 16 --max-iters 2 --batch-size 8 --device cuda:0
+TARGET_SUBJECTS=1 RANDOM_SEEDS="42" \
+  bash scripts/run_main_A0_A7_suite.sh
 ```
 
-### Sequential nohup run
+Results are written under
+`results_class_conditional_multiscale/{A0,A1,A2,A3,A4,A5,A6,A7,main}/`.
+Completed folds are skipped by default; set `OVERWRITE=1` on the controller to
+replace them.
 
-`run_transfer_sequential.sh` first verifies the expected 80 SEED-VII and 48
-SEED-V session files at every scale, runs the full processed-data validator,
-then executes `caga-balanced` followed by `r-softsga-v2`. A failed validation or
-baseline stops the sequence rather than launching the next stage. Completed
-subject results are reused when the script is restarted.
-
-Launch the script itself with nohup:
-
-```bash
-cd /home/gzw/projects/CAGA-SGA
-mkdir -p MPUS_GA/logs/training
-RUN_LOG="MPUS_GA/logs/training/nohup_$(date +%Y%m%d_%H%M%S).log"
-nohup bash MPUS_GA/run_transfer_sequential.sh > "${RUN_LOG}" 2>&1 &
-echo "PID=$! LOG=${RUN_LOG}"
-```
-
-Follow the master status log and the detailed tqdm logs with:
-
-```bash
-tail -f "${RUN_LOG}"
-tail -f MPUS_GA/logs/training/*_caga-balanced.log
-tail -f MPUS_GA/logs/training/*_r-softsga-v2.log
-```
-
-The script accepts environment overrides without editing the file, for example
-`PHYSICAL_GPU=0`, `MAX_ITERS=2`, or `BATCH_SIZE=32`. The checked-in default
-exposes only physical GPU 1 through `CUDA_VISIBLE_DEVICES=1`; inside the process
-that card is correctly addressed as `cuda:0`.
+B6 is intentionally not part of the dual-GPU suite. It uses the same model and
+optimization settings as A6, but runs 20 SEED-VII target subjects for seeds 42,
+43, and 44 (60 folds). Source normalization is fitted on SEED-V only; target
+labels remain unavailable until the single final evaluation of each fold. Use
+a separate `--result-root` and log path for each bidirectional comparison run so
+historical `results_seedv2vii/B6/` outputs are not overwritten. The current
+independent-scale/warmup verification run stores A6 and B6 together under
+`results_independent_scale_warmup_fix/{A6,B6}/` and its logs under
+`logs/independent_scale_warmup_fix/`.
 
 ## Signal processing
 

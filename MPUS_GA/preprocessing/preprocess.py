@@ -1,10 +1,12 @@
-"""Build 1 s, 2 s, and 4 s DE features for SEED-VII -> SEED-V."""
+"""Build 1 s, 2 s, and 4 s DE features for SEED-IV/V/VII."""
 
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,27 +14,31 @@ from typing import Any, Iterable
 
 import numpy as np
 
-from dataset_metadata import (
+from .dataset_metadata import (
+    EMOTION_TO_ORIGINAL_SEED_IV,
     EMOTION_TO_ORIGINAL_SEED_V,
     EMOTION_TO_ORIGINAL_SEED_VII,
     EMOTION_TO_THREE_CLASS,
+    SEED_IV_EMOTIONS,
     SEED_V_EMOTIONS,
     SEED_V_END_SECONDS,
     SEED_V_START_SECONDS,
     SEED_VII_SPECIAL_TRIGGER_START,
+    load_channel_names,
     load_seed_vii_emotions,
+    parse_seed_iv_filename,
     parse_seed_v_filename,
     parse_seed_vii_filename,
     read_special_trigger_samples,
 )
-from de_features import BANDS, extract_multiscale_de, validate_window_seconds
+from .de_features import BANDS, extract_multiscale_de, validate_window_seconds
 
 
-PROJECT_DIR = Path(__file__).resolve().parent
+PACKAGE_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_DATA_ROOT = Path(
     os.environ.get("CAGA_SGA_DATA_ROOT", "/dataset/gzw/seed_series")
 )
-DEFAULT_OUTPUT = PROJECT_DIR / "data_processed"
+DEFAULT_OUTPUT = PACKAGE_DIR / "data_processed"
 TARGET_SFREQ = 200.0
 DROP_CHANNELS = {"M1", "M2", "ECG", "HEO", "VEO"}
 
@@ -104,12 +110,30 @@ def _raw_dir_candidates(root: Path, dataset: str) -> tuple[Path, ...]:
             root / "feature/seed_vii/EEG_raw",
             root / "SEED-VII/EEG_raw",
         )
+    if dataset == "seed-v":
+        return (
+            root / "eeg_raw/SEED_V",
+            root / "raw/SEED_V/EEG_raw",
+            root / "raw/seed_v/EEG_raw",
+            root / "feature/seed_v/EEG_raw",
+            root / "SEED-V/EEG_raw",
+        )
+    if dataset == "seed-iv":
+        return (
+            root / "eeg_raw/SEED_IV",
+            root / "raw/SEED_IV/eeg_raw_data",
+            root / "raw/seed_iv/eeg_raw_data",
+            root / "SEED-IV/eeg_raw_data",
+        )
+    raise ValueError(f"Unsupported dataset: {dataset}")
+
+
+def _seed_iv_channel_candidates(root: Path, raw_dir: Path) -> tuple[Path, ...]:
     return (
-        root / "eeg_raw/SEED_V",
-        root / "raw/SEED_V/EEG_raw",
-        root / "raw/seed_v/EEG_raw",
-        root / "feature/seed_v/EEG_raw",
-        root / "SEED-V/EEG_raw",
+        root / "labels/SEED_IV/Channel Order.xlsx",
+        raw_dir / "Channel Order.xlsx",
+        raw_dir.parent / "Channel Order.xlsx",
+        root / "raw/SEED_IV/Channel Order.xlsx",
     )
 
 
@@ -194,6 +218,71 @@ def _seed_v_trials(path: Path) -> tuple[list[Trial], tuple[str, ...]]:
     return trials, channel_names
 
 
+def _seed_iv_trials(
+    path: Path,
+    channel_names: tuple[str, ...],
+) -> tuple[list[Trial], tuple[str, ...]]:
+    """Load the 24 already segmented 200 Hz EEG trials in one SEED-IV MAT."""
+
+    try:
+        from scipy.io import loadmat, whosmat
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "SciPy is required to read SEED-IV MAT files."
+        ) from exc
+
+    subject, session = parse_seed_iv_filename(path)
+    variable_by_trial: dict[int, str] = {}
+    for name, shape, dtype in whosmat(path):
+        match = re.search(r"_eeg(\d+)$", name)
+        if match is None:
+            continue
+        trial_id = int(match.group(1))
+        if trial_id in variable_by_trial:
+            raise ValueError(f"{path} contains duplicate EEG trial {trial_id}")
+        if tuple(shape[:1]) != (62,) or len(shape) != 2 or dtype != "double":
+            raise ValueError(
+                f"{path}:{name} must be a 62 x time double array, got {shape} {dtype}"
+            )
+        variable_by_trial[trial_id] = name
+
+    expected_trials = set(range(1, 25))
+    if set(variable_by_trial) != expected_trials:
+        missing = sorted(expected_trials - set(variable_by_trial))
+        extra = sorted(set(variable_by_trial) - expected_trials)
+        raise ValueError(
+            f"{path} must contain EEG trials 1..24; missing={missing}, extra={extra}"
+        )
+
+    archive = loadmat(path, variable_names=list(variable_by_trial.values()))
+    trials = []
+    for offset, emotion in enumerate(SEED_IV_EMOTIONS[session], start=1):
+        data = np.asarray(archive[variable_by_trial[offset]])
+        if data.ndim != 2 or data.shape[0] != 62:
+            raise ValueError(
+                f"{path}:{variable_by_trial[offset]} has invalid shape {data.shape}"
+            )
+        if data.shape[1] % int(TARGET_SFREQ) != 1:
+            raise ValueError(
+                f"{path}:{variable_by_trial[offset]} has {data.shape[1]} samples; "
+                "expected an integer number of 200 Hz seconds plus one endpoint sample"
+            )
+        if not np.isfinite(data).all():
+            raise ValueError(f"{path}:{variable_by_trial[offset]} contains NaN or Inf")
+        trials.append(
+            Trial(
+                data=data.astype(np.float32, copy=False),
+                subject=subject,
+                session=session,
+                global_trial=(session - 1) * 24 + offset,
+                session_trial=offset,
+                emotion=emotion,
+                source_file=path.name,
+            )
+        )
+    return trials, channel_names
+
+
 def _discover_save_info(root: Path, raw_dir: Path, explicit: Path | None) -> Path | None:
     if explicit is not None:
         return _find_existing(explicit, (), "SEED-VII save_info")
@@ -247,6 +336,19 @@ def _atomic_save_npz(path: Path, payload: dict[str, np.ndarray]) -> None:
     temporary = path.with_suffix(".tmp.npz")
     np.savez_compressed(temporary, **payload)
     os.replace(temporary, path)
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    os.replace(temporary, path)
+
+
+def _now_iso() -> str:
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def _session_payload(
@@ -332,17 +434,26 @@ def _process_dataset(
     overwrite: bool,
     seed_vii_emotions: dict[int, str] | None,
     seed_vii_save_info: Path | None,
+    seed_iv_channel_names: tuple[str, ...] | None,
     missing_trigger_policy: str,
 ) -> dict[str, Any]:
     if dataset == "seed-vii":
         parser = parse_seed_vii_filename
         original_mapping = EMOTION_TO_ORIGINAL_SEED_VII
-    else:
+        candidates = raw_dir.glob("*.cnt")
+    elif dataset == "seed-v":
         parser = parse_seed_v_filename
         original_mapping = EMOTION_TO_ORIGINAL_SEED_V
+        candidates = raw_dir.glob("*.cnt")
+    elif dataset == "seed-iv":
+        parser = parse_seed_iv_filename
+        original_mapping = EMOTION_TO_ORIGINAL_SEED_IV
+        candidates = raw_dir.glob("*/*.mat")
+    else:
+        raise ValueError(f"Unsupported dataset: {dataset}")
 
     raw_files = []
-    for path in raw_dir.glob("*.cnt"):
+    for path in candidates:
         if "_repaired" in path.stem:
             continue
         try:
@@ -354,7 +465,7 @@ def _process_dataset(
     raw_files.sort(key=lambda item: (item[0], item[1], item[2].name))
     if not raw_files:
         raise FileNotFoundError(
-            f"No matching {dataset} CNT files found in {raw_dir}"
+            f"No matching {dataset} EEG files found in {raw_dir}"
         )
 
     manifest_files = []
@@ -396,8 +507,13 @@ def _process_dataset(
                 trials, channel_names = _seed_vii_trials(
                     raw_path, seed_vii_emotions, seed_vii_save_info
                 )
-            else:
+            elif dataset == "seed-v":
                 trials, channel_names = _seed_v_trials(raw_path)
+            else:
+                assert seed_iv_channel_names is not None
+                trials, channel_names = _seed_iv_trials(
+                    raw_path, seed_iv_channel_names
+                )
         except MissingTriggerError as exc:
             if missing_trigger_policy == "error":
                 raise
@@ -465,24 +581,205 @@ def _process_dataset(
         "three_class_mapping": EMOTION_TO_THREE_CLASS,
         "files": manifest_files,
     }
-    manifest_path = output_root / dataset.replace("-", "_") / "manifest.json"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    manifest_path.write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
     return manifest
+
+
+def _rebuild_artifact_manifests(
+    output_root: Path,
+    current_runs: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Rebuild dataset manifests from every NPZ currently on disk."""
+
+    mappings = {
+        "seed-vii": EMOTION_TO_ORIGINAL_SEED_VII,
+        "seed-v": EMOTION_TO_ORIGINAL_SEED_V,
+        "seed-iv": EMOTION_TO_ORIGINAL_SEED_IV,
+    }
+    manifests: dict[str, dict[str, Any]] = {}
+    for dataset_dir in sorted(output_root.glob("seed_*")):
+        if not dataset_dir.is_dir():
+            continue
+        artifact_paths = sorted(dataset_dir.glob("window_*/*.npz"))
+        if not artifact_paths:
+            continue
+        dataset = dataset_dir.name.replace("_", "-")
+        if dataset not in mappings:
+            continue
+
+        previous: dict[str, Any] = {}
+        manifest_path = dataset_dir / "manifest.json"
+        if manifest_path.is_file():
+            try:
+                previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                previous = {}
+        run_manifest = current_runs.get(dataset, {})
+
+        entries = []
+        subjects = set()
+        subject_sessions = set()
+        source_files = set()
+        sample_counts: Counter[str] = Counter()
+        scales = set()
+        canonical_channels: tuple[str, ...] | None = None
+        for path in artifact_paths:
+            summary = _existing_file_summary(path)
+            with np.load(path, allow_pickle=False) as archive:
+                subject = int(archive["subject_id"][0])
+                session = int(archive["session_id"][0])
+                source_file = str(archive["source_file"])
+                scale = float(archive["window_seconds"])
+                channel_names = tuple(archive["channel_names"].tolist())
+            if canonical_channels is None:
+                canonical_channels = channel_names
+            elif channel_names != canonical_channels:
+                raise ValueError(f"Channel order mismatch while inventorying {path}")
+            summary.update(
+                {
+                    "window_seconds": _jsonable_number(scale),
+                    "subject": subject,
+                    "session": session,
+                    "source_file": source_file,
+                }
+            )
+            entries.append(summary)
+            subjects.add(subject)
+            subject_sessions.add((subject, session))
+            source_files.add(source_file)
+            sample_counts[str(_jsonable_number(scale))] += summary["samples"]
+            scales.add(scale)
+
+        excluded_files = run_manifest.get(
+            "excluded_files", previous.get("excluded_files", [])
+        )
+        manifest = {
+            "schema_version": 2,
+            "inventory_scope": "all_existing_artifacts",
+            "generated_at": _now_iso(),
+            "dataset": dataset,
+            "raw_dir": run_manifest.get("raw_dir", previous.get("raw_dir", "")),
+            "sampling_rate_hz": TARGET_SFREQ,
+            "windows_seconds": [
+                _jsonable_number(scale) for scale in sorted(scales)
+            ],
+            "bands": [
+                {"name": name, "low_hz": low, "high_hz": high}
+                for name, low, high in BANDS
+            ],
+            "channels": list(canonical_channels or ()),
+            "subjects": sorted(subjects),
+            "subject_count": len(subjects),
+            "subject_session_count": len(subject_sessions),
+            "artifact_count": len(entries),
+            "raw_files": len(source_files),
+            "processed_raw_files": len(source_files),
+            "excluded_raw_files": len(excluded_files),
+            "excluded_files": excluded_files,
+            "sample_counts": dict(sorted(sample_counts.items())),
+            "original_label_mapping": mappings[dataset],
+            "three_class_mapping": EMOTION_TO_THREE_CLASS,
+            "files": entries,
+        }
+        _write_json_atomic(manifest_path, manifest)
+        manifests[dataset] = manifest
+    return manifests
+
+
+def _write_processing_metadata(
+    output_root: Path,
+    data_root: Path,
+    run_id: str,
+    manifests: dict[str, dict[str, Any]],
+    seed_iv_channel_file: Path | None,
+) -> dict[str, Any]:
+    """Write stable pipeline configuration and a full artifact summary."""
+
+    config_path = output_root / "processing_config.json"
+    previous: dict[str, Any] = {}
+    if config_path.is_file():
+        try:
+            previous = json.loads(config_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            previous = {}
+    dataset_inputs = (
+        previous.get("dataset_inputs", {})
+        if previous.get("schema_version") == 2
+        else {}
+    )
+    for dataset, manifest in manifests.items():
+        dataset_inputs[dataset] = {"raw_dir": manifest.get("raw_dir", "")}
+    if seed_iv_channel_file is not None:
+        dataset_inputs.setdefault("seed-iv", {})["channel_order_file"] = str(
+            seed_iv_channel_file
+        )
+
+    config = {
+        "schema_version": 2,
+        "record_type": "stable_pipeline_configuration",
+        "data_root": str(data_root),
+        "output_dir": str(output_root),
+        "sampling_rate_hz": TARGET_SFREQ,
+        "default_window_seconds": [1, 2, 4],
+        "bands": [
+            {"name": name, "low_hz": low, "high_hz": high}
+            for name, low, high in BANDS
+        ],
+        "cnt_preprocessing": {
+            "broadband_filter_hz": [0.1, 70.0],
+            "notch_hz": 50.0,
+            "resample_hz": TARGET_SFREQ,
+        },
+        "seed_iv_input": {
+            "format": "official trial-segmented MAT arrays",
+            "sampling_rate_hz": TARGET_SFREQ,
+            "additional_broadband_filter_or_resample": False,
+        },
+        "de_formula": "0.5 * ln(2*pi*e*(variance+1e-8))",
+        "lds_smoothing": False,
+        "dataset_inputs": dataset_inputs,
+        "latest_completed_run_id": run_id,
+        "updated_at": _now_iso(),
+    }
+    _write_json_atomic(config_path, config)
+
+    datasets = {
+        dataset: {
+            "raw_files": manifest["raw_files"],
+            "processed_raw_files": manifest["processed_raw_files"],
+            "excluded_raw_files": manifest["excluded_raw_files"],
+            "subject_count": manifest["subject_count"],
+            "subject_session_count": manifest["subject_session_count"],
+            "artifact_count": manifest["artifact_count"],
+            "sample_counts": manifest["sample_counts"],
+        }
+        for dataset, manifest in sorted(manifests.items())
+    }
+    summary = {
+        "schema_version": 2,
+        "inventory_scope": "all_existing_artifacts",
+        "generated_at": _now_iso(),
+        "datasets": datasets,
+        "totals": {
+            "artifacts": sum(item["artifact_count"] for item in datasets.values()),
+            "subject_sessions": sum(
+                item["subject_session_count"] for item in datasets.values()
+            ),
+        },
+    }
+    _write_json_atomic(output_root / "processing_summary.json", summary)
+    return summary
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Recompute SEED-VII and SEED-V multiscale DE from raw CNT EEG"
+        description="Recompute SEED-IV/V/VII multiscale DE from trial EEG"
     )
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument(
         "--datasets",
         nargs="+",
-        choices=("seed-vii", "seed-v"),
+        choices=("seed-vii", "seed-v", "seed-iv"),
         default=("seed-vii", "seed-v"),
     )
     parser.add_argument(
@@ -491,6 +788,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--subjects", type=_parse_subjects, default=None)
     parser.add_argument("--seed-vii-raw-dir", type=Path)
     parser.add_argument("--seed-v-raw-dir", type=Path)
+    parser.add_argument("--seed-iv-raw-dir", type=Path)
+    parser.add_argument("--seed-iv-channel-file", type=Path)
     parser.add_argument("--seed-vii-label-file", type=Path)
     parser.add_argument("--seed-vii-save-info", type=Path)
     parser.add_argument(
@@ -524,9 +823,17 @@ def main() -> None:
             _raw_dir_candidates(data_root, "seed-v"),
             "SEED-V raw directory",
         )
+    if "seed-iv" in args.datasets:
+        resolved["seed-iv"] = _find_existing(
+            args.seed_iv_raw_dir,
+            _raw_dir_candidates(data_root, "seed-iv"),
+            "SEED-IV raw directory",
+        )
 
     seed_vii_emotions = None
     seed_vii_save_info = None
+    seed_iv_channel_names = None
+    seed_iv_channel_file = None
     label_file = None
     if "seed-vii" in args.datasets:
         label_file = _find_existing(
@@ -542,55 +849,90 @@ def main() -> None:
         seed_vii_save_info = _discover_save_info(
             data_root, resolved["seed-vii"], args.seed_vii_save_info
         )
+    if "seed-iv" in args.datasets:
+        seed_iv_channel_file = _find_existing(
+            args.seed_iv_channel_file,
+            _seed_iv_channel_candidates(data_root, resolved["seed-iv"]),
+            "SEED-IV channel order file",
+        )
+        seed_iv_channel_names = load_channel_names(seed_iv_channel_file)
 
-    config = {
+    run_id = f"{dt.datetime.now().astimezone():%Y%m%d_%H%M%S}_{os.getpid()}"
+    run_record = {
+        "schema_version": 2,
+        "record_type": "processing_run",
+        "run_id": run_id,
+        "status": "running",
+        "started_at": _now_iso(),
         "data_root": str(data_root),
         "output_dir": str(output_root),
         "datasets": list(args.datasets),
         "window_seconds": [_jsonable_number(value) for value in scales],
         "subjects": "all" if subjects is None else sorted(subjects),
-        "seed_vii_raw_dir": str(resolved.get("seed-vii", "")),
-        "seed_v_raw_dir": str(resolved.get("seed-v", "")),
+        "raw_dirs": {
+            dataset: str(path) for dataset, path in sorted(resolved.items())
+        },
+        "seed_iv_channel_file": str(seed_iv_channel_file or ""),
         "seed_vii_label_file": str(label_file or ""),
         "seed_vii_save_info": str(seed_vii_save_info or ""),
-        "sampling_rate_hz": TARGET_SFREQ,
-        "broadband_filter_hz": [0.1, 70.0],
-        "notch_hz": 50.0,
-        "de_formula": "0.5 * ln(2*pi*e*(variance+1e-8))",
-        "lds_smoothing": False,
         "overwrite": bool(args.overwrite),
         "missing_trigger_policy": args.missing_trigger_policy,
     }
-    (output_root / "processing_config.json").write_text(
-        json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    run_record_path = output_root / "processing_runs" / f"{run_id}.json"
+    _write_json_atomic(run_record_path, run_record)
 
-    manifests = {}
-    for dataset in args.datasets:
-        manifests[dataset] = _process_dataset(
-            dataset=dataset,
-            raw_dir=resolved[dataset],
+    run_manifests: dict[str, dict[str, Any]] = {}
+    try:
+        for dataset in args.datasets:
+            run_manifests[dataset] = _process_dataset(
+                dataset=dataset,
+                raw_dir=resolved[dataset],
+                output_root=output_root,
+                scales=scales,
+                subjects=subjects,
+                overwrite=args.overwrite,
+                seed_vii_emotions=seed_vii_emotions,
+                seed_vii_save_info=seed_vii_save_info,
+                seed_iv_channel_names=seed_iv_channel_names,
+                missing_trigger_policy=args.missing_trigger_policy,
+            )
+        full_manifests = _rebuild_artifact_manifests(output_root, run_manifests)
+        summary = _write_processing_metadata(
             output_root=output_root,
-            scales=scales,
-            subjects=subjects,
-            overwrite=args.overwrite,
-            seed_vii_emotions=seed_vii_emotions,
-            seed_vii_save_info=seed_vii_save_info,
-            missing_trigger_policy=args.missing_trigger_policy,
+            data_root=data_root,
+            run_id=run_id,
+            manifests=full_manifests,
+            seed_iv_channel_file=seed_iv_channel_file,
         )
+    except Exception as exc:
+        run_record.update(
+            {
+                "status": "failed",
+                "finished_at": _now_iso(),
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+        )
+        _write_json_atomic(run_record_path, run_record)
+        raise
 
-    summary = {
-        dataset: {
-            "raw_files": manifest["raw_files"],
-            "processed_raw_files": manifest["processed_raw_files"],
-            "excluded_raw_files": manifest["excluded_raw_files"],
-            "sample_counts": manifest["sample_counts"],
+    run_record.update(
+        {
+            "status": "completed",
+            "finished_at": _now_iso(),
+            "run_results": {
+                dataset: {
+                    "raw_files": manifest["raw_files"],
+                    "processed_raw_files": manifest["processed_raw_files"],
+                    "excluded_raw_files": manifest["excluded_raw_files"],
+                    "sample_counts": manifest["sample_counts"],
+                }
+                for dataset, manifest in run_manifests.items()
+            },
+            "full_inventory_totals": summary["totals"],
         }
-        for dataset, manifest in manifests.items()
-    }
-    (output_root / "processing_summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    _write_json_atomic(run_record_path, run_record)
     print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
 
 

@@ -7,10 +7,13 @@ from pathlib import Path
 import numpy as np
 
 
-PROJECT_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_DIR))
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(PROJECT_ROOT))
 
-from de_features import extract_multiscale_de, validate_window_seconds
+from MPUS_GA.preprocessing.de_features import (  # noqa: E402
+    extract_multiscale_de,
+    validate_window_seconds,
+)
 
 
 class DifferentialEntropyTests(unittest.TestCase):

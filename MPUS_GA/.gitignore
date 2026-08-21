@@ -3,6 +3,13 @@ data_processed/**/*.tmp.npz
 data_processed/processing_config.json
 data_processed/processing_summary.json
 data_processed/validation_report.json
+data_processed/processing_runs/
 !data_processed/README.md
 results/
+results_trial_temporal/
+results_multisource_multiscale_v3/
 logs/
+__pycache__/
+tests/__pycache__/
+.pytest_cache/
+.DS_Store

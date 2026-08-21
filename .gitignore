@@ -2,3 +2,5 @@ __pycache__/
 *.py[cod]
 result/
 .vscode/
+.DS_Store
+MPUS_GA.zip

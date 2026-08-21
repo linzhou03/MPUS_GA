@@ -19,7 +19,7 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from torch.utils.data import RandomSampler, WeightedRandomSampler
+from torch.utils.data import Dataset, RandomSampler, WeightedRandomSampler
 from torch_geometric.loader import DataLoader
 
 from datapipe import (
@@ -36,13 +36,13 @@ from datapipe import (
 from golden_style import ch_stats, gram
 from graph_align import SemanticAligner
 from model import GSA_CAST
+from MPUS_GA.protocols import FIXED_UDA_PROTOCOL
 
 
 # Paper Table I: one fixed configuration for every transfer task.
 DEFAULT_BATCH_SIZE = 48
 DEFAULT_LEARNING_RATE = 5e-4
 DEFAULT_WEIGHT_DECAY = 1e-4
-DEFAULT_MAX_ITERS = 1000
 DEFAULT_SEED = 42
 
 D_MODEL = 64
@@ -175,6 +175,8 @@ def train_step(
     device: torch.device,
     pseudo_selection: str,
 ) -> dict[str, float | int]:
+    if "y" in target_data:
+        raise RuntimeError("Target adaptation batch unexpectedly contains labels")
     model.train()
     graph_module.train()
     source_data = source_data.to(device)
@@ -322,6 +324,21 @@ def _next_batch(iterator, loader):
         return next(iterator), iterator
 
 
+class UnlabeledGraphView(Dataset):
+    """Expose target features and graph metadata without target labels."""
+
+    def __init__(self, dataset) -> None:
+        self.dataset = dataset
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int):
+        data = self.dataset[index]
+        del data.y
+        return data
+
+
 def _make_loaders(
     source_dataset,
     target_dataset,
@@ -367,15 +384,16 @@ def _make_loaders(
             pin_memory=pin_memory,
             generator=source_generator,
         )
+    unlabeled_target = UnlabeledGraphView(target_dataset)
     target_samples = batch_size * len(source_loader)
     target_sampler = RandomSampler(
-        target_dataset,
+        unlabeled_target,
         replacement=True,
         num_samples=target_samples,
         generator=target_generator,
     )
     target_loader = DataLoader(
-        target_dataset,
+        unlabeled_target,
         batch_size=batch_size,
         sampler=target_sampler,
         drop_last=True,
@@ -419,7 +437,10 @@ def _parse_subjects(value: str) -> list[int]:
 
 def _result_paths(result_dir: Path, source_dataset: str) -> tuple[Path, Path]:
     result_dir.mkdir(parents=True, exist_ok=True)
-    experiment = f"{SOURCE_NAMES[source_dataset]}_to_SEED-V_CAGA-SGA"
+    experiment = (
+        f"{SOURCE_NAMES[source_dataset]}_to_SEED-V_"
+        "CAGA-SGA_transductive_fixed1000"
+    )
     version = 1
     while True:
         summary = result_dir / f"Summary_{experiment}_v{version}.csv"
@@ -432,7 +453,9 @@ def _result_paths(result_dir: Path, source_dataset: str) -> tuple[Path, Path]:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Reproduce CAGA-SGA -> SEED-V")
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
-    parser.add_argument("--result-dir", type=Path, default=Path("result"))
+    parser.add_argument(
+        "--result-dir", type=Path, default=Path("result/transductive_fixed1000")
+    )
     parser.add_argument(
         "--source-dataset",
         choices=SOURCE_DATASETS,
@@ -443,7 +466,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--learning-rate", type=float, default=DEFAULT_LEARNING_RATE)
     parser.add_argument("--weight-decay", type=float, default=DEFAULT_WEIGHT_DECAY)
-    parser.add_argument("--max-iters", type=int, default=DEFAULT_MAX_ITERS)
     parser.add_argument("--log-interval", type=int, default=100)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
@@ -480,12 +502,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def _validate_args(args) -> None:
     if args.batch_size <= 1:
         raise ValueError("batch-size must be greater than 1")
-    if args.max_iters <= 0:
-        raise ValueError("max-iters must be positive")
     if args.log_interval <= 0:
         raise ValueError("log-interval must be positive")
     if args.num_workers < 0:
         raise ValueError("num-workers cannot be negative")
+    if (
+        not args.validate_data_only
+        and args.source_dataset != FIXED_UDA_PROTOCOL.source_dataset
+    ):
+        raise ValueError(
+            "The fixed comparison protocol requires --source-dataset seed-vii"
+        )
     if str(args.device).startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError(
             f"CUDA device requested but CUDA is unavailable: {args.device}"
@@ -518,6 +545,10 @@ def main() -> None:
     print(f"Transfer: {SOURCE_NAMES[args.source_dataset]} -> SEED-V")
     print(f"Device: {device}")
     print(
+        f"Protocol: {FIXED_UDA_PROTOCOL.name} (all 20 source subjects, all 45 "
+        "unlabeled target trials, fixed 1000 iterations, final evaluation only)"
+    )
+    print(
         f"Anti-collapse modes: source_sampling={args.source_sampling}, "
         f"pseudo_selection={args.pseudo_selection}, "
         f"target_normalization={args.target_normalization}"
@@ -538,6 +569,12 @@ def main() -> None:
             args.data_root,
             target_normalization=args.target_normalization,
             source_dataset=args.source_dataset,
+        )
+        source_subjects = int(torch.unique(source_dataset.subject_ids).numel())
+        FIXED_UDA_PROTOCOL.validate_fold(
+            source_subjects=source_subjects,
+            target_trials=len(target_dataset),
+            training_iterations=FIXED_UDA_PROTOCOL.training_iterations,
         )
         source_loader, target_loader, test_loader = _make_loaders(
             source_dataset,
@@ -575,7 +612,7 @@ def main() -> None:
 
         source_iterator = iter(source_loader)
         target_iterator = iter(target_loader)
-        for iteration in range(1, args.max_iters + 1):
+        for iteration in range(1, FIXED_UDA_PROTOCOL.training_iterations + 1):
             source_batch, source_iterator = _next_batch(source_iterator, source_loader)
             target_batch, target_iterator = _next_batch(target_iterator, target_loader)
             losses = train_step(
@@ -590,9 +627,14 @@ def main() -> None:
                 device,
                 args.pseudo_selection,
             )
-            if iteration == 1 or iteration % args.log_interval == 0:
+            if (
+                iteration == 1
+                or iteration % args.log_interval == 0
+                or iteration == FIXED_UDA_PROTOCOL.training_iterations
+            ):
                 print(
-                    f"S{subject_id:02d}|I{iteration:04d}/{args.max_iters} "
+                    f"S{subject_id:02d}|I{iteration:04d}/"
+                    f"{FIXED_UDA_PROTOCOL.training_iterations} "
                     f"total={losses['total']:.4f} "
                     f"cls={losses['classification']:.4f} "
                     f"domain={losses['domain']:.4f} "
@@ -610,8 +652,15 @@ def main() -> None:
         detailed_results.append(
             {
                 "subject": subject_id,
+                "protocol": FIXED_UDA_PROTOCOL.name,
                 "source_dataset": args.source_dataset,
-                "iterations": args.max_iters,
+                "source_subjects": source_subjects,
+                "source_trials": len(source_dataset),
+                "target_adaptation_trials": len(target_dataset),
+                "target_evaluation_trials": len(target_dataset),
+                "iterations": FIXED_UDA_PROTOCOL.training_iterations,
+                "checkpoint_selection": FIXED_UDA_PROTOCOL.checkpoint_selection,
+                "target_evaluations": FIXED_UDA_PROTOCOL.target_evaluations,
                 "seed": fold_seed,
                 "source_sampling": args.source_sampling,
                 "pseudo_selection": args.pseudo_selection,
