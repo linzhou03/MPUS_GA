@@ -25,6 +25,7 @@ from MPUS_GA.trial_temporal.train import (  # noqa: E402
     EXPERIMENT_ORDER,
     EXPERIMENTS,
     PrototypeBank,
+    TargetPriorEstimator,
     _adaptation_ramp,
     _class_balanced_domain_ce,
     _should_evaluate_target,
@@ -74,12 +75,72 @@ def test_class_conditional_fusion_uses_external_scale_class_reliability() -> Non
     embeddings = torch.randn(3, 2, 32)
     logits = torch.randn(3, 2, 3)
     reliability = torch.tensor([[0.9, 0.2, 0.5], [0.1, 0.8, 0.5]])
-    _, _, class_weight = model._fuse(embeddings, logits, reliability)
+    _, _, class_weight, _, _, _ = model._fuse(
+        embeddings, logits, reliability
+    )
     torch.testing.assert_close(
         class_weight.sum(dim=1), torch.ones(3, 3), atol=1e-6, rtol=1e-6
     )
     assert torch.all(class_weight[:, 0, 0] > class_weight[:, 1, 0])
     assert torch.all(class_weight[:, 1, 1] > class_weight[:, 0, 1])
+
+
+def test_weighted_pyramid_keeps_one_feature_per_class() -> None:
+    model = _small_model(scales=(1.0, 2.0, 4.0), num_domains=2)
+    embeddings = torch.randn(4, 3, 32)
+    logits = torch.randn(4, 3, 3)
+    reliability = torch.tensor(
+        [[0.7, 0.2, 0.3], [0.2, 0.7, 0.2], [0.1, 0.1, 0.5]]
+    )
+    (
+        fused_logits,
+        fused_embedding,
+        class_weight,
+        class_features,
+        pyramid_logits,
+        residual_weight,
+    ) = model._fuse(embeddings, logits, reliability)
+    assert fused_logits.shape == (4, 3)
+    assert fused_embedding.shape == (4, 32)
+    assert class_weight.shape == (4, 3, 3)
+    assert class_features.shape == (4, 3, 32)
+    assert pyramid_logits.shape == (4, 3)
+    torch.testing.assert_close(class_weight.sum(dim=1), torch.ones(4, 3))
+    torch.testing.assert_close(residual_weight, torch.tensor(0.2))
+
+
+def test_target_prior_estimator_recovers_multiscale_label_shift() -> None:
+    estimator = TargetPriorEstimator(
+        domain_count=1,
+        scale_count=3,
+        class_count=3,
+        source_prior=torch.tensor([0.2, 0.2, 0.6]),
+        device=torch.device("cpu"),
+        momentum=0.0,
+        ridge=0.0,
+        prior_floor=0.001,
+    )
+    labels = torch.tensor([0, 1, 2])
+    source_logits = torch.full((3, 3, 3), -8.0)
+    for class_index in range(3):
+        source_logits[class_index, :, class_index] = 8.0
+    estimator.update_source(0, source_logits, labels)
+
+    target_labels = torch.tensor([0, 0, 0, 1, 2, 2, 2, 2, 2, 2])
+    target_logits = torch.full((10, 3, 3), -8.0)
+    for row, class_index in enumerate(target_labels.tolist()):
+        target_logits[row, :, class_index] = 8.0
+    estimator.update_target(target_logits)
+    torch.testing.assert_close(
+        estimator.estimated_prior,
+        torch.tensor([0.3, 0.1, 0.6]),
+        atol=1e-4,
+        rtol=1e-4,
+    )
+    adjustment = estimator.logit_adjustment(0.5)
+    assert adjustment[0] > 0
+    assert adjustment[1] < 0
+    assert abs(float(adjustment[2])) < 1e-4
 
 
 def test_scale_logits_are_independent_before_cross_scale_context() -> None:
@@ -135,7 +196,36 @@ def test_relation_graph_changes_only_fusion_not_independent_scale_logits() -> No
         )
     torch.testing.assert_close(first["scale_embeddings"], second["scale_embeddings"])
     torch.testing.assert_close(first["scale_logits"], second["scale_logits"])
+    assert not torch.allclose(
+        first["pyramid_class_features"], second["pyramid_class_features"]
+    )
     assert not torch.allclose(first["logits"], second["logits"])
+
+
+def test_prior_adjustment_changes_only_calibrated_independent_evidence() -> None:
+    model = _small_model(scales=(1.0, 2.0), num_domains=2)
+    model.eval()
+    x = {
+        "1s": torch.randn(2, 2, 62, 5),
+        "2s": torch.randn(2, 2, 62, 5),
+    }
+    mask = {
+        "1s": torch.ones(2, 2, dtype=torch.bool),
+        "2s": torch.ones(2, 2, dtype=torch.bool),
+    }
+    with torch.no_grad():
+        raw = model(x, mask, compute_domain=False)
+        corrected = model(
+            x,
+            mask,
+            compute_domain=False,
+            class_logit_adjustment=torch.tensor([0.4, -0.6, 0.0]),
+        )
+    torch.testing.assert_close(raw["scale_logits"], corrected["scale_logits"])
+    assert not torch.allclose(
+        raw["calibrated_scale_logits"], corrected["calibrated_scale_logits"]
+    )
+    assert not torch.allclose(raw["logits"], corrected["logits"])
 
 
 def test_scale_conditional_domain_head_detaches_classifier_probability() -> None:
@@ -398,6 +488,14 @@ def test_multiscale_relation_graph_train_step_updates_class_edges() -> None:
         "domain_id": torch.ones(3, dtype=torch.long),
     }
     bank = PrototypeBank(1, 3, 3, 32, 0.9, 0.15, 0.1, device)
+    prior = TargetPriorEstimator(
+        1,
+        3,
+        3,
+        torch.tensor([0.3, 0.1, 0.6]),
+        device,
+        momentum=0.9,
+    )
     record = train_step(
         model,
         [source_batch],
@@ -416,6 +514,7 @@ def test_multiscale_relation_graph_train_step_updates_class_edges() -> None:
         pseudo_confidence_threshold=0.0,
         consensus_jsd_threshold=1.0,
         consensus_minimum_votes=1,
+        target_prior_estimator=prior,
     )
     assert bank.source_relation_initialized.all()
     torch.testing.assert_close(
@@ -424,6 +523,9 @@ def test_multiscale_relation_graph_train_step_updates_class_edges() -> None:
     assert record["scale_classification"] > 0
     assert record["gate_supervision"] >= 0
     assert record["prototype_updates_active"]
+    assert "estimated_target_prior" in record
+    assert prior.source_initialized.all()
+    assert prior.target_updates == 1
 
 
 def test_train_step_rejects_target_labels_before_model_access() -> None:

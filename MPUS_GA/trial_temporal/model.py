@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 
 import torch
@@ -217,6 +218,8 @@ class MultiScaleMultiSourceDANN(nn.Module):
         domain_mode: str = "scale_conditional",
         detach_domain_probability: bool = True,
         relation_strength: float = 1.0,
+        pyramid_weight_floor: float = 0.10,
+        pyramid_residual_initial: float = 0.20,
     ) -> None:
         super().__init__()
         self.scales = tuple(sorted(map(float, scales)))
@@ -232,6 +235,10 @@ class MultiScaleMultiSourceDANN(nn.Module):
             raise ValueError(f"Unsupported domain mode: {domain_mode}")
         if relation_strength < 0:
             raise ValueError("relation_strength must be nonnegative")
+        if not 0 <= pyramid_weight_floor < 1:
+            raise ValueError("pyramid_weight_floor must be within [0,1)")
+        if not 0 < pyramid_residual_initial < 1:
+            raise ValueError("pyramid_residual_initial must be within (0,1)")
         self.scale_keys = tuple(scale_key(scale) for scale in self.scales)
         self.num_classes = int(num_classes)
         self.num_domains = int(num_domains)
@@ -240,6 +247,7 @@ class MultiScaleMultiSourceDANN(nn.Module):
         self.domain_mode = domain_mode
         self.detach_domain_probability = bool(detach_domain_probability)
         self.relation_strength = float(relation_strength)
+        self.pyramid_weight_floor = float(pyramid_weight_floor)
 
         self.spatial = WindowSpatialEncoder(
             d_model,
@@ -285,6 +293,31 @@ class MultiScaleMultiSourceDANN(nn.Module):
             nn.Linear(hidden, num_classes),
         )
         self.naive_scale_gate = nn.Linear(d_model, 1)
+        # A learnable residual on the external scale x class relation matrix.
+        # It starts at zero so the source/prototype relation remains the prior.
+        self.scale_class_relation_residual = nn.Parameter(
+            torch.zeros(len(self.scales), num_classes)
+        )
+        self.pyramid_projections = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.LayerNorm(d_model),
+                    nn.Linear(d_model, d_model),
+                    nn.GELU(),
+                    nn.Dropout(dropout),
+                    nn.Linear(d_model, d_model),
+                )
+                for _ in self.scales
+            ]
+        )
+        for projection in self.pyramid_projections:
+            nn.init.zeros_(projection[-1].weight)
+            nn.init.zeros_(projection[-1].bias)
+        self.pyramid_output_norm = nn.LayerNorm(d_model)
+        residual_logit = math.log(
+            pyramid_residual_initial / (1.0 - pyramid_residual_initial)
+        )
+        self.pyramid_residual_logit = nn.Parameter(torch.tensor(residual_logit))
 
         self.grl = GRL(alpha=1.0)
         self.scale_domain_heads = nn.ModuleList()
@@ -311,9 +344,33 @@ class MultiScaleMultiSourceDANN(nn.Module):
         scale_embeddings: torch.Tensor,
         scale_logits: torch.Tensor,
         scale_class_reliability: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         batch, scale_count, _ = scale_logits.shape
-        if self.fusion_mode == "uniform" or scale_count == 1:
+        if scale_count == 1:
+            class_weight = scale_logits.new_full(
+                (batch, scale_count, self.num_classes), 1.0 / scale_count
+            )
+            class_features = scale_embeddings[:, :1].expand(
+                -1, self.num_classes, -1
+            )
+            logits = scale_logits[:, 0]
+            residual_weight = logits.new_zeros(())
+            return (
+                logits,
+                scale_embeddings[:, 0],
+                class_weight,
+                class_features,
+                logits,
+                residual_weight,
+            )
+        if self.fusion_mode == "uniform":
             class_weight = scale_logits.new_full(
                 (batch, scale_count, self.num_classes), 1.0 / scale_count
             )
@@ -325,7 +382,10 @@ class MultiScaleMultiSourceDANN(nn.Module):
                 -1, -1, self.num_classes
             )
         else:
-            gate_logits = self.class_scale_gate(scale_embeddings)
+            gate_logits = (
+                self.class_scale_gate(scale_embeddings)
+                + self.scale_class_relation_residual.unsqueeze(0)
+            )
             if scale_class_reliability is not None:
                 reliability = scale_class_reliability.to(gate_logits)
                 if reliability.shape != (scale_count, self.num_classes):
@@ -336,17 +396,48 @@ class MultiScaleMultiSourceDANN(nn.Module):
                     reliability.clamp_min(1e-6)
                 )
             class_weight = F.softmax(gate_logits, dim=1)
+        if self.fusion_mode != "uniform":
+            uniform = torch.full_like(class_weight, 1.0 / scale_count)
+            class_weight = (
+                (1.0 - self.pyramid_weight_floor) * class_weight
+                + self.pyramid_weight_floor * uniform
+            )
 
-        fused_logits = (class_weight * scale_logits).sum(dim=1)
-        class_mass = F.softmax(scale_logits.detach(), dim=-1).mean(dim=1)
-        sample_scale_weight = torch.einsum("bsc,bc->bs", class_weight, class_mass)
-        sample_scale_weight = sample_scale_weight / sample_scale_weight.sum(
-            dim=1, keepdim=True
-        ).clamp_min(1e-8)
-        fused_embedding = torch.einsum(
-            "bs,bsd->bd", sample_scale_weight, scale_embeddings
+        projected_levels = torch.stack(
+            [
+                scale_embeddings[:, index] + projection(
+                    scale_embeddings[:, index]
+                )
+                for index, projection in enumerate(self.pyramid_projections)
+            ],
+            dim=1,
         )
-        return fused_logits, fused_embedding, class_weight
+        class_features = self.pyramid_output_norm(
+            torch.einsum("bsc,bsd->bcd", class_weight, projected_levels)
+        )
+        pyramid_logits = torch.einsum(
+            "bcd,cd->bc", class_features, self.classifier.weight
+        )
+        if self.classifier.bias is not None:
+            pyramid_logits = pyramid_logits + self.classifier.bias
+        independent_logits = scale_logits.mean(dim=1)
+        residual_weight = torch.sigmoid(self.pyramid_residual_logit)
+        fused_logits = (
+            (1.0 - residual_weight) * independent_logits
+            + residual_weight * pyramid_logits
+        )
+        class_mass = F.softmax(fused_logits.detach(), dim=-1)
+        fused_embedding = torch.einsum(
+            "bc,bcd->bd", class_mass, class_features
+        )
+        return (
+            fused_logits,
+            fused_embedding,
+            class_weight,
+            class_features,
+            pyramid_logits,
+            residual_weight,
+        )
 
     @staticmethod
     def _conditional_feature(
@@ -366,6 +457,7 @@ class MultiScaleMultiSourceDANN(nn.Module):
         grl_alpha: float = 1.0,
         compute_domain: bool = True,
         scale_class_reliability: torch.Tensor | None = None,
+        class_logit_adjustment: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | None]:
         if tuple(x_by_scale) != self.scale_keys:
             raise ValueError(
@@ -386,10 +478,32 @@ class MultiScaleMultiSourceDANN(nn.Module):
         # embeddings or logits in the forward pass.
         scale_embeddings = self.scale_output_norm(tokens)
         scale_logits = self.classifier(scale_embeddings)
+        fusion_scale_logits = scale_logits
+        if class_logit_adjustment is not None:
+            adjustment = class_logit_adjustment.to(scale_logits)
+            if adjustment.shape != (self.num_classes,):
+                raise ValueError("class_logit_adjustment must be [classes]")
+            fusion_scale_logits = scale_logits + adjustment.view(1, 1, -1)
         contextual_scale_embeddings = self.output_norm(self.scale_context(tokens))
-        logits, embedding, scale_class_weight = self._fuse(
-            contextual_scale_embeddings, scale_logits, scale_class_reliability
+        (
+            logits,
+            embedding,
+            scale_class_weight,
+            pyramid_class_features,
+            pyramid_logits,
+            pyramid_residual_weight,
+        ) = self._fuse(
+            contextual_scale_embeddings,
+            scale_logits,
+            scale_class_reliability,
         )
+        if class_logit_adjustment is not None:
+            logits = logits + adjustment.view(1, -1)
+            embedding = torch.einsum(
+                "bc,bcd->bd",
+                F.softmax(logits.detach(), dim=-1),
+                pyramid_class_features,
+            )
         probability = F.softmax(logits, dim=-1)
 
         self.grl.alpha = float(grl_alpha)
@@ -405,7 +519,7 @@ class MultiScaleMultiSourceDANN(nn.Module):
                 if self.domain_mode == "scale_conditional":
                     feature = self._conditional_feature(
                         feature,
-                        scale_logits[:, index],
+                        fusion_scale_logits[:, index],
                         self.detach_domain_probability,
                     )
                 domain_outputs.append(head(self.grl(feature)))
@@ -424,8 +538,13 @@ class MultiScaleMultiSourceDANN(nn.Module):
             "scale_embeddings": scale_embeddings,
             "contextual_scale_embeddings": contextual_scale_embeddings,
             "scale_logits": scale_logits,
+            "calibrated_scale_logits": fusion_scale_logits,
             "scale_class_weight": scale_class_weight,
             "scale_weight": scale_weight,
+            "pyramid_class_features": pyramid_class_features,
+            "pyramid_logits": pyramid_logits,
+            "pyramid_residual_weight": pyramid_residual_weight,
+            "scale_class_relation_residual": self.scale_class_relation_residual,
             "scale_domain_logits": scale_domain_logits,
             "fused_domain_logits": fused_domain_logits,
         }
