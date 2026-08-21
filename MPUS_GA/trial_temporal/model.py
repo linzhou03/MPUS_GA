@@ -219,7 +219,7 @@ class MultiScaleMultiSourceDANN(nn.Module):
         detach_domain_probability: bool = True,
         relation_strength: float = 1.0,
         pyramid_weight_floor: float = 0.10,
-        pyramid_residual_initial: float = 0.20,
+        pyramid_residual_initial: float = 0.05,
     ) -> None:
         super().__init__()
         self.scales = tuple(sorted(map(float, scales)))
@@ -351,6 +351,7 @@ class MultiScaleMultiSourceDANN(nn.Module):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        torch.Tensor,
     ]:
         batch, scale_count, _ = scale_logits.shape
         if scale_count == 1:
@@ -365,6 +366,7 @@ class MultiScaleMultiSourceDANN(nn.Module):
             return (
                 logits,
                 scale_embeddings[:, 0],
+                class_weight,
                 class_weight,
                 class_features,
                 logits,
@@ -396,9 +398,10 @@ class MultiScaleMultiSourceDANN(nn.Module):
                     reliability.clamp_min(1e-6)
                 )
             class_weight = F.softmax(gate_logits, dim=1)
+        pyramid_class_weight = class_weight
         if self.fusion_mode != "uniform":
             uniform = torch.full_like(class_weight, 1.0 / scale_count)
-            class_weight = (
+            pyramid_class_weight = (
                 (1.0 - self.pyramid_weight_floor) * class_weight
                 + self.pyramid_weight_floor * uniform
             )
@@ -413,17 +416,22 @@ class MultiScaleMultiSourceDANN(nn.Module):
             dim=1,
         )
         class_features = self.pyramid_output_norm(
-            torch.einsum("bsc,bsd->bcd", class_weight, projected_levels)
+            torch.einsum(
+                "bsc,bsd->bcd", pyramid_class_weight, projected_levels
+            )
         )
         pyramid_logits = torch.einsum(
             "bcd,cd->bc", class_features, self.classifier.weight
         )
         if self.classifier.bias is not None:
             pyramid_logits = pyramid_logits + self.classifier.bias
-        independent_logits = scale_logits.mean(dim=1)
+        # Preserve the previous relation-guided logit fusion as the stable
+        # anchor. The weighted pyramid is an additive refinement, not a
+        # replacement by a weaker uniform scale ensemble.
+        relation_weighted_logits = (class_weight * scale_logits).sum(dim=1)
         residual_weight = torch.sigmoid(self.pyramid_residual_logit)
         fused_logits = (
-            (1.0 - residual_weight) * independent_logits
+            (1.0 - residual_weight) * relation_weighted_logits
             + residual_weight * pyramid_logits
         )
         class_mass = F.softmax(fused_logits.detach(), dim=-1)
@@ -434,6 +442,7 @@ class MultiScaleMultiSourceDANN(nn.Module):
             fused_logits,
             fused_embedding,
             class_weight,
+            pyramid_class_weight,
             class_features,
             pyramid_logits,
             residual_weight,
@@ -489,6 +498,7 @@ class MultiScaleMultiSourceDANN(nn.Module):
             logits,
             embedding,
             scale_class_weight,
+            pyramid_scale_class_weight,
             pyramid_class_features,
             pyramid_logits,
             pyramid_residual_weight,
@@ -531,6 +541,7 @@ class MultiScaleMultiSourceDANN(nn.Module):
             fused_domain_logits = self.fused_domain_head(self.grl(conditional))
 
         scale_weight = scale_class_weight.mean(dim=-1)
+        pyramid_scale_weight = pyramid_scale_class_weight.mean(dim=-1)
         return {
             "logits": logits,
             "probability": probability,
@@ -541,7 +552,12 @@ class MultiScaleMultiSourceDANN(nn.Module):
             "calibrated_scale_logits": fusion_scale_logits,
             "scale_class_weight": scale_class_weight,
             "scale_weight": scale_weight,
+            "pyramid_scale_class_weight": pyramid_scale_class_weight,
+            "pyramid_scale_weight": pyramid_scale_weight,
             "pyramid_class_features": pyramid_class_features,
+            "relation_weighted_logits": (
+                scale_class_weight * scale_logits
+            ).sum(dim=1),
             "pyramid_logits": pyramid_logits,
             "pyramid_residual_weight": pyramid_residual_weight,
             "scale_class_relation_residual": self.scale_class_relation_residual,

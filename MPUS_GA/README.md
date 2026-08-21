@@ -209,8 +209,8 @@ aligned 1 s / 2 s / 4 s DE sequences [T,62,5]
   -> source scale-class reliability and a learnable 3 x 3 residual matrix
   -> sample-dependent weights for each scale x emotion-class edge
   -> one weighted pyramid feature for each emotion class
-  -> stable residual with the independent-scale logit ensemble
-  -> unlabeled multiscale target-prior correction and one trial prediction
+  -> stable residual with the relation-weighted logit fusion
+  -> one raw final-logit trial prediction
 ```
 
 Per-scale logits are computed before the cross-scale context Transformer, so a
@@ -220,7 +220,7 @@ embedding. Consequently, per-scale metrics are genuine independent-scale
 evidence, and their comparison with the fused output is a valid multiscale
 ablation.
 
-### Prior-aware class-conditional weighted feature pyramid
+### Class-conditional weighted feature pyramid
 
 The association between the three temporal scales and three emotion classes is
 represented by a `[3 scales, 3 classes]` bipartite relation matrix. Source
@@ -232,21 +232,24 @@ prevents a scale from disappearing. Every class column is normalized over the
 The relation matrix now controls features rather than merely averaging logits.
 The model projects each contextual scale level, constructs a separate weighted
 pyramid feature for positive, neutral, and negative, and scores each feature
-with the matching classifier row. A learnable residual, initialized to 0.2,
-mixes this pyramid prediction with the mean independent-scale logits. Thus the
-new fusion path can add class-specific multiscale information without abruptly
-discarding the independent-scale baseline.
+with the matching classifier row. A learnable residual, initialized to 0.05,
+mixes this pyramid prediction with the previous relation-weighted logit fusion.
+The established 3 x 3 logit path is therefore the stable 95% anchor at
+initialization; the feature pyramid is a small refinement rather than a
+replacement by a uniform scale average.
 
 An online target-prior estimator uses only raw independent-scale logits. It
 maintains a soft source confusion matrix for every scale and matches all target
 scale mean probabilities jointly with a constrained ridge label-shift solve.
-The estimated target prior is floored, normalized, and converted into a clipped
-logit adjustment relative to the natural source prior. Its strength follows
-the adaptation ramp, so it is zero through iteration 300 and reaches its
-configured value at iteration 600.
+The estimated target prior is floored and normalized. In the current method its
+correction strength defaults to zero: the estimate is diagnostic-only and
+cannot change final logits, pseudo-labels, domain alignment, or prototypes.
+This isolation is intentional because direct label-shift inversion was unstable
+under cross-dataset conditional shift. A nonzero correction remains an explicit
+experimental option rather than part of A6/B6 defaults.
 
-Target pseudo-label evidence is constructed from the prior-corrected but still
-independent per-scale probabilities. A target trial is eligible only when its
+Target pseudo-label evidence is constructed from raw independent per-scale
+probabilities. A target trial is eligible only when its
 consensus confidence, scale vote count, and Jensen-Shannon agreement pass their
 thresholds. These detached consensus labels update scale/class target
 prototypes after iteration 300. Neither fused pyramid logits nor target labels
@@ -258,10 +261,10 @@ The hard issue-7 boundary is therefore:
 each scale input -> its own embedding -> its own logits
                                         |
 all independent evidence ---------------+
-  -> multiscale target-prior estimate and independent consensus
+  -> diagnostic multiscale target-prior estimate + raw independent consensus
   -> source relation + learnable 3 x 3 residual + sample importance
   -> positive / neutral / negative weighted pyramid features
-  -> independent-logit residual + prior correction -> final logits
+  -> relation-weighted logits + small pyramid residual -> final logits
 ```
 
 Neither cross-scale context nor relation-graph output can feed back into the
@@ -280,10 +283,10 @@ forcing the target prediction prior to be uniform.
 New fixed-final A6/B6 runs use isolated paths:
 
 ```text
-results_prior_aware_weighted_pyramid/A6/
-results_prior_aware_weighted_pyramid/B6/
-logs/prior_aware_weighted_pyramid/A6.log
-logs/prior_aware_weighted_pyramid/B6.log
+results_weighted_pyramid_residual_fix/A6/
+results_weighted_pyramid_residual_fix/B6/
+logs/weighted_pyramid_residual_fix/A6.log
+logs/weighted_pyramid_residual_fix/B6.log
 ```
 
 Result JSON files record the source relation matrix, learned 3 x 3 residual,
@@ -306,12 +309,13 @@ iteration 301, after the classifier has completed the source-only adaptation
 warmup. This prevents biased early target predictions from changing later
 fusion weights during warmup.
 
-The final prediction is the argmax after the unlabeled target-prior logit
-adjustment. The prior estimator never accesses target labels. The old
+The final prediction is the argmax of the relation-weighted logits plus the
+small pyramid residual; no target-prior correction is applied by default. The
+diagnostic prior estimator never accesses target labels. The old
 supervised contrastive, InfoMax, and 1-second-teacher consistency losses are not
 part of this experiment family. Source inverse-frequency sampling remains
-softened to alpha=0.4; prior correction, domain adaptation, and prototype
-adaptation start after iteration 300 and reach full weight at iteration 600.
+softened to alpha=0.4; domain and prototype adaptation start after iteration
+300 and reach full weight at iteration 600.
 
 The comparison protocol remains fixed:
 
@@ -320,8 +324,7 @@ The comparison protocol remains fixed:
 - training runs for exactly 1000 iterations without validation or checkpoint
   selection;
 - target labels are accessed once for final trial-level evaluation;
-- final predictions use the unlabeled multiscale prior estimate fixed at the
-  end of iteration 1000;
+- final predictions use no target-prior correction;
 - random seeds 42, 43, and 44 and all target subjects run by default.
 
 ### CAGA-SGA-style target-selected comparison
