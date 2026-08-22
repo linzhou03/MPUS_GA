@@ -438,6 +438,28 @@ folds, and every B experiment contains 3 seeds x 20 subjects = 60 folds. The
 complete suite therefore produces 864 fold JSON files. Source normalization is
 always fitted only on the configured source dataset.
 
+### Paired statistical analysis
+
+Analyze the completed suite with the target subject, rather than an individual
+seed/fold, as the independent statistical unit:
+
+```bash
+/home/gzw/miniforge3/envs/BCI/bin/python \
+  scripts/analyze_bidirectional_ablation.py \
+  --result-root results_bidirectional_full_ablation \
+  --output-dir analysis/bidirectional_full_ablation
+```
+
+The script validates all 864 JSON files as fixed-final runs, averages the three
+seeds inside each target subject, and then performs the planned paired
+comparisons. It writes subject-level metrics, paired mean differences with 95%
+bootstrap confidence intervals, two-sided Wilcoxon tests, per-metric Holm
+correction, Cohen's paired `dz`, and matched-pairs rank-biserial effects. A
+positive reported performance change is always favorable; recall-gap changes
+are sign-flipped so that a reduction is positive. Prediction-rate columns are
+descriptive raw candidate-minus-reference changes because a larger predicted
+class share is not inherently better.
+
 ## Signal processing
 
 1. Drop non-EEG channels from `{M1, M2, ECG, HEO, VEO}` when present.
