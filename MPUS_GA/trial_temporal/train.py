@@ -62,6 +62,9 @@ class ExperimentSpec:
     domain_mode: str
     use_prototypes: bool
     use_feature_pyramid: bool = True
+    pyramid_gate_mode: str = "global"
+    use_pyramid_bias_guard: bool = False
+    use_pyramid_gate_warmup: bool = False
     use_source_excess_suppression: bool = True
     use_boundary_attractor_suppression: bool = True
     target_dataset: str = "seed_v"
@@ -153,7 +156,7 @@ _TRANSFER_DIRECTIONS = {
     },
 }
 
-EXPERIMENT_ORDER = tuple(
+LEGACY_EXPERIMENT_ORDER = tuple(
     name
     for ablation in (*map(str, range(7)), "main")
     for name in (
@@ -161,6 +164,36 @@ EXPERIMENT_ORDER = tuple(
         f"B_{ablation}" if ablation == "main" else f"B{ablation}",
     )
 )
+
+_G_DEFINITIONS = {
+    "G0": {
+        "description": "relation-logit anchor without feature pyramid",
+        "use_feature_pyramid": False,
+    },
+    "G1": {
+        "description": "class-static safe residual pyramid",
+        "pyramid_gate_mode": "class_static",
+        "use_pyramid_gate_warmup": True,
+    },
+    "G2": {
+        "description": "sample-class adaptive safe residual pyramid",
+        "pyramid_gate_mode": "sample_class",
+        "use_pyramid_gate_warmup": True,
+    },
+    "G3": {
+        "description": "bias-guarded sample-class safe residual pyramid",
+        "pyramid_gate_mode": "sample_class",
+        "use_pyramid_bias_guard": True,
+        "use_pyramid_gate_warmup": True,
+    },
+}
+
+G_EXPERIMENT_ORDER = tuple(
+    f"{direction}_{variant}"
+    for variant in _G_DEFINITIONS
+    for direction in "AB"
+)
+EXPERIMENT_ORDER = LEGACY_EXPERIMENT_ORDER + G_EXPERIMENT_ORDER
 
 
 def _build_experiments() -> dict[str, ExperimentSpec]:
@@ -194,6 +227,39 @@ def _build_experiments() -> dict[str, ExperimentSpec]:
                 use_boundary_attractor_suppression=definition.get(
                     "use_boundary_attractor_suppression", True
                 ),
+                target_dataset=transfer["target_dataset"],
+                target_subject_count=transfer["target_subject_count"],
+                target_trials=transfer["target_trials"],
+            )
+    for variant, definition in _G_DEFINITIONS.items():
+        for direction, transfer in _TRANSFER_DIRECTIONS.items():
+            name = f"{direction}_{variant}"
+            experiments[name] = ExperimentSpec(
+                name=name,
+                description=(
+                    f"{transfer['description']}; {definition['description']}"
+                ),
+                transfer_direction=direction,
+                ablation=variant,
+                source_domains=transfer["source_domains"],
+                scales=(1.0, 2.0, 4.0),
+                fusion_mode="class_conditional",
+                domain_mode="scale_conditional",
+                use_prototypes=True,
+                use_feature_pyramid=definition.get(
+                    "use_feature_pyramid", True
+                ),
+                pyramid_gate_mode=definition.get(
+                    "pyramid_gate_mode", "class_static"
+                ),
+                use_pyramid_bias_guard=definition.get(
+                    "use_pyramid_bias_guard", False
+                ),
+                use_pyramid_gate_warmup=definition.get(
+                    "use_pyramid_gate_warmup", False
+                ),
+                use_source_excess_suppression=True,
+                use_boundary_attractor_suppression=True,
                 target_dataset=transfer["target_dataset"],
                 target_subject_count=transfer["target_subject_count"],
                 target_trials=transfer["target_trials"],
@@ -1094,6 +1160,39 @@ def _gate_supervision_loss(
     )
 
 
+def _pyramid_gate_supervision_loss(
+    relation_logits: torch.Tensor,
+    pyramid_logits: torch.Tensor,
+    raw_gate: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float,
+    margin: float,
+) -> torch.Tensor:
+    """Open a class gate only when its source-label logit change is useful.
+
+    For the true class, a positive pyramid-minus-anchor change is useful. For
+    every false class the sign is reversed, because lowering that logit
+    improves the true-class margin. The detached soft teacher supervises only
+    the gate; it cannot feed labels into the pyramid logits or scale heads.
+    """
+
+    if not raw_gate.requires_grad:
+        return relation_logits.sum() * 0.0
+    if temperature <= 0 or margin < 0:
+        raise ValueError("pyramid gate teacher parameters are invalid")
+    if raw_gate.shape != relation_logits.shape or pyramid_logits.shape != (
+        relation_logits.shape
+    ):
+        raise ValueError("pyramid gate tensors must all be [batch,classes]")
+    true_class = F.one_hot(labels, num_classes=relation_logits.shape[1]).bool()
+    delta = (pyramid_logits - relation_logits).detach()
+    useful_delta = torch.where(true_class, delta, -delta)
+    teacher = torch.sigmoid((useful_delta - margin) / temperature)
+    return F.binary_cross_entropy(
+        raw_gate.clamp(1e-6, 1.0 - 1e-6), teacher
+    )
+
+
 def _class_balanced_domain_ce(
     logits: torch.Tensor,
     domain_index: int,
@@ -1197,6 +1296,10 @@ def train_step(
     boundary_bias_strength: float = 2.0,
     boundary_bias_ratio_tolerance: float = 0.15,
     common_bias_max_adjustment: float = 0.50,
+    pyramid_gate_supervision_weight: float = 0.05,
+    pyramid_gate_sparsity_weight: float = 0.005,
+    pyramid_gate_teacher_temperature: float = 0.10,
+    pyramid_gate_teacher_margin: float = 0.05,
 ) -> dict:
     if "y" in target_batch:
         raise RuntimeError("Target adaptation batch unexpectedly contains labels")
@@ -1209,6 +1312,7 @@ def train_step(
     ramp = _adaptation_ramp(
         iteration, adaptation_warmup_iterations, adaptation_ramp_end
     )
+    pyramid_gate_ramp = ramp if spec.use_pyramid_gate_warmup else 1.0
     adaptation_active = iteration > adaptation_warmup_iterations
     reliability = (
         prototype_bank.scale_class_reliability()
@@ -1242,6 +1346,17 @@ def train_step(
         if common_bias_components is not None
         else None
     )
+    pyramid_bias_risk = None
+    if spec.use_pyramid_bias_guard and common_bias_components is not None:
+        if common_bias_max_adjustment > 0:
+            pyramid_bias_risk = (
+                -common_bias_components["combined"]
+                / common_bias_max_adjustment
+            ).clamp(0.0, 1.0)
+        else:
+            pyramid_bias_risk = torch.zeros(
+                NUM_CLASSES, device=device, dtype=torch.float32
+            )
     target_logit_adjustment = None
     if prior_adjustment is not None or common_bias_adjustment is not None:
         target_logit_adjustment = torch.zeros(
@@ -1263,6 +1378,7 @@ def train_step(
                 mask,
                 grl_alpha=ramp,
                 scale_class_reliability=reliability,
+                pyramid_gate_ramp=pyramid_gate_ramp,
             )
         )
     target_x, target_mask = _batch_to_device(target_batch, device)
@@ -1272,6 +1388,8 @@ def train_step(
         grl_alpha=ramp,
         scale_class_reliability=reliability,
         class_logit_adjustment=target_logit_adjustment,
+        pyramid_gate_ramp=pyramid_gate_ramp,
+        pyramid_bias_risk=pyramid_bias_risk,
     )
 
     target_consensus = independent_scale_consensus(
@@ -1312,6 +1430,32 @@ def train_step(
             for output, labels in zip(source_outputs, source_labels, strict=True)
         ]
     )
+    if spec.use_feature_pyramid and spec.pyramid_gate_mode != "global":
+        pyramid_gate_supervision_by_source = torch.stack(
+            [
+                _pyramid_gate_supervision_loss(
+                    output["relation_weighted_logits"],
+                    output["pyramid_logits"],
+                    output["pyramid_raw_gate"],
+                    labels,
+                    pyramid_gate_teacher_temperature,
+                    pyramid_gate_teacher_margin,
+                )
+                for output, labels in zip(
+                    source_outputs, source_labels, strict=True
+                )
+            ]
+        )
+        pyramid_gate_sparsity_loss = torch.stack(
+            [output["pyramid_raw_gate"].mean() for output in source_outputs]
+            + [target_output["pyramid_raw_gate"].mean()]
+        ).mean()
+    else:
+        zero = target_output["logits"].sum() * 0.0
+        pyramid_gate_supervision_by_source = torch.zeros_like(
+            fused_classification_by_source
+        ) + zero
+        pyramid_gate_sparsity_loss = zero
     source_weights = (
         prototype_bank.source_weights(source_class_priors)
         if prototype_bank is not None and adaptation_active
@@ -1322,6 +1466,9 @@ def train_step(
     classification_loss = (classification_by_source * source_weights).sum()
     gate_supervision_loss = (
         gate_supervision_by_source * source_weights
+    ).sum()
+    pyramid_gate_supervision_loss = (
+        pyramid_gate_supervision_by_source * source_weights
     ).sum()
     domain_loss, domain_by_scale = _domain_loss(
         source_outputs,
@@ -1353,6 +1500,12 @@ def train_step(
     total_loss = (
         classification_loss
         + gate_supervision_weight * gate_supervision_loss
+        + ramp
+        * (
+            pyramid_gate_supervision_weight
+            * pyramid_gate_supervision_loss
+            + pyramid_gate_sparsity_weight * pyramid_gate_sparsity_loss
+        )
         + ramp
         * (
             spec.domain_weight * domain_loss
@@ -1403,6 +1556,18 @@ def train_step(
     mean_pyramid_gate = target_output[
         "pyramid_scale_class_weight"
     ].detach().mean(dim=0)
+    mean_pyramid_residual_gate = target_output[
+        "pyramid_residual_gate"
+    ].detach().mean(dim=0)
+    mean_pyramid_raw_gate = target_output[
+        "pyramid_raw_gate"
+    ].detach().mean(dim=0)
+    mean_pyramid_guard = target_output[
+        "pyramid_guard_factor"
+    ].detach().mean(dim=0)
+    mean_pyramid_unsupported_excess = target_output[
+        "pyramid_unsupported_excess"
+    ].detach().mean(dim=0)
     consensus_statistics = target_consensus.statistics(NUM_CLASSES)
     if not adaptation_active:
         consensus_statistics["active_class_counts"] = [0] * NUM_CLASSES
@@ -1429,6 +1594,10 @@ def train_step(
             (scale_classification_by_source * source_weights).sum().detach()
         ),
         "gate_supervision": float(gate_supervision_loss.detach()),
+        "pyramid_gate_supervision": float(
+            pyramid_gate_supervision_loss.detach()
+        ),
+        "pyramid_gate_sparsity": float(pyramid_gate_sparsity_loss.detach()),
         "classification_by_source": [
             float(value) for value in classification_by_source.detach()
         ],
@@ -1442,11 +1611,28 @@ def train_step(
         "mean_target_pyramid_scale_class_gate": (
             mean_pyramid_gate.cpu().tolist()
         ),
+        "mean_target_pyramid_residual_gate_by_class": (
+            mean_pyramid_residual_gate.cpu().tolist()
+        ),
+        "mean_target_pyramid_raw_gate_by_class": (
+            mean_pyramid_raw_gate.cpu().tolist()
+        ),
+        "mean_target_pyramid_guard_by_class": (
+            mean_pyramid_guard.cpu().tolist()
+        ),
+        "mean_target_pyramid_unsupported_excess_by_class": (
+            mean_pyramid_unsupported_excess.cpu().tolist()
+        ),
         "pyramid_residual_weight": float(
             target_output["pyramid_residual_weight"].detach()
         ),
         "learned_scale_class_relation_residual": (
             model.scale_class_relation_residual.detach().cpu().tolist()
+        ),
+        "pyramid_bias_risk": (
+            pyramid_bias_risk.detach().cpu().tolist()
+            if pyramid_bias_risk is not None
+            else [0.0] * NUM_CLASSES
         ),
         "gradient_norm": float(gradient_norm),
         "learning_rate": float(optimizer.param_groups[0]["lr"]),
@@ -1599,6 +1785,10 @@ def evaluate_trials(
     corrected_scale_probabilities = []
     scale_gates = []
     pyramid_scale_gates = []
+    pyramid_residual_gates = []
+    pyramid_raw_gates = []
+    pyramid_guard_factors = []
+    pyramid_unsupported_excesses = []
     labels = []
     reliability = (
         prototype_bank.scale_class_reliability()
@@ -1638,6 +1828,17 @@ def evaluate_trials(
         if common_bias_components is not None
         else None
     )
+    pyramid_bias_risk = None
+    if model.use_pyramid_bias_guard and common_bias_components is not None:
+        if common_bias_max_adjustment > 0:
+            pyramid_bias_risk = (
+                -common_bias_components["combined"]
+                / common_bias_max_adjustment
+            ).clamp(0.0, 1.0)
+        else:
+            pyramid_bias_risk = torch.zeros(
+                NUM_CLASSES, device=device, dtype=torch.float32
+            )
     target_logit_adjustment = None
     if prior_adjustment is not None or common_bias_adjustment is not None:
         target_logit_adjustment = torch.zeros(
@@ -1664,6 +1865,8 @@ def evaluate_trials(
                 compute_domain=False,
                 scale_class_reliability=reliability,
                 class_logit_adjustment=target_logit_adjustment,
+                pyramid_gate_ramp=1.0,
+                pyramid_bias_risk=pyramid_bias_risk,
             )
             probabilities.append(output["probability"].cpu().numpy())
             scale_probabilities.append(
@@ -1678,6 +1881,16 @@ def evaluate_trials(
             pyramid_scale_gates.append(
                 output["pyramid_scale_class_weight"].cpu().numpy()
             )
+            pyramid_residual_gates.append(
+                output["pyramid_residual_gate"].cpu().numpy()
+            )
+            pyramid_raw_gates.append(output["pyramid_raw_gate"].cpu().numpy())
+            pyramid_guard_factors.append(
+                output["pyramid_guard_factor"].cpu().numpy()
+            )
+            pyramid_unsupported_excesses.append(
+                output["pyramid_unsupported_excess"].cpu().numpy()
+            )
             labels.append(batch["y"].numpy())
     labels_array = np.concatenate(labels)
     probability_array = np.concatenate(probabilities)
@@ -1687,6 +1900,12 @@ def evaluate_trials(
     )
     gate_array = np.concatenate(scale_gates)
     pyramid_gate_array = np.concatenate(pyramid_scale_gates)
+    pyramid_residual_gate_array = np.concatenate(pyramid_residual_gates)
+    pyramid_raw_gate_array = np.concatenate(pyramid_raw_gates)
+    pyramid_guard_array = np.concatenate(pyramid_guard_factors)
+    pyramid_unsupported_excess_array = np.concatenate(
+        pyramid_unsupported_excesses
+    )
     return {
         "fused": _classification_metrics(labels_array, probability_array),
         "by_scale": {
@@ -1706,7 +1925,24 @@ def evaluate_trials(
             pyramid_gate_array.mean(axis=0).tolist()
         ),
         "pyramid_residual_weight": float(
-            torch.sigmoid(model.pyramid_residual_logit.detach()).cpu()
+            pyramid_residual_gate_array.mean()
+        ),
+        "mean_pyramid_residual_gate_by_class": (
+            pyramid_residual_gate_array.mean(axis=0).tolist()
+        ),
+        "mean_pyramid_raw_gate_by_class": (
+            pyramid_raw_gate_array.mean(axis=0).tolist()
+        ),
+        "mean_pyramid_guard_by_class": (
+            pyramid_guard_array.mean(axis=0).tolist()
+        ),
+        "mean_pyramid_unsupported_excess_by_class": (
+            pyramid_unsupported_excess_array.mean(axis=0).tolist()
+        ),
+        "pyramid_bias_risk": (
+            pyramid_bias_risk.cpu().tolist()
+            if pyramid_bias_risk is not None
+            else [0.0] * NUM_CLASSES
         ),
         "estimated_target_prior": (
             target_prior_estimator.estimated_prior.cpu().tolist()
@@ -1947,6 +2183,11 @@ def run_fold(
         pyramid_weight_floor=args.pyramid_weight_floor,
         pyramid_residual_initial=args.pyramid_residual_initial,
         use_feature_pyramid=spec.use_feature_pyramid,
+        pyramid_gate_mode=spec.pyramid_gate_mode,
+        use_pyramid_bias_guard=spec.use_pyramid_bias_guard,
+        pyramid_residual_clip=args.pyramid_residual_clip,
+        pyramid_guard_strength=args.pyramid_guard_strength,
+        pyramid_guard_tolerance=args.pyramid_guard_tolerance,
     ).to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     optimizer = torch.optim.AdamW(
@@ -2051,6 +2292,10 @@ def run_fold(
             boundary_bias_strength,
             args.boundary_bias_ratio_tolerance,
             args.common_bias_max_adjustment,
+            args.pyramid_gate_supervision_weight,
+            args.pyramid_gate_sparsity_weight,
+            args.pyramid_gate_teacher_temperature,
+            args.pyramid_gate_teacher_margin,
         )
         if iteration == 1 or iteration % args.log_interval == 0 or iteration == iterations:
             training_trace.append(record)
@@ -2186,6 +2431,9 @@ def run_fold(
             "fusion_mode": spec.fusion_mode,
             "domain_mode": spec.domain_mode,
             "use_feature_pyramid": spec.use_feature_pyramid,
+            "pyramid_gate_mode": spec.pyramid_gate_mode,
+            "use_pyramid_bias_guard": spec.use_pyramid_bias_guard,
+            "use_pyramid_gate_warmup": spec.use_pyramid_gate_warmup,
             "channel_attention": True,
             "d_model": args.d_model,
             "num_heads": args.num_heads,
@@ -2198,6 +2446,9 @@ def run_fold(
             "relation_strength": args.relation_strength,
             "pyramid_weight_floor": args.pyramid_weight_floor,
             "pyramid_residual_initial": args.pyramid_residual_initial,
+            "pyramid_residual_clip": args.pyramid_residual_clip,
+            "pyramid_guard_strength": args.pyramid_guard_strength,
+            "pyramid_guard_tolerance": args.pyramid_guard_tolerance,
             "fusion_output": (
                 "one class-specific feature per emotion, scored by the "
                 "matching classifier row"
@@ -2228,6 +2479,21 @@ def run_fold(
             "relation_strength": args.relation_strength,
             "pyramid_weight_floor": args.pyramid_weight_floor,
             "pyramid_residual_initial": args.pyramid_residual_initial,
+            "pyramid_residual_clip": args.pyramid_residual_clip,
+            "pyramid_guard_strength": args.pyramid_guard_strength,
+            "pyramid_guard_tolerance": args.pyramid_guard_tolerance,
+            "pyramid_gate_supervision_weight": (
+                args.pyramid_gate_supervision_weight
+            ),
+            "pyramid_gate_sparsity_weight": (
+                args.pyramid_gate_sparsity_weight
+            ),
+            "pyramid_gate_teacher_temperature": (
+                args.pyramid_gate_teacher_temperature
+            ),
+            "pyramid_gate_teacher_margin": (
+                args.pyramid_gate_teacher_margin
+            ),
             "prior_correction_strength": args.prior_correction_strength,
             "common_bias_strength": args.common_bias_strength,
             "effective_common_bias_strength": common_bias_strength,
@@ -2264,7 +2530,10 @@ def run_fold(
             model.scale_class_relation_residual.detach().cpu().tolist()
         ),
         "final_pyramid_residual_weight": float(
-            torch.sigmoid(model.pyramid_residual_logit.detach()).cpu()
+            evaluation["pyramid_residual_weight"]
+        ),
+        "final_pyramid_class_gate_prior": (
+            torch.sigmoid(model.pyramid_class_gate_logit.detach()).cpu().tolist()
         ),
         "training_trace": training_trace,
         "target_evaluation_trace": target_evaluation_trace,
@@ -2314,6 +2583,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--relation-strength", type=float, default=1.0)
     parser.add_argument("--pyramid-weight-floor", type=float, default=0.10)
     parser.add_argument("--pyramid-residual-initial", type=float, default=0.05)
+    parser.add_argument("--pyramid-residual-clip", type=float, default=0.50)
+    parser.add_argument("--pyramid-guard-strength", type=float, default=4.0)
+    parser.add_argument("--pyramid-guard-tolerance", type=float, default=0.05)
+    parser.add_argument(
+        "--pyramid-gate-supervision-weight", type=float, default=0.05
+    )
+    parser.add_argument(
+        "--pyramid-gate-sparsity-weight", type=float, default=0.005
+    )
+    parser.add_argument(
+        "--pyramid-gate-teacher-temperature", type=float, default=0.10
+    )
+    parser.add_argument(
+        "--pyramid-gate-teacher-margin", type=float, default=0.05
+    )
     parser.add_argument("--prior-correction-strength", type=float, default=0.0)
     parser.add_argument("--common-bias-strength", type=float, default=2.0)
     parser.add_argument(
@@ -2425,6 +2709,18 @@ def validate_args(args, spec: ExperimentSpec) -> None:
         raise ValueError("pyramid-weight-floor must be within [0,1)")
     if not 0 < args.pyramid_residual_initial < 1:
         raise ValueError("pyramid-residual-initial must be within (0,1)")
+    if args.pyramid_residual_clip <= 0:
+        raise ValueError("pyramid-residual-clip must be positive")
+    if min(
+        args.pyramid_guard_strength,
+        args.pyramid_guard_tolerance,
+        args.pyramid_gate_supervision_weight,
+        args.pyramid_gate_sparsity_weight,
+        args.pyramid_gate_teacher_margin,
+    ) < 0:
+        raise ValueError("pyramid gate/guard parameters must be nonnegative")
+    if args.pyramid_gate_teacher_temperature <= 0:
+        raise ValueError("pyramid gate teacher temperature must be positive")
     if args.prior_correction_strength < 0:
         raise ValueError("prior-correction-strength must be nonnegative")
     if min(

@@ -193,6 +193,7 @@ class MultiScaleMultiSourceDANN(nn.Module):
     """Multiscale encoder with class-dependent fusion and selectable alignment."""
 
     VALID_FUSIONS = {"class_conditional", "attention", "uniform"}
+    VALID_PYRAMID_GATE_MODES = {"global", "class_static", "sample_class"}
     VALID_DOMAIN_MODES = {
         "scale_conditional",
         "scale_global",
@@ -221,6 +222,11 @@ class MultiScaleMultiSourceDANN(nn.Module):
         pyramid_weight_floor: float = 0.10,
         pyramid_residual_initial: float = 0.05,
         use_feature_pyramid: bool = True,
+        pyramid_gate_mode: str = "global",
+        use_pyramid_bias_guard: bool = False,
+        pyramid_residual_clip: float = 0.50,
+        pyramid_guard_strength: float = 4.0,
+        pyramid_guard_tolerance: float = 0.05,
     ) -> None:
         super().__init__()
         self.scales = tuple(sorted(map(float, scales)))
@@ -240,6 +246,14 @@ class MultiScaleMultiSourceDANN(nn.Module):
             raise ValueError("pyramid_weight_floor must be within [0,1)")
         if not 0 < pyramid_residual_initial < 1:
             raise ValueError("pyramid_residual_initial must be within (0,1)")
+        if pyramid_gate_mode not in self.VALID_PYRAMID_GATE_MODES:
+            raise ValueError(
+                f"Unsupported pyramid gate mode: {pyramid_gate_mode}"
+            )
+        if pyramid_residual_clip <= 0:
+            raise ValueError("pyramid_residual_clip must be positive")
+        if min(pyramid_guard_strength, pyramid_guard_tolerance) < 0:
+            raise ValueError("pyramid guard parameters must be nonnegative")
         self.scale_keys = tuple(scale_key(scale) for scale in self.scales)
         self.num_classes = int(num_classes)
         self.num_domains = int(num_domains)
@@ -250,6 +264,11 @@ class MultiScaleMultiSourceDANN(nn.Module):
         self.relation_strength = float(relation_strength)
         self.pyramid_weight_floor = float(pyramid_weight_floor)
         self.use_feature_pyramid = bool(use_feature_pyramid)
+        self.pyramid_gate_mode = pyramid_gate_mode
+        self.use_pyramid_bias_guard = bool(use_pyramid_bias_guard)
+        self.pyramid_residual_clip = float(pyramid_residual_clip)
+        self.pyramid_guard_strength = float(pyramid_guard_strength)
+        self.pyramid_guard_tolerance = float(pyramid_guard_tolerance)
 
         self.spatial = WindowSpatialEncoder(
             d_model,
@@ -302,6 +321,7 @@ class MultiScaleMultiSourceDANN(nn.Module):
         )
         self.pyramid_projections = nn.ModuleList()
         self.pyramid_output_norm: nn.Module = nn.Identity()
+        self.pyramid_sample_gate: nn.Module | None = None
         if self.use_feature_pyramid:
             self.pyramid_projections = nn.ModuleList(
                 [
@@ -325,9 +345,27 @@ class MultiScaleMultiSourceDANN(nn.Module):
             self.pyramid_residual_logit = nn.Parameter(
                 torch.tensor(residual_logit)
             )
+            self.pyramid_class_gate_logit = nn.Parameter(
+                torch.full((num_classes,), residual_logit)
+            )
+            if self.pyramid_gate_mode == "sample_class":
+                gate_hidden = max(8, num_classes * 2)
+                self.pyramid_sample_gate = nn.Sequential(
+                    nn.Linear(6, gate_hidden),
+                    nn.GELU(),
+                    nn.Linear(gate_hidden, 1),
+                )
+                # The sample gate begins as the class-static prior. This makes
+                # every new G variant an exact near-B4 fallback at startup.
+                nn.init.zeros_(self.pyramid_sample_gate[-1].weight)
+                nn.init.zeros_(self.pyramid_sample_gate[-1].bias)
         else:
             self.register_buffer(
                 "pyramid_residual_logit", torch.tensor(float("-inf"))
+            )
+            self.register_buffer(
+                "pyramid_class_gate_logit",
+                torch.full((num_classes,), float("-inf")),
             )
 
         self.grl = GRL(alpha=1.0)
@@ -355,16 +393,12 @@ class MultiScaleMultiSourceDANN(nn.Module):
         scale_embeddings: torch.Tensor,
         scale_logits: torch.Tensor,
         scale_class_reliability: torch.Tensor | None,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
+        pyramid_gate_ramp: float = 1.0,
+        pyramid_bias_risk: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         batch, scale_count, _ = scale_logits.shape
+        if not 0 <= pyramid_gate_ramp <= 1:
+            raise ValueError("pyramid_gate_ramp must be within [0,1]")
         if scale_count == 1:
             class_weight = scale_logits.new_full(
                 (batch, scale_count, self.num_classes), 1.0 / scale_count
@@ -373,16 +407,20 @@ class MultiScaleMultiSourceDANN(nn.Module):
                 -1, self.num_classes, -1
             )
             logits = scale_logits[:, 0]
-            residual_weight = logits.new_zeros(())
-            return (
-                logits,
-                scale_embeddings[:, 0],
-                class_weight,
-                class_weight,
-                class_features,
-                logits,
-                residual_weight,
-            )
+            zero_gate = logits.new_zeros((batch, self.num_classes))
+            return {
+                "logits": logits,
+                "embedding": scale_embeddings[:, 0],
+                "scale_class_weight": class_weight,
+                "pyramid_scale_class_weight": class_weight,
+                "pyramid_class_features": class_features,
+                "pyramid_logits": logits,
+                "pyramid_gate": zero_gate,
+                "pyramid_raw_gate": zero_gate,
+                "pyramid_guard_factor": torch.ones_like(zero_gate),
+                "pyramid_unsupported_excess": zero_gate,
+                "pyramid_logit_delta": zero_gate,
+            }
         if self.fusion_mode == "uniform":
             class_weight = scale_logits.new_full(
                 (batch, scale_count, self.num_classes), 1.0 / scale_count
@@ -426,16 +464,22 @@ class MultiScaleMultiSourceDANN(nn.Module):
             fused_embedding = torch.einsum(
                 "bc,bcd->bd", class_mass, class_features
             )
-            residual_weight = relation_weighted_logits.new_zeros(())
-            return (
-                relation_weighted_logits,
-                fused_embedding,
-                class_weight,
-                class_weight,
-                class_features,
-                relation_weighted_logits,
-                residual_weight,
+            zero_gate = relation_weighted_logits.new_zeros(
+                (batch, self.num_classes)
             )
+            return {
+                "logits": relation_weighted_logits,
+                "embedding": fused_embedding,
+                "scale_class_weight": class_weight,
+                "pyramid_scale_class_weight": class_weight,
+                "pyramid_class_features": class_features,
+                "pyramid_logits": relation_weighted_logits,
+                "pyramid_gate": zero_gate,
+                "pyramid_raw_gate": zero_gate,
+                "pyramid_guard_factor": torch.ones_like(zero_gate),
+                "pyramid_unsupported_excess": zero_gate,
+                "pyramid_logit_delta": zero_gate,
+            }
 
         projected_levels = torch.stack(
             [
@@ -456,27 +500,108 @@ class MultiScaleMultiSourceDANN(nn.Module):
         )
         if self.classifier.bias is not None:
             pyramid_logits = pyramid_logits + self.classifier.bias
-        # Preserve the previous relation-guided logit fusion as the stable
-        # anchor. The weighted pyramid is an additive refinement, not a
-        # replacement by a weaker uniform scale ensemble.
-        residual_weight = torch.sigmoid(self.pyramid_residual_logit)
-        fused_logits = (
-            (1.0 - residual_weight) * relation_weighted_logits
-            + residual_weight * pyramid_logits
-        )
+
+        if self.pyramid_gate_mode == "global":
+            raw_gate = torch.sigmoid(self.pyramid_residual_logit).expand(
+                batch, self.num_classes
+            )
+        else:
+            raw_gate_logit = self.pyramid_class_gate_logit.unsqueeze(0).expand(
+                batch, -1
+            )
+            if self.pyramid_gate_mode == "sample_class":
+                if self.pyramid_sample_gate is None:
+                    raise RuntimeError("sample-class pyramid gate is unavailable")
+                # Gate evidence comes only from raw independent-scale logits
+                # and the downstream relation weights. Detaching it prevents
+                # gate gradients from corrupting the independent scale heads.
+                detached_probability = F.softmax(scale_logits.detach(), dim=-1)
+                mean_probability = detached_probability.mean(dim=1)
+                probability_spread = detached_probability.std(
+                    dim=1, unbiased=False
+                )
+                anchor_probability = F.softmax(
+                    relation_weighted_logits.detach(), dim=-1
+                )
+                relation_concentration = class_weight.detach().square().sum(dim=1)
+                mean_distribution = mean_probability.unsqueeze(1).clamp_min(1e-8)
+                js_divergence = (
+                    detached_probability
+                    * (
+                        torch.log(detached_probability.clamp_min(1e-8))
+                        - torch.log(mean_distribution)
+                    )
+                ).sum(dim=-1).mean(dim=1, keepdim=True)
+                logit_delta = torch.tanh(
+                    (pyramid_logits - relation_weighted_logits).detach()
+                )
+                gate_evidence = torch.stack(
+                    (
+                        mean_probability,
+                        probability_spread,
+                        anchor_probability,
+                        relation_concentration,
+                        (1.0 - js_divergence).expand(-1, self.num_classes),
+                        logit_delta,
+                    ),
+                    dim=-1,
+                )
+                raw_gate_logit = raw_gate_logit + self.pyramid_sample_gate(
+                    gate_evidence
+                ).squeeze(-1)
+            raw_gate = torch.sigmoid(raw_gate_logit)
+
+        guard_factor = torch.ones_like(raw_gate)
+        unsupported_excess = torch.zeros_like(raw_gate)
+        if self.use_pyramid_bias_guard:
+            independent_probability = F.softmax(
+                scale_logits.detach(), dim=-1
+            ).mean(dim=1)
+            pyramid_probability = F.softmax(
+                pyramid_logits.detach(), dim=-1
+            )
+            unsupported_excess = (
+                pyramid_probability
+                - independent_probability
+                - self.pyramid_guard_tolerance
+            ).clamp_min(0.0)
+            total_risk = unsupported_excess
+            if pyramid_bias_risk is not None:
+                bias_risk = pyramid_bias_risk.detach().to(raw_gate)
+                if bias_risk.shape != (self.num_classes,):
+                    raise ValueError("pyramid_bias_risk must be [classes]")
+                total_risk = total_risk + bias_risk.clamp_min(0.0).unsqueeze(0)
+            guard_factor = torch.exp(
+                -self.pyramid_guard_strength * total_risk
+            ).clamp(0.0, 1.0)
+
+        effective_gate = raw_gate * float(pyramid_gate_ramp) * guard_factor
+        logit_delta = pyramid_logits - relation_weighted_logits
+        if self.pyramid_gate_mode != "global":
+            logit_delta = logit_delta.clamp(
+                -self.pyramid_residual_clip,
+                self.pyramid_residual_clip,
+            )
+        # The relation-weighted logits are always the stable anchor. G gates
+        # can accept or reject a bounded pyramid correction per sample/class.
+        fused_logits = relation_weighted_logits + effective_gate * logit_delta
         class_mass = F.softmax(fused_logits.detach(), dim=-1)
         fused_embedding = torch.einsum(
             "bc,bcd->bd", class_mass, class_features
         )
-        return (
-            fused_logits,
-            fused_embedding,
-            class_weight,
-            pyramid_class_weight,
-            class_features,
-            pyramid_logits,
-            residual_weight,
-        )
+        return {
+            "logits": fused_logits,
+            "embedding": fused_embedding,
+            "scale_class_weight": class_weight,
+            "pyramid_scale_class_weight": pyramid_class_weight,
+            "pyramid_class_features": class_features,
+            "pyramid_logits": pyramid_logits,
+            "pyramid_gate": effective_gate,
+            "pyramid_raw_gate": raw_gate,
+            "pyramid_guard_factor": guard_factor,
+            "pyramid_unsupported_excess": unsupported_excess,
+            "pyramid_logit_delta": logit_delta,
+        }
 
     @staticmethod
     def _conditional_feature(
@@ -497,6 +622,8 @@ class MultiScaleMultiSourceDANN(nn.Module):
         compute_domain: bool = True,
         scale_class_reliability: torch.Tensor | None = None,
         class_logit_adjustment: torch.Tensor | None = None,
+        pyramid_gate_ramp: float = 1.0,
+        pyramid_bias_risk: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | None]:
         if tuple(x_by_scale) != self.scale_keys:
             raise ValueError(
@@ -524,19 +651,18 @@ class MultiScaleMultiSourceDANN(nn.Module):
                 raise ValueError("class_logit_adjustment must be [classes]")
             fusion_scale_logits = scale_logits + adjustment.view(1, 1, -1)
         contextual_scale_embeddings = self.output_norm(self.scale_context(tokens))
-        (
-            logits,
-            embedding,
-            scale_class_weight,
-            pyramid_scale_class_weight,
-            pyramid_class_features,
-            pyramid_logits,
-            pyramid_residual_weight,
-        ) = self._fuse(
+        fusion = self._fuse(
             contextual_scale_embeddings,
             scale_logits,
             scale_class_reliability,
+            pyramid_gate_ramp=pyramid_gate_ramp,
+            pyramid_bias_risk=pyramid_bias_risk,
         )
+        logits = fusion["logits"]
+        embedding = fusion["embedding"]
+        scale_class_weight = fusion["scale_class_weight"]
+        pyramid_scale_class_weight = fusion["pyramid_scale_class_weight"]
+        pyramid_class_features = fusion["pyramid_class_features"]
         if class_logit_adjustment is not None:
             logits = logits + adjustment.view(1, -1)
             embedding = torch.einsum(
@@ -588,8 +714,15 @@ class MultiScaleMultiSourceDANN(nn.Module):
             "relation_weighted_logits": (
                 scale_class_weight * scale_logits
             ).sum(dim=1),
-            "pyramid_logits": pyramid_logits,
-            "pyramid_residual_weight": pyramid_residual_weight,
+            "pyramid_logits": fusion["pyramid_logits"],
+            "pyramid_residual_weight": fusion["pyramid_gate"].mean(),
+            "pyramid_residual_gate": fusion["pyramid_gate"],
+            "pyramid_raw_gate": fusion["pyramid_raw_gate"],
+            "pyramid_guard_factor": fusion["pyramid_guard_factor"],
+            "pyramid_unsupported_excess": fusion[
+                "pyramid_unsupported_excess"
+            ],
+            "pyramid_logit_delta": fusion["pyramid_logit_delta"],
             "scale_class_relation_residual": self.scale_class_relation_residual,
             "scale_domain_logits": scale_domain_logits,
             "fused_domain_logits": fused_domain_logits,

@@ -233,11 +233,38 @@ prevents a scale from disappearing. Every class column is normalized over the
 The relation matrix now controls features rather than merely averaging logits.
 The model projects each contextual scale level, constructs a separate weighted
 pyramid feature for positive, neutral, and negative, and scores each feature
-with the matching classifier row. A learnable residual, initialized to 0.05,
-mixes this pyramid prediction with the previous relation-weighted logit fusion.
-The established 3 x 3 logit path is therefore the stable 95% anchor at
-initialization; the feature pyramid is a small refinement rather than a
-replacement by a uniform scale average.
+with the matching classifier row. The established 3 x 3 relation-weighted
+logits remain the stable anchor. Legacy Main uses its original scalar residual;
+the safety-gated G family below replaces that scalar only inside the new G
+experiments.
+
+### Safety-gated class-conditional pyramid (G family)
+
+The G experiments test whether the feature pyramid can add useful multiscale
+information without destroying the stronger relation-logit anchor. For class
+`c` of target trial `i`, the final logit is
+
+```text
+z(i,c) = z_anchor(i,c) + gate(i,c) * clip(z_pyramid(i,c)-z_anchor(i,c), -0.5, 0.5)
+```
+
+The gate starts at 0.05. It is forced to zero through iteration 300, then uses
+the same 300-to-600 ramp as domain adaptation. Thus the source classifier and
+independent scale heads are established before any pyramid correction can
+change a prediction. A detached source-label teacher opens a class gate when
+the pyramid raises the true-class logit or lowers a false-class logit; a small
+sparsity penalty keeps the anchor as the default. The teacher supervises only
+the gate and cannot feed labels into pyramid features or scale heads.
+
+The sample-class gate uses six pieces of detached evidence for each class:
+mean independent-scale probability, disagreement, anchor probability,
+relation concentration, cross-scale agreement, and the proposed pyramid-logit
+change. G3 additionally closes a target class gate when the pyramid proposes an
+increase unsupported by the independent scale heads, or when the existing
+unlabeled cross-scale detector reports shared source-excess/boundary-attractor
+risk. This guard is one-sided: it suppresses risky pyramid corrections but does
+not manufacture support for another class. No target labels, target-prior
+correction, new data split, or new preprocessing are introduced.
 
 An online target-prior estimator uses only raw independent-scale logits. It
 maintains a soft source confusion matrix for every scale and matches all target
@@ -406,6 +433,34 @@ means SEED-V to SEED-VII.
 | A5 / B5 | source-excess suppression retained, boundary-attractor suppression removed |
 | A6 / B6 | both source-excess and boundary-attractor suppression removed |
 | A_main / B_main | complete boundary-reliable class-conditional weighted pyramid |
+
+The isolated G matrix keeps the same fixed-final protocol and both bias
+suppressors in every row; only the way the pyramid is admitted changes:
+
+| Paired tags | Purpose |
+|---|---|
+| A_G0 / B_G0 | relation-logit anchor with no feature pyramid; equivalent architectural control to A4 / B4 |
+| A_G1 / B_G1 | static learned gate for each emotion class, with delayed activation and bounded residual |
+| A_G2 / B_G2 | sample-by-class dynamic gate using detached independent-scale evidence |
+| A_G3 / B_G3 | G2 plus the unlabeled common-bias and unsupported-pyramid safety guard |
+
+For a two-direction seed-42 pilot, start in `/home/gzw/projects`, use isolated
+output paths, and assign one physical GPU to each direction:
+
+```bash
+mkdir -p MPUS_GA/results_safe_pyramid_g_seed42 \
+  MPUS_GA/logs/safe_pyramid_g_seed42
+CUDA_VISIBLE_DEVICES=0 nohup /home/gzw/miniforge3/envs/BCI/bin/python -m \
+  MPUS_GA.trial_temporal.train --experiment A_G3 --random-seeds 42 \
+  --target-subjects all --evaluation-protocol fixed_final \
+  --result-root MPUS_GA/results_safe_pyramid_g_seed42 \
+  --device cuda:0 > MPUS_GA/logs/safe_pyramid_g_seed42/A_G3.log 2>&1 < /dev/null &
+CUDA_VISIBLE_DEVICES=1 nohup /home/gzw/miniforge3/envs/BCI/bin/python -m \
+  MPUS_GA.trial_temporal.train --experiment B_G3 --random-seeds 42 \
+  --target-subjects all --evaluation-protocol fixed_final \
+  --result-root MPUS_GA/results_safe_pyramid_g_seed42 \
+  --device cuda:0 > MPUS_GA/logs/safe_pyramid_g_seed42/B_G3.log 2>&1 < /dev/null &
+```
 
 On CSU, start the complete dual-GPU suite from the `MPUS_GA` directory:
 

@@ -29,6 +29,7 @@ from MPUS_GA.trial_temporal.train import (  # noqa: E402
     _adaptation_ramp,
     _class_balanced_domain_ce,
     _gate_supervision_loss,
+    _pyramid_gate_supervision_loss,
     _should_evaluate_target,
     _target_evaluation_is_better,
     _target_subjects,
@@ -77,9 +78,8 @@ def test_class_conditional_fusion_uses_external_scale_class_reliability() -> Non
     embeddings = torch.randn(3, 2, 32)
     logits = torch.randn(3, 2, 3)
     reliability = torch.tensor([[0.9, 0.2, 0.5], [0.1, 0.8, 0.5]])
-    _, _, class_weight, _, _, _, _ = model._fuse(
-        embeddings, logits, reliability
-    )
+    fusion = model._fuse(embeddings, logits, reliability)
+    class_weight = fusion["scale_class_weight"]
     torch.testing.assert_close(
         class_weight.sum(dim=1), torch.ones(3, 3), atol=1e-6, rtol=1e-6
     )
@@ -94,15 +94,14 @@ def test_weighted_pyramid_keeps_one_feature_per_class() -> None:
     reliability = torch.tensor(
         [[0.7, 0.2, 0.3], [0.2, 0.7, 0.2], [0.1, 0.1, 0.5]]
     )
-    (
-        fused_logits,
-        fused_embedding,
-        class_weight,
-        pyramid_class_weight,
-        class_features,
-        pyramid_logits,
-        residual_weight,
-    ) = model._fuse(embeddings, logits, reliability)
+    fusion = model._fuse(embeddings, logits, reliability)
+    fused_logits = fusion["logits"]
+    fused_embedding = fusion["embedding"]
+    class_weight = fusion["scale_class_weight"]
+    pyramid_class_weight = fusion["pyramid_scale_class_weight"]
+    class_features = fusion["pyramid_class_features"]
+    pyramid_logits = fusion["pyramid_logits"]
+    residual_gate = fusion["pyramid_gate"]
     assert fused_logits.shape == (4, 3)
     assert fused_embedding.shape == (4, 32)
     assert class_weight.shape == (4, 3, 3)
@@ -113,12 +112,14 @@ def test_weighted_pyramid_keeps_one_feature_per_class() -> None:
     torch.testing.assert_close(
         pyramid_class_weight.sum(dim=1), torch.ones(4, 3)
     )
-    torch.testing.assert_close(residual_weight, torch.tensor(0.05))
+    torch.testing.assert_close(
+        residual_gate, torch.full((4, 3), 0.05), atol=1e-6, rtol=1e-6
+    )
     expected_anchor = (class_weight * logits).sum(dim=1)
     torch.testing.assert_close(
         fused_logits,
-        (1.0 - residual_weight) * expected_anchor
-        + residual_weight * pyramid_logits,
+        (1.0 - residual_gate) * expected_anchor
+        + residual_gate * pyramid_logits,
     )
 
 
@@ -133,22 +134,119 @@ def test_feature_pyramid_ablation_uses_only_relation_weighted_logits() -> None:
     reliability = torch.tensor(
         [[0.7, 0.2, 0.3], [0.2, 0.7, 0.2], [0.1, 0.1, 0.5]]
     )
-    (
-        fused_logits,
-        _,
-        class_weight,
-        pyramid_class_weight,
-        _,
-        pyramid_logits,
-        residual_weight,
-    ) = model._fuse(embeddings, logits, reliability)
+    fusion = model._fuse(embeddings, logits, reliability)
+    fused_logits = fusion["logits"]
+    class_weight = fusion["scale_class_weight"]
+    pyramid_class_weight = fusion["pyramid_scale_class_weight"]
+    pyramid_logits = fusion["pyramid_logits"]
+    residual_gate = fusion["pyramid_gate"]
     expected = (class_weight * logits).sum(dim=1)
     torch.testing.assert_close(fused_logits, expected)
     torch.testing.assert_close(pyramid_logits, expected)
     torch.testing.assert_close(pyramid_class_weight, class_weight)
-    torch.testing.assert_close(residual_weight, torch.tensor(0.0))
+    torch.testing.assert_close(residual_gate, torch.zeros(4, 3))
     assert len(model.pyramid_projections) == 0
     assert not model.use_feature_pyramid
+
+
+def test_class_static_pyramid_gate_has_safe_anchor_warmup() -> None:
+    model = _small_model(
+        scales=(1.0, 2.0, 4.0),
+        num_domains=2,
+        pyramid_gate_mode="class_static",
+        pyramid_residual_clip=0.5,
+    )
+    desired_gate = torch.tensor([0.2, 0.5, 0.8])
+    with torch.no_grad():
+        model.pyramid_class_gate_logit.copy_(torch.logit(desired_gate))
+    embeddings = torch.randn(4, 3, 32)
+    logits = torch.randn(4, 3, 3)
+    reliability = torch.full((3, 3), 1.0 / 3.0)
+
+    warmup = model._fuse(
+        embeddings, logits, reliability, pyramid_gate_ramp=0.0
+    )
+    anchor = (
+        warmup["scale_class_weight"] * logits
+    ).sum(dim=1)
+    torch.testing.assert_close(warmup["logits"], anchor)
+    torch.testing.assert_close(warmup["pyramid_gate"], torch.zeros(4, 3))
+
+    active = model._fuse(
+        embeddings, logits, reliability, pyramid_gate_ramp=1.0
+    )
+    torch.testing.assert_close(
+        active["pyramid_raw_gate"], desired_gate.expand(4, -1)
+    )
+    assert torch.all(active["pyramid_logit_delta"].abs() <= 0.5)
+
+
+def test_sample_class_gate_starts_from_class_prior() -> None:
+    model = _small_model(
+        scales=(1.0, 2.0, 4.0),
+        num_domains=2,
+        pyramid_gate_mode="sample_class",
+    )
+    embeddings = torch.randn(4, 3, 32)
+    logits = torch.randn(4, 3, 3)
+    reliability = torch.full((3, 3), 1.0 / 3.0)
+    fusion = model._fuse(embeddings, logits, reliability)
+    assert fusion["pyramid_raw_gate"].shape == (4, 3)
+    torch.testing.assert_close(
+        fusion["pyramid_raw_gate"],
+        torch.full((4, 3), 0.05),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_pyramid_bias_guard_suppresses_only_risky_class() -> None:
+    model = _small_model(
+        scales=(1.0, 2.0, 4.0),
+        num_domains=2,
+        pyramid_gate_mode="sample_class",
+        use_pyramid_bias_guard=True,
+        pyramid_guard_strength=4.0,
+        pyramid_guard_tolerance=1.0,
+    )
+    embeddings = torch.randn(4, 3, 32)
+    logits = torch.randn(4, 3, 3)
+    reliability = torch.full((3, 3), 1.0 / 3.0)
+    fusion = model._fuse(
+        embeddings,
+        logits,
+        reliability,
+        pyramid_bias_risk=torch.tensor([0.0, 1.0, 0.0]),
+    )
+    guard = fusion["pyramid_guard_factor"]
+    torch.testing.assert_close(guard[:, 0], torch.ones(4))
+    torch.testing.assert_close(guard[:, 2], torch.ones(4))
+    torch.testing.assert_close(
+        guard[:, 1], torch.full((4,), math.exp(-4.0))
+    )
+    assert torch.all(
+        fusion["pyramid_gate"][:, 1]
+        < fusion["pyramid_gate"][:, [0, 2]].min(dim=1).values
+    )
+
+
+def test_pyramid_gate_supervision_rewards_useful_class_changes() -> None:
+    relation = torch.zeros(2, 3)
+    pyramid = torch.tensor(
+        [[1.0, -1.0, -1.0], [-1.0, 1.0, -1.0]]
+    )
+    labels = torch.tensor([0, 1])
+    matching_gate = torch.full((2, 3), 0.9, requires_grad=True)
+    opposing_gate = torch.full((2, 3), 0.1, requires_grad=True)
+    matching_loss = _pyramid_gate_supervision_loss(
+        relation, pyramid, matching_gate, labels, 0.1, 0.05
+    )
+    opposing_loss = _pyramid_gate_supervision_loss(
+        relation, pyramid, opposing_gate, labels, 0.1, 0.05
+    )
+    assert matching_loss < opposing_loss
+    matching_loss.backward()
+    assert matching_gate.grad is not None
 
 
 def test_uniform_fusion_has_no_inactive_gate_supervision_constant() -> None:
@@ -657,6 +755,14 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
         "B6",
         "A_main",
         "B_main",
+        "A_G0",
+        "B_G0",
+        "A_G1",
+        "B_G1",
+        "A_G2",
+        "B_G2",
+        "A_G3",
+        "B_G3",
     )
     assert set(EXPERIMENTS) == set(EXPERIMENT_ORDER)
     assert EXPERIMENTS["A0"].scales == (1.0,)
@@ -679,6 +785,13 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
     assert EXPERIMENTS["B6"].target_trials == 80
     assert EXPERIMENTS["B6"].scales == EXPERIMENTS["A6"].scales
     assert EXPERIMENTS["B6"].fusion_mode == EXPERIMENTS["A6"].fusion_mode
+    assert not EXPERIMENTS["A_G0"].use_feature_pyramid
+    assert EXPERIMENTS["A_G1"].pyramid_gate_mode == "class_static"
+    assert EXPERIMENTS["A_G1"].use_pyramid_gate_warmup
+    assert EXPERIMENTS["A_G2"].pyramid_gate_mode == "sample_class"
+    assert not EXPERIMENTS["A_G2"].use_pyramid_bias_guard
+    assert EXPERIMENTS["A_G3"].pyramid_gate_mode == "sample_class"
+    assert EXPERIMENTS["A_G3"].use_pyramid_bias_guard
     paired_fields = (
         "ablation",
         "scales",
@@ -686,6 +799,9 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
         "domain_mode",
         "use_prototypes",
         "use_feature_pyramid",
+        "pyramid_gate_mode",
+        "use_pyramid_bias_guard",
+        "use_pyramid_gate_warmup",
         "use_source_excess_suppression",
         "use_boundary_attractor_suppression",
         "domain_weight",
@@ -697,6 +813,11 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
         for field in paired_fields:
             assert getattr(EXPERIMENTS[a_name], field) == getattr(
                 EXPERIMENTS[b_name], field
+            )
+    for variant in ("G0", "G1", "G2", "G3"):
+        for field in paired_fields:
+            assert getattr(EXPERIMENTS[f"A_{variant}"], field) == getattr(
+                EXPERIMENTS[f"B_{variant}"], field
             )
     assert _target_subjects("all", 20) == list(range(1, 21))
     assert _adaptation_ramp(300, 300, 600) == 0.0
@@ -848,6 +969,87 @@ def test_multiscale_relation_graph_train_step_updates_class_edges() -> None:
     assert record["boundary_attractor_logit_adjustment"] == [0.0, 0.0, 0.0]
     assert prior.source_initialized.all()
     assert prior.target_updates == 1
+
+
+def test_g3_gate_guard_and_supervision_run_in_one_train_step() -> None:
+    device = torch.device("cpu")
+    model = _small_model(
+        scales=(1.0, 2.0, 4.0),
+        num_domains=2,
+        pyramid_gate_mode="sample_class",
+        use_pyramid_bias_guard=True,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    labels = torch.tensor([0, 1, 2])
+
+    def features() -> dict:
+        return {
+            key: torch.randn(3, 2, 62, 5)
+            for key in ("1s", "2s", "4s")
+        }
+
+    masks = {
+        key: torch.ones(3, 2, dtype=torch.bool)
+        for key in ("1s", "2s", "4s")
+    }
+    source_batch = {
+        "x": features(),
+        "mask": masks,
+        "y": labels,
+        "domain_id": torch.zeros(3, dtype=torch.long),
+    }
+    target_batch = {
+        "x": features(),
+        "mask": masks,
+        "domain_id": torch.ones(3, dtype=torch.long),
+    }
+    prior = TargetPriorEstimator(
+        1,
+        3,
+        3,
+        torch.tensor([0.25, 0.25, 0.50]),
+        device,
+        natural_source_prior=torch.tensor([0.20, 0.20, 0.60]),
+        momentum=0.9,
+    )
+    confusion = torch.tensor(
+        [[0.80, 0.10, 0.10], [0.10, 0.70, 0.30], [0.10, 0.20, 0.60]]
+    )
+    prior.source_confusion[0] = confusion.unsqueeze(0).expand(3, -1, -1)
+    prior.source_hard_confusion[0] = confusion.unsqueeze(0).expand(3, -1, -1)
+    prior.source_initialized.fill_(True)
+    prior.target_initialized = True
+    prior.target_mean_probability.copy_(
+        torch.tensor(
+            [[0.20, 0.50, 0.30], [0.20, 0.50, 0.30], [0.30, 0.30, 0.40]]
+        )
+    )
+    prior.target_hard_frequency.copy_(prior.target_mean_probability)
+    before = model.pyramid_sample_gate[-1].bias.detach().clone()
+    record = train_step(
+        model,
+        [source_batch],
+        target_batch,
+        optimizer,
+        scheduler,
+        device,
+        iteration=600,
+        spec=EXPERIMENTS["A_G3"],
+        source_class_priors=torch.tensor([[0.20, 0.20, 0.60]]),
+        prototype_bank=None,
+        label_smoothing=0.1,
+        gradient_clip=5.0,
+        adaptation_warmup_iterations=300,
+        adaptation_ramp_end=600,
+        pseudo_confidence_threshold=0.6,
+        target_prior_estimator=prior,
+    )
+    assert math.isfinite(record["total"])
+    assert record["pyramid_gate_supervision"] >= 0
+    assert record["pyramid_bias_risk"][1] > 0
+    assert record["mean_target_pyramid_guard_by_class"][1] < 1.0
+    assert not torch.equal(before, model.pyramid_sample_gate[-1].bias)
 
 
 def test_train_step_rejects_target_labels_before_model_access() -> None:
