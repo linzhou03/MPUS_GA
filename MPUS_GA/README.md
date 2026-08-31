@@ -444,6 +444,87 @@ suppressors in every row; only the way the pyramid is admitted changes:
 | A_G2 / B_G2 | sample-by-class dynamic gate using detached independent-scale evidence |
 | A_G3 / B_G3 | G2 plus the unlabeled common-bias and unsupported-pyramid safety guard |
 
+### Class-query low-rank multiview fusion (H family)
+
+The H family treats 1 s, 2 s, and 4 s as three temporal views while retaining
+their independent embeddings and logits. H2 and later construct six downstream
+fusion tokens: `1s`, `2s`, `4s`, `1sx2s`, `1sx4s`, and `2sx4s`. Each pair token
+uses a rank-16 multiplicative interaction rather than a full tensor product.
+Three learned emotion-class queries separately attend to these tokens, so each
+class can use different single-scale and cross-scale evidence.
+
+H3 subtracts detached predictive entropy and class-wise cross-scale conflict
+from the attention scores. These reliability terms can only change downstream
+fusion and cannot alter an independent scale head. H4 uses the existing
+unlabeled common-bias evidence as a sign-aware guard: a risky class has an
+unsupported positive logit correction attenuated, while a negative correction
+that lowers the same over-predicted class remains available. The relation-logit
+path stays the stable anchor, the correction remains clipped to `[-0.5, 0.5]`,
+and the pyramid is disabled through iteration 300 before ramping to full weight
+at iteration 600.
+
+H5 addresses the cross-seed instability observed in H4. The EMA 3 x 3
+scale-by-class relation estimated from source labels and independent scale
+logits is expanded to the six multiview tokens; pair-token reliability is the
+geometric mean of its two scales. Half of the dynamic attention is shrunk to
+this source-only anchor. Target pseudo-label prototypes are deliberately
+excluded from the anchor. The sample-class pyramid gate is also shrunk halfway
+toward its class-static prior and passed through a smooth `0.25` ceiling, so a
+seed-specific gate cannot overwhelm the relation-logit path.
+
+| Paired tags | Purpose |
+|---|---|
+| A_H0 / B_H0 | relation-logit anchor without feature fusion; same architectural control as A4 / B4 |
+| A_H1 / B_H1 | three class queries attend to the three scale tokens |
+| A_H2 / B_H2 | H1 plus three rank-16 pairwise scale-interaction tokens |
+| A_H3 / B_H3 | H2 plus entropy- and conflict-aware attention |
+| A_H4 / B_H4 | H3 plus sign-aware protection against harmful class-logit increases |
+| A_H5 / B_H5 | H4 plus source-only reliability anchoring and stable bounded pyramid admission |
+
+Result JSON files include the six token names, class-by-token mean attention,
+the pre-shrink dynamic attention, the source-only token anchor, token
+uncertainty and class-wise conflict, as well as the existing residual gate and
+guard diagnostics. No new preprocessing, target labels, target-prior
+correction, or target checkpoint selection is introduced.
+
+### Relative-degradation-aware temporal pyramid (R family)
+
+The R family translates the two useful ideas in RDANet to trial EEG without
+copying its image-specific pixel rearrangement or Fourier phase operations.
+R1 adds a one-dimensional temporal MSAD path after the independent heads:
+fixed normalized binomial filters of widths 3, 5, and 7 are mixed per channel,
+folded by adjacent time pairs, refined depthwise, and injected only into the
+downstream 2 s/4 s fusion context. It therefore cannot contaminate the native
+1 s/2 s/4 s logits.
+
+R2 adds a source-only multi-slot memory with shape
+`[3 scales, 3 classes, K slots, d]`. Every scale-class cell receives exactly
+the same number of slots. The memory is updated only from source embeddings
+and source true labels through iteration 300, then frozen. A target trial
+queries every class independently; no target pseudo-label selects the queried
+class and target data never update a slot. R3 uses cosine distance to those
+retrieved source prototypes as relative degradation: degraded scale-class and
+pairwise tokens are downweighted before class-query attention, and the same
+distance controls how source-memory features are fused across scales.
+
+| Paired tags | Purpose |
+|---|---|
+| A_R0 / B_R0 | exact H5 stable source-anchored multiview baseline |
+| A_R1 / B_R1 | R0 plus anti-aliased temporal MSAD |
+| A_R2 / B_R2 | R1 plus equal-capacity source class multi-prototype memory |
+| A_R3 / B_R3 | R2 plus relative-degradation-aware class-conditional fusion |
+| A_R4 / B_R4 | H5 plus source class multi-prototype memory only; MSAD and relative degradation removed |
+
+The R variants use the existing processed 1 s/2 s/4 s artifacts and the same
+fixed-final protocol. Result files record filter mixtures, MSAD admission
+gates, memory initialization/update counts, class-wise prototype distance,
+memory scale weights, and memory residual gates.
+
+All optional R modules are initialized after the complete shared H5 model.
+Consequently, resetting the same random seed produces byte-identical shared
+H5/R weights, so an ablation cannot gain merely by shifting the random-number
+sequence used for downstream shared layers.
+
 For a two-direction seed-42 pilot, start in `/home/gzw/projects`, use isolated
 output paths, and assign one physical GPU to each direction:
 

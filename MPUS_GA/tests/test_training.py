@@ -18,6 +18,7 @@ from MPUS_GA.trial_temporal.data import _artifact_files  # noqa: E402
 from MPUS_GA.trial_temporal.model import (  # noqa: E402
     EEGChannelAttention,
     MultiScaleMultiSourceDANN,
+    TemporalMSAD1D,
 )
 from MPUS_GA.trial_temporal.train import (  # noqa: E402
     EVALUATION_PROTOCOL_CAGA_TARGET_BEST,
@@ -25,6 +26,7 @@ from MPUS_GA.trial_temporal.train import (  # noqa: E402
     EXPERIMENT_ORDER,
     EXPERIMENTS,
     PrototypeBank,
+    SourceMultiPrototypeMemory,
     TargetPriorEstimator,
     _adaptation_ramp,
     _class_balanced_domain_ce,
@@ -228,6 +230,277 @@ def test_pyramid_bias_guard_suppresses_only_risky_class() -> None:
         fusion["pyramid_gate"][:, 1]
         < fusion["pyramid_gate"][:, [0, 2]].min(dim=1).values
     )
+
+
+def test_low_rank_multiview_fusion_has_six_class_conditioned_tokens() -> None:
+    model = _small_model(
+        scales=(1.0, 2.0, 4.0),
+        num_domains=2,
+        pyramid_gate_mode="sample_class",
+        multiview_fusion_mode="class_query_low_rank",
+        use_multiview_uncertainty=True,
+        multiview_low_rank=8,
+    )
+    embeddings = torch.randn(4, 3, 32)
+    logits = torch.randn(4, 3, 3)
+    reliability = torch.full((3, 3), 1.0 / 3.0)
+    fusion = model._fuse(embeddings, logits, reliability)
+    attention = fusion["multiview_token_attention"]
+    assert attention.shape == (4, 3, 6)
+    assert fusion["multiview_token_uncertainty"].shape == (4, 6)
+    assert fusion["multiview_token_conflict"].shape == (4, 3, 6)
+    torch.testing.assert_close(attention.sum(dim=-1), torch.ones(4, 3))
+    assert len(model.multiview_pair_output) == 3
+
+
+def test_multiview_uncertainty_downweights_uncertain_scale() -> None:
+    model = _small_model(
+        scales=(1.0, 2.0, 4.0),
+        num_domains=2,
+        pyramid_gate_mode="sample_class",
+        multiview_fusion_mode="class_query",
+        use_multiview_uncertainty=True,
+        multiview_uncertainty_strength=4.0,
+        multiview_conflict_strength=0.0,
+    )
+    with torch.no_grad():
+        for parameter in model.class_scale_gate.parameters():
+            parameter.zero_()
+        model.multiview_query_projection.weight.zero_()
+        model.multiview_key_projection.weight.zero_()
+    embeddings = torch.randn(2, 3, 32)
+    logits = torch.tensor(
+        [
+            [[0.0, 0.0, 0.0], [8.0, -8.0, -8.0], [8.0, -8.0, -8.0]],
+            [[0.0, 0.0, 0.0], [-8.0, 8.0, -8.0], [-8.0, 8.0, -8.0]],
+        ]
+    )
+    reliability = torch.full((3, 3), 1.0 / 3.0)
+    fusion = model._fuse(embeddings, logits, reliability)
+    attention = fusion["multiview_token_attention"]
+    assert torch.all(attention[:, :, 0] < attention[:, :, 1])
+    assert torch.all(attention[:, :, 0] < attention[:, :, 2])
+
+
+def test_h5_multiview_attention_shrinks_to_source_only_anchor() -> None:
+    model = _small_model(
+        scales=(1.0, 2.0, 4.0),
+        num_domains=2,
+        pyramid_gate_mode="sample_class",
+        multiview_fusion_mode="class_query_low_rank",
+        multiview_source_anchor_mix=0.5,
+        multiview_low_rank=8,
+    )
+    with torch.no_grad():
+        for parameter in model.class_scale_gate.parameters():
+            parameter.zero_()
+        model.multiview_query_projection.weight.zero_()
+        model.multiview_key_projection.weight.zero_()
+    embeddings = torch.randn(2, 3, 32)
+    logits = torch.zeros(2, 3, 3)
+    reliability = torch.full((3, 3), 1.0 / 3.0)
+    source_anchor = torch.tensor(
+        [[0.8, 0.1, 0.1], [0.1, 0.8, 0.1], [0.1, 0.1, 0.8]]
+    )
+    fusion = model._fuse(
+        embeddings,
+        logits,
+        reliability,
+        multiview_source_anchor=source_anchor,
+    )
+    pair_anchor = torch.stack(
+        (
+            torch.sqrt(source_anchor[0] * source_anchor[1]),
+            torch.sqrt(source_anchor[0] * source_anchor[2]),
+            torch.sqrt(source_anchor[1] * source_anchor[2]),
+        )
+    )
+    expected_anchor = torch.cat((source_anchor, pair_anchor), dim=0).T
+    expected_anchor = expected_anchor / expected_anchor.sum(dim=1, keepdim=True)
+    expected_dynamic = torch.full((2, 3, 6), 1.0 / 6.0)
+    expected_attention = (
+        0.5 * expected_dynamic + 0.5 * expected_anchor.unsqueeze(0)
+    )
+    torch.testing.assert_close(
+        fusion["multiview_source_anchor"], expected_anchor
+    )
+    torch.testing.assert_close(
+        fusion["multiview_dynamic_attention"], expected_dynamic
+    )
+    torch.testing.assert_close(
+        fusion["multiview_token_attention"], expected_attention
+    )
+
+
+def test_h5_gate_shrinkage_and_smooth_ceiling_limit_sample_drift() -> None:
+    model = _small_model(
+        scales=(1.0, 2.0, 4.0),
+        num_domains=2,
+        pyramid_gate_mode="sample_class",
+        pyramid_gate_shrinkage=0.5,
+        pyramid_gate_ceiling=0.25,
+    )
+    class_gate = torch.full((3,), 0.2)
+    with torch.no_grad():
+        model.pyramid_class_gate_logit.copy_(torch.logit(class_gate))
+        model.pyramid_sample_gate[-1].bias.fill_(10.0)
+    embeddings = torch.randn(2, 3, 32)
+    logits = torch.randn(2, 3, 3)
+    reliability = torch.full((3, 3), 1.0 / 3.0)
+    fusion = model._fuse(embeddings, logits, reliability)
+    sample_gate = torch.sigmoid(torch.logit(class_gate) + 10.0)
+    shrunk = 0.5 * sample_gate + 0.5 * class_gate
+    expected = 0.25 * torch.tanh(shrunk / 0.25)
+    torch.testing.assert_close(
+        fusion["pyramid_raw_gate"], expected.expand(2, -1)
+    )
+    assert torch.all(fusion["pyramid_raw_gate"] < 0.25)
+
+
+def test_sign_aware_guard_allows_risk_reducing_logit_changes() -> None:
+    model = _small_model(
+        scales=(1.0, 2.0, 4.0),
+        num_domains=2,
+        pyramid_gate_mode="sample_class",
+        multiview_fusion_mode="class_query_low_rank",
+        use_sign_aware_pyramid_guard=True,
+        pyramid_guard_strength=4.0,
+        pyramid_guard_tolerance=1.0,
+    )
+    embeddings = torch.randn(8, 3, 32)
+    logits = torch.randn(8, 3, 3)
+    reliability = torch.full((3, 3), 1.0 / 3.0)
+    fusion = model._fuse(
+        embeddings,
+        logits,
+        reliability,
+        pyramid_bias_risk=torch.ones(3),
+    )
+    positive_delta = fusion["pyramid_logit_delta"] > 0
+    guard = fusion["pyramid_guard_factor"]
+    torch.testing.assert_close(
+        guard[positive_delta],
+        torch.full_like(guard[positive_delta], math.exp(-4.0)),
+    )
+    torch.testing.assert_close(
+        guard[~positive_delta], torch.ones_like(guard[~positive_delta])
+    )
+
+
+def test_temporal_msad_downsamples_with_normalized_fixed_filters() -> None:
+    module = TemporalMSAD1D(d_model=8)
+    sequence = torch.randn(2, 5, 8, requires_grad=True)
+    mask = torch.tensor(
+        [[True, True, True, True, True], [True, True, True, False, False]]
+    )
+    output, down_mask, filter_weight = module(sequence, mask)
+    assert output.shape == (2, 3, 8)
+    assert down_mask.tolist() == [[True, True, True], [True, True, False]]
+    assert filter_weight.shape == (2, 3, 8)
+    torch.testing.assert_close(
+        filter_weight.sum(dim=1), torch.ones(2, 8)
+    )
+    for size in (3, 5, 7):
+        kernel = getattr(module, f"kernel_{size}")
+        assert not kernel.requires_grad
+        torch.testing.assert_close(kernel.sum(), torch.tensor(1.0))
+    module.pool(output, down_mask).sum().backward()
+    assert sequence.grad is not None
+
+
+def test_source_multi_prototype_memory_is_class_balanced_and_source_only() -> None:
+    memory = SourceMultiPrototypeMemory(
+        scale_count=3,
+        class_count=3,
+        slots=2,
+        feature_dim=4,
+        momentum=0.9,
+        device=torch.device("cpu"),
+    )
+    labels = torch.tensor([0, 0, 1, 1, 2, 2])
+    embeddings = torch.randn(6, 3, 4)
+    memory.update_source(embeddings, labels)
+    assert memory.initialized.all()
+    assert memory.memory.shape == (3, 3, 2, 4)
+    assert torch.all(memory.updates > 0)
+    state = memory.state(freeze_iteration=300)
+    assert state["equal_slots_per_scale_class"] == 2
+    assert "source_true_labels_only" in state["policy"]
+    assert not hasattr(memory, "update_target")
+
+
+def test_r3_memory_and_msad_preserve_independent_scale_logits() -> None:
+    model = _small_model(
+        scales=(1.0, 2.0, 4.0),
+        num_domains=2,
+        pyramid_gate_mode="sample_class",
+        multiview_fusion_mode="class_query_low_rank",
+        use_multiview_uncertainty=True,
+        use_sign_aware_pyramid_guard=True,
+        multiview_source_anchor_mix=0.5,
+        pyramid_gate_shrinkage=0.5,
+        pyramid_gate_ceiling=0.25,
+        use_temporal_msad=True,
+        use_source_prototype_memory=True,
+        use_relative_degradation_fusion=True,
+        rda_memory_topk=2,
+    )
+    model.eval()
+    x = {
+        "1s": torch.randn(2, 5, 62, 5),
+        "2s": torch.randn(2, 3, 62, 5),
+        "4s": torch.randn(2, 2, 62, 5),
+    }
+    mask = {
+        key: torch.ones(value.shape[:2], dtype=torch.bool)
+        for key, value in x.items()
+    }
+    memory = torch.randn(3, 3, 2, 32)
+    initialized = torch.ones(3, 3, 2, dtype=torch.bool)
+    with torch.no_grad():
+        empty = model(x, mask, compute_domain=False)
+        queried = model(
+            x,
+            mask,
+            compute_domain=False,
+            source_prototype_memory=memory,
+            source_prototype_initialized=initialized,
+        )
+    torch.testing.assert_close(empty["scale_logits"], queried["scale_logits"])
+    torch.testing.assert_close(
+        empty["scale_embeddings"], queried["scale_embeddings"]
+    )
+    assert queried["rda_msad_filter_weight"].shape == (2, 2, 3)
+    assert queried["rda_memory_distance"].shape == (2, 3, 3)
+    assert queried["rda_memory_valid"].all()
+    assert queried["rda_token_degradation"].shape == (2, 3, 6)
+    assert not torch.allclose(empty["logits"], queried["logits"])
+
+
+def test_r4_memory_only_preserves_h5_shared_initialization() -> None:
+    common = {
+        "scales": (1.0, 2.0, 4.0),
+        "num_domains": 2,
+        "pyramid_gate_mode": "sample_class",
+        "multiview_fusion_mode": "class_query_low_rank",
+        "use_multiview_uncertainty": True,
+        "use_sign_aware_pyramid_guard": True,
+        "multiview_source_anchor_mix": 0.5,
+        "pyramid_gate_shrinkage": 0.5,
+        "pyramid_gate_ceiling": 0.25,
+        "multiview_low_rank": 8,
+    }
+    torch.manual_seed(2026)
+    h5 = _small_model(**common)
+    torch.manual_seed(2026)
+    r4 = _small_model(**common, use_source_prototype_memory=True)
+    h5_state = h5.state_dict()
+    r4_state = r4.state_dict()
+    for name, value in h5_state.items():
+        torch.testing.assert_close(value, r4_state[name])
+    assert not r4.use_temporal_msad
+    assert r4.use_source_prototype_memory
+    assert not r4.use_relative_degradation_fusion
 
 
 def test_pyramid_gate_supervision_rewards_useful_class_changes() -> None:
@@ -763,6 +1036,28 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
         "B_G2",
         "A_G3",
         "B_G3",
+        "A_H0",
+        "B_H0",
+        "A_H1",
+        "B_H1",
+        "A_H2",
+        "B_H2",
+        "A_H3",
+        "B_H3",
+        "A_H4",
+        "B_H4",
+        "A_H5",
+        "B_H5",
+        "A_R0",
+        "B_R0",
+        "A_R1",
+        "B_R1",
+        "A_R2",
+        "B_R2",
+        "A_R3",
+        "B_R3",
+        "A_R4",
+        "B_R4",
     )
     assert set(EXPERIMENTS) == set(EXPERIMENT_ORDER)
     assert EXPERIMENTS["A0"].scales == (1.0,)
@@ -792,6 +1087,24 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
     assert not EXPERIMENTS["A_G2"].use_pyramid_bias_guard
     assert EXPERIMENTS["A_G3"].pyramid_gate_mode == "sample_class"
     assert EXPERIMENTS["A_G3"].use_pyramid_bias_guard
+    assert not EXPERIMENTS["A_H0"].use_feature_pyramid
+    assert EXPERIMENTS["A_H1"].multiview_fusion_mode == "class_query"
+    assert (
+        EXPERIMENTS["A_H2"].multiview_fusion_mode
+        == "class_query_low_rank"
+    )
+    assert EXPERIMENTS["A_H3"].use_multiview_uncertainty
+    assert not EXPERIMENTS["A_H3"].use_sign_aware_pyramid_guard
+    assert EXPERIMENTS["A_H4"].use_sign_aware_pyramid_guard
+    assert EXPERIMENTS["A_H5"].use_source_multiview_anchor
+    assert EXPERIMENTS["A_H5"].use_stable_pyramid_gate
+    assert not EXPERIMENTS["A_R0"].use_temporal_msad
+    assert EXPERIMENTS["A_R1"].use_temporal_msad
+    assert EXPERIMENTS["A_R2"].use_source_prototype_memory
+    assert EXPERIMENTS["A_R3"].use_relative_degradation_fusion
+    assert not EXPERIMENTS["A_R4"].use_temporal_msad
+    assert EXPERIMENTS["A_R4"].use_source_prototype_memory
+    assert not EXPERIMENTS["A_R4"].use_relative_degradation_fusion
     paired_fields = (
         "ablation",
         "scales",
@@ -802,6 +1115,14 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
         "pyramid_gate_mode",
         "use_pyramid_bias_guard",
         "use_pyramid_gate_warmup",
+        "multiview_fusion_mode",
+        "use_multiview_uncertainty",
+        "use_sign_aware_pyramid_guard",
+        "use_source_multiview_anchor",
+        "use_stable_pyramid_gate",
+        "use_temporal_msad",
+        "use_source_prototype_memory",
+        "use_relative_degradation_fusion",
         "use_source_excess_suppression",
         "use_boundary_attractor_suppression",
         "domain_weight",
@@ -815,6 +1136,16 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
                 EXPERIMENTS[b_name], field
             )
     for variant in ("G0", "G1", "G2", "G3"):
+        for field in paired_fields:
+            assert getattr(EXPERIMENTS[f"A_{variant}"], field) == getattr(
+                EXPERIMENTS[f"B_{variant}"], field
+            )
+    for variant in ("H0", "H1", "H2", "H3", "H4", "H5"):
+        for field in paired_fields:
+            assert getattr(EXPERIMENTS[f"A_{variant}"], field) == getattr(
+                EXPERIMENTS[f"B_{variant}"], field
+            )
+    for variant in ("R0", "R1", "R2", "R3", "R4"):
         for field in paired_fields:
             assert getattr(EXPERIMENTS[f"A_{variant}"], field) == getattr(
                 EXPERIMENTS[f"B_{variant}"], field
@@ -1050,6 +1381,141 @@ def test_g3_gate_guard_and_supervision_run_in_one_train_step() -> None:
     assert record["pyramid_bias_risk"][1] > 0
     assert record["mean_target_pyramid_guard_by_class"][1] < 1.0
     assert not torch.equal(before, model.pyramid_sample_gate[-1].bias)
+
+
+def test_h4_multiview_fusion_runs_in_one_train_step() -> None:
+    device = torch.device("cpu")
+    model = _small_model(
+        scales=(1.0, 2.0, 4.0),
+        num_domains=2,
+        pyramid_gate_mode="sample_class",
+        multiview_fusion_mode="class_query_low_rank",
+        use_multiview_uncertainty=True,
+        use_sign_aware_pyramid_guard=True,
+        multiview_low_rank=8,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+
+    def features() -> dict:
+        return {
+            key: torch.randn(3, 2, 62, 5)
+            for key in ("1s", "2s", "4s")
+        }
+
+    masks = {
+        key: torch.ones(3, 2, dtype=torch.bool)
+        for key in ("1s", "2s", "4s")
+    }
+    source_batch = {
+        "x": features(),
+        "mask": masks,
+        "y": torch.tensor([0, 1, 2]),
+        "domain_id": torch.zeros(3, dtype=torch.long),
+    }
+    target_batch = {
+        "x": features(),
+        "mask": masks,
+        "domain_id": torch.ones(3, dtype=torch.long),
+    }
+    before = model.multiview_pair_output[0][1].weight.detach().clone()
+    record = train_step(
+        model,
+        [source_batch],
+        target_batch,
+        optimizer,
+        scheduler,
+        device,
+        iteration=600,
+        spec=EXPERIMENTS["A_H4"],
+        source_class_priors=torch.tensor([[0.20, 0.20, 0.60]]),
+        prototype_bank=None,
+        label_smoothing=0.1,
+        gradient_clip=5.0,
+        adaptation_warmup_iterations=300,
+        adaptation_ramp_end=600,
+        pseudo_confidence_threshold=0.6,
+    )
+    assert math.isfinite(record["total"])
+    assert len(record["mean_target_multiview_token_attention"]) == 3
+    assert len(record["mean_target_multiview_token_attention"][0]) == 6
+    assert not torch.equal(
+        before, model.multiview_pair_output[0][1].weight
+    )
+
+
+def test_r3_train_step_queries_frozen_source_memory() -> None:
+    device = torch.device("cpu")
+    model = _small_model(
+        scales=(1.0, 2.0, 4.0),
+        num_domains=2,
+        pyramid_gate_mode="sample_class",
+        multiview_fusion_mode="class_query_low_rank",
+        use_multiview_uncertainty=True,
+        use_sign_aware_pyramid_guard=True,
+        multiview_source_anchor_mix=0.5,
+        pyramid_gate_shrinkage=0.5,
+        pyramid_gate_ceiling=0.25,
+        use_temporal_msad=True,
+        use_source_prototype_memory=True,
+        use_relative_degradation_fusion=True,
+        multiview_low_rank=8,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+
+    def features() -> dict:
+        return {
+            key: torch.randn(3, 3, 62, 5)
+            for key in ("1s", "2s", "4s")
+        }
+
+    masks = {
+        key: torch.ones(3, 3, dtype=torch.bool)
+        for key in ("1s", "2s", "4s")
+    }
+    labels = torch.tensor([0, 1, 2])
+    source_batch = {
+        "x": features(),
+        "mask": masks,
+        "y": labels,
+        "domain_id": torch.zeros(3, dtype=torch.long),
+    }
+    target_batch = {
+        "x": features(),
+        "mask": masks,
+        "domain_id": torch.ones(3, dtype=torch.long),
+    }
+    memory = SourceMultiPrototypeMemory(3, 3, 2, 32, 0.9, device)
+    initial_labels = labels.repeat_interleave(2)
+    memory.update_source(torch.randn(6, 3, 32), initial_labels)
+    assert memory.initialized.all()
+    updates_before = memory.updates.clone()
+    gate_before = model.rda_memory_gate_logit.detach().clone()
+    record = train_step(
+        model,
+        [source_batch],
+        target_batch,
+        optimizer,
+        scheduler,
+        device,
+        iteration=301,
+        spec=EXPERIMENTS["A_R3"],
+        source_class_priors=torch.tensor([[0.20, 0.20, 0.60]]),
+        prototype_bank=None,
+        label_smoothing=0.1,
+        gradient_clip=5.0,
+        adaptation_warmup_iterations=300,
+        adaptation_ramp_end=600,
+        pseudo_confidence_threshold=0.6,
+        source_prototype_memory=memory,
+    )
+    assert math.isfinite(record["total"])
+    assert not record["source_prototype_memory_updates_active"]
+    torch.testing.assert_close(memory.updates, updates_before)
+    assert not torch.equal(gate_before, model.rda_memory_gate_logit)
+    assert len(record["mean_target_rda_memory_distance"]) == 3
+    assert len(record["mean_target_rda_memory_scale_weight"]) == 3
 
 
 def test_train_step_rejects_target_labels_before_model_access() -> None:

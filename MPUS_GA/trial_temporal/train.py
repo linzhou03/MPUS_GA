@@ -65,6 +65,14 @@ class ExperimentSpec:
     pyramid_gate_mode: str = "global"
     use_pyramid_bias_guard: bool = False
     use_pyramid_gate_warmup: bool = False
+    multiview_fusion_mode: str = "none"
+    use_multiview_uncertainty: bool = False
+    use_sign_aware_pyramid_guard: bool = False
+    use_source_multiview_anchor: bool = False
+    use_stable_pyramid_gate: bool = False
+    use_temporal_msad: bool = False
+    use_source_prototype_memory: bool = False
+    use_relative_degradation_fusion: bool = False
     use_source_excess_suppression: bool = True
     use_boundary_attractor_suppression: bool = True
     target_dataset: str = "seed_v"
@@ -193,7 +201,90 @@ G_EXPERIMENT_ORDER = tuple(
     for variant in _G_DEFINITIONS
     for direction in "AB"
 )
-EXPERIMENT_ORDER = LEGACY_EXPERIMENT_ORDER + G_EXPERIMENT_ORDER
+
+_H_DEFINITIONS = {
+    "H0": {
+        "description": "relation-logit anchor without feature fusion",
+        "use_feature_pyramid": False,
+    },
+    "H1": {
+        "description": "class-query cross-scale feature fusion",
+        "multiview_fusion_mode": "class_query",
+    },
+    "H2": {
+        "description": "class-query fusion with low-rank scale interactions",
+        "multiview_fusion_mode": "class_query_low_rank",
+    },
+    "H3": {
+        "description": "uncertainty-aware low-rank multiview fusion",
+        "multiview_fusion_mode": "class_query_low_rank",
+        "use_multiview_uncertainty": True,
+    },
+    "H4": {
+        "description": "sign-safe uncertainty-aware low-rank multiview fusion",
+        "multiview_fusion_mode": "class_query_low_rank",
+        "use_multiview_uncertainty": True,
+        "use_sign_aware_pyramid_guard": True,
+    },
+    "H5": {
+        "description": (
+            "source-anchored stable sign-safe low-rank multiview fusion"
+        ),
+        "multiview_fusion_mode": "class_query_low_rank",
+        "use_multiview_uncertainty": True,
+        "use_sign_aware_pyramid_guard": True,
+        "use_source_multiview_anchor": True,
+        "use_stable_pyramid_gate": True,
+    },
+}
+
+H_EXPERIMENT_ORDER = tuple(
+    f"{direction}_{variant}"
+    for variant in _H_DEFINITIONS
+    for direction in "AB"
+)
+
+_R_DEFINITIONS = {
+    "R0": {
+        "description": "H5 stable source-anchored multiview baseline",
+    },
+    "R1": {
+        "description": "R0 with anti-aliased temporal MSAD",
+        "use_temporal_msad": True,
+    },
+    "R2": {
+        "description": "R1 with class-balanced source multi-prototype memory",
+        "use_temporal_msad": True,
+        "use_source_prototype_memory": True,
+    },
+    "R3": {
+        "description": (
+            "R2 with relative-degradation-aware class-conditional fusion"
+        ),
+        "use_temporal_msad": True,
+        "use_source_prototype_memory": True,
+        "use_relative_degradation_fusion": True,
+    },
+    "R4": {
+        "description": (
+            "H5 with source multi-prototype memory only; no MSAD or "
+            "relative degradation"
+        ),
+        "use_source_prototype_memory": True,
+    },
+}
+
+R_EXPERIMENT_ORDER = tuple(
+    f"{direction}_{variant}"
+    for variant in _R_DEFINITIONS
+    for direction in "AB"
+)
+EXPERIMENT_ORDER = (
+    LEGACY_EXPERIMENT_ORDER
+    + G_EXPERIMENT_ORDER
+    + H_EXPERIMENT_ORDER
+    + R_EXPERIMENT_ORDER
+)
 
 
 def _build_experiments() -> dict[str, ExperimentSpec]:
@@ -257,6 +348,91 @@ def _build_experiments() -> dict[str, ExperimentSpec]:
                 ),
                 use_pyramid_gate_warmup=definition.get(
                     "use_pyramid_gate_warmup", False
+                ),
+                use_source_excess_suppression=True,
+                use_boundary_attractor_suppression=True,
+                target_dataset=transfer["target_dataset"],
+                target_subject_count=transfer["target_subject_count"],
+                target_trials=transfer["target_trials"],
+            )
+    for variant, definition in _H_DEFINITIONS.items():
+        for direction, transfer in _TRANSFER_DIRECTIONS.items():
+            name = f"{direction}_{variant}"
+            experiments[name] = ExperimentSpec(
+                name=name,
+                description=(
+                    f"{transfer['description']}; {definition['description']}"
+                ),
+                transfer_direction=direction,
+                ablation=variant,
+                source_domains=transfer["source_domains"],
+                scales=(1.0, 2.0, 4.0),
+                fusion_mode="class_conditional",
+                domain_mode="scale_conditional",
+                use_prototypes=True,
+                use_feature_pyramid=definition.get(
+                    "use_feature_pyramid", True
+                ),
+                pyramid_gate_mode=(
+                    "class_static"
+                    if not definition.get("use_feature_pyramid", True)
+                    else "sample_class"
+                ),
+                use_pyramid_gate_warmup=definition.get(
+                    "use_feature_pyramid", True
+                ),
+                multiview_fusion_mode=definition.get(
+                    "multiview_fusion_mode", "none"
+                ),
+                use_multiview_uncertainty=definition.get(
+                    "use_multiview_uncertainty", False
+                ),
+                use_sign_aware_pyramid_guard=definition.get(
+                    "use_sign_aware_pyramid_guard", False
+                ),
+                use_source_multiview_anchor=definition.get(
+                    "use_source_multiview_anchor", False
+                ),
+                use_stable_pyramid_gate=definition.get(
+                    "use_stable_pyramid_gate", False
+                ),
+                use_source_excess_suppression=True,
+                use_boundary_attractor_suppression=True,
+                target_dataset=transfer["target_dataset"],
+                target_subject_count=transfer["target_subject_count"],
+                target_trials=transfer["target_trials"],
+            )
+    for variant, definition in _R_DEFINITIONS.items():
+        for direction, transfer in _TRANSFER_DIRECTIONS.items():
+            name = f"{direction}_{variant}"
+            experiments[name] = ExperimentSpec(
+                name=name,
+                description=(
+                    f"{transfer['description']}; {definition['description']}"
+                ),
+                transfer_direction=direction,
+                ablation=variant,
+                source_domains=transfer["source_domains"],
+                scales=(1.0, 2.0, 4.0),
+                fusion_mode="class_conditional",
+                domain_mode="scale_conditional",
+                use_prototypes=True,
+                use_feature_pyramid=True,
+                pyramid_gate_mode="sample_class",
+                use_pyramid_gate_warmup=True,
+                multiview_fusion_mode="class_query_low_rank",
+                use_multiview_uncertainty=True,
+                use_sign_aware_pyramid_guard=True,
+                use_source_multiview_anchor=True,
+                use_stable_pyramid_gate=True,
+                use_temporal_msad=definition.get(
+                    "use_temporal_msad", False
+                ),
+                use_source_prototype_memory=definition.get(
+                    "use_source_prototype_memory", False
+                ),
+                use_relative_degradation_fusion=definition.get(
+                    "use_relative_degradation_fusion", False
                 ),
                 use_source_excess_suppression=True,
                 use_boundary_attractor_suppression=True,
@@ -1118,6 +1294,121 @@ class PrototypeBank:
         }
 
 
+class SourceMultiPrototypeMemory:
+    """Equal-capacity source-only memory for every scale and emotion class."""
+
+    def __init__(
+        self,
+        scale_count: int,
+        class_count: int,
+        slots: int,
+        feature_dim: int,
+        momentum: float,
+        device: torch.device,
+    ) -> None:
+        if min(scale_count, class_count, slots, feature_dim) < 1:
+            raise ValueError("source memory dimensions must be positive")
+        if not 0 <= momentum < 1:
+            raise ValueError("source memory momentum must be within [0,1)")
+        self.momentum = float(momentum)
+        self.memory = torch.zeros(
+            scale_count,
+            class_count,
+            slots,
+            feature_dim,
+            device=device,
+        )
+        self.initialized = torch.zeros(
+            scale_count,
+            class_count,
+            slots,
+            dtype=torch.bool,
+            device=device,
+        )
+        self.updates = torch.zeros(
+            scale_count,
+            class_count,
+            slots,
+            dtype=torch.long,
+            device=device,
+        )
+        self.update_calls = 0
+
+    @torch.no_grad()
+    def update_source(
+        self, embeddings: torch.Tensor, labels: torch.Tensor
+    ) -> None:
+        """Update only from source embeddings paired with source true labels."""
+
+        if embeddings.ndim != 3 or embeddings.shape[1] != self.memory.shape[0]:
+            raise ValueError("source memory embeddings must be [batch,scales,d]")
+        if embeddings.shape[2] != self.memory.shape[-1]:
+            raise ValueError("source memory feature dimension mismatch")
+        if labels.shape != (embeddings.shape[0],):
+            raise ValueError("source memory labels must be [batch]")
+        detached = F.normalize(embeddings.detach(), dim=-1)
+        for scale_index in range(self.memory.shape[0]):
+            for class_index in range(self.memory.shape[1]):
+                vectors = detached[labels == class_index, scale_index]
+                if vectors.numel() == 0:
+                    continue
+                available = torch.where(
+                    ~self.initialized[scale_index, class_index]
+                )[0]
+                fill_count = min(len(available), len(vectors))
+                if fill_count:
+                    slots = available[:fill_count]
+                    self.memory[scale_index, class_index, slots] = vectors[
+                        :fill_count
+                    ]
+                    self.initialized[scale_index, class_index, slots] = True
+                    self.updates[scale_index, class_index, slots] += 1
+                    vectors = vectors[fill_count:]
+                if vectors.numel() == 0:
+                    continue
+                ready = self.initialized[scale_index, class_index]
+                ready_indices = torch.where(ready)[0]
+                prototypes = self.memory[
+                    scale_index, class_index, ready_indices
+                ]
+                assignment = (vectors @ prototypes.transpose(0, 1)).argmax(
+                    dim=1
+                )
+                for local_index, slot_index in enumerate(ready_indices):
+                    selected = assignment == local_index
+                    if not torch.any(selected):
+                        continue
+                    observation = F.normalize(
+                        vectors[selected].mean(dim=0), dim=0
+                    )
+                    stored = self.memory[
+                        scale_index, class_index, slot_index
+                    ]
+                    stored.mul_(self.momentum).add_(
+                        observation, alpha=1.0 - self.momentum
+                    )
+                    stored.copy_(F.normalize(stored, dim=0))
+                    self.updates[scale_index, class_index, slot_index] += int(
+                        selected.sum()
+                    )
+        self.update_calls += 1
+
+    @torch.no_grad()
+    def state(self, freeze_iteration: int) -> dict:
+        return {
+            "policy": (
+                "source_true_labels_only; target_query_only; "
+                f"frozen_after_iteration_{freeze_iteration}"
+            ),
+            "shape": list(self.memory.shape),
+            "equal_slots_per_scale_class": self.memory.shape[2],
+            "initialized": self.initialized.cpu().tolist(),
+            "updates": self.updates.cpu().tolist(),
+            "update_calls": self.update_calls,
+            "prototype_norms": self.memory.norm(dim=-1).cpu().tolist(),
+        }
+
+
 def _scale_classification_loss(
     scale_logits: torch.Tensor,
     labels: torch.Tensor,
@@ -1300,6 +1591,7 @@ def train_step(
     pyramid_gate_sparsity_weight: float = 0.005,
     pyramid_gate_teacher_temperature: float = 0.10,
     pyramid_gate_teacher_margin: float = 0.05,
+    source_prototype_memory: SourceMultiPrototypeMemory | None = None,
 ) -> dict:
     if "y" in target_batch:
         raise RuntimeError("Target adaptation batch unexpectedly contains labels")
@@ -1317,6 +1609,12 @@ def train_step(
     reliability = (
         prototype_bank.scale_class_reliability()
         if prototype_bank is not None
+        else None
+    )
+    source_multiview_anchor = (
+        prototype_bank.source_relation_weights().mean(dim=0)
+        if prototype_bank is not None
+        and spec.use_source_multiview_anchor
         else None
     )
     prior_adjustment = (
@@ -1347,7 +1645,10 @@ def train_step(
         else None
     )
     pyramid_bias_risk = None
-    if spec.use_pyramid_bias_guard and common_bias_components is not None:
+    if (
+        spec.use_pyramid_bias_guard
+        or spec.use_sign_aware_pyramid_guard
+    ) and common_bias_components is not None:
         if common_bias_max_adjustment > 0:
             pyramid_bias_risk = (
                 -common_bias_components["combined"]
@@ -1378,7 +1679,18 @@ def train_step(
                 mask,
                 grl_alpha=ramp,
                 scale_class_reliability=reliability,
+                multiview_source_anchor=source_multiview_anchor,
                 pyramid_gate_ramp=pyramid_gate_ramp,
+                source_prototype_memory=(
+                    source_prototype_memory.memory
+                    if source_prototype_memory is not None
+                    else None
+                ),
+                source_prototype_initialized=(
+                    source_prototype_memory.initialized
+                    if source_prototype_memory is not None
+                    else None
+                ),
             )
         )
     target_x, target_mask = _batch_to_device(target_batch, device)
@@ -1387,9 +1699,20 @@ def train_step(
         target_mask,
         grl_alpha=ramp,
         scale_class_reliability=reliability,
+        multiview_source_anchor=source_multiview_anchor,
         class_logit_adjustment=target_logit_adjustment,
         pyramid_gate_ramp=pyramid_gate_ramp,
         pyramid_bias_risk=pyramid_bias_risk,
+        source_prototype_memory=(
+            source_prototype_memory.memory
+            if source_prototype_memory is not None
+            else None
+        ),
+        source_prototype_initialized=(
+            source_prototype_memory.initialized
+            if source_prototype_memory is not None
+            else None
+        ),
     )
 
     target_consensus = independent_scale_consensus(
@@ -1519,6 +1842,21 @@ def train_step(
     optimizer.step()
     scheduler.step()
 
+    # R memory has a strict information boundary: source true labels only.
+    # It is updated during the source warmup, then frozen for all subsequent
+    # target querying and final evaluation. Target labels/pseudo-labels never
+    # select a memory class or modify a slot.
+    if (
+        source_prototype_memory is not None
+        and iteration <= adaptation_warmup_iterations
+    ):
+        for output, labels in zip(
+            source_outputs, source_labels, strict=True
+        ):
+            source_prototype_memory.update_source(
+                output["scale_embeddings"], labels
+            )
+
     if target_prior_estimator is not None:
         for domain_index, (output, labels) in enumerate(
             zip(source_outputs, source_labels, strict=True)
@@ -1567,6 +1905,34 @@ def train_step(
     ].detach().mean(dim=0)
     mean_pyramid_unsupported_excess = target_output[
         "pyramid_unsupported_excess"
+    ].detach().mean(dim=0)
+    mean_multiview_attention = target_output[
+        "multiview_token_attention"
+    ].detach().mean(dim=0)
+    mean_multiview_dynamic_attention = target_output[
+        "multiview_dynamic_attention"
+    ].detach().mean(dim=0)
+    multiview_source_anchor = target_output[
+        "multiview_source_anchor"
+    ].detach()
+    mean_multiview_uncertainty = target_output[
+        "multiview_token_uncertainty"
+    ].detach().mean(dim=0)
+    mean_multiview_conflict = target_output[
+        "multiview_token_conflict"
+    ].detach().mean(dim=0)
+    mean_rda_msad_filter = target_output[
+        "rda_msad_filter_weight"
+    ].detach().mean(dim=0)
+    rda_msad_gate = target_output["rda_msad_gate"].detach()
+    mean_rda_memory_distance = target_output[
+        "rda_memory_distance"
+    ].detach().mean(dim=0)
+    mean_rda_memory_scale_weight = target_output[
+        "rda_memory_scale_weight"
+    ].detach().mean(dim=0)
+    mean_rda_memory_gate = target_output[
+        "rda_memory_gate"
     ].detach().mean(dim=0)
     consensus_statistics = target_consensus.statistics(NUM_CLASSES)
     if not adaptation_active:
@@ -1622,6 +1988,34 @@ def train_step(
         ),
         "mean_target_pyramid_unsupported_excess_by_class": (
             mean_pyramid_unsupported_excess.cpu().tolist()
+        ),
+        "mean_target_multiview_token_attention": (
+            mean_multiview_attention.cpu().tolist()
+        ),
+        "mean_target_multiview_dynamic_attention": (
+            mean_multiview_dynamic_attention.cpu().tolist()
+        ),
+        "source_multiview_token_anchor": (
+            multiview_source_anchor.cpu().tolist()
+        ),
+        "mean_target_multiview_token_uncertainty": (
+            mean_multiview_uncertainty.cpu().tolist()
+        ),
+        "mean_target_multiview_token_conflict": (
+            mean_multiview_conflict.cpu().tolist()
+        ),
+        "mean_rda_msad_filter_weight": mean_rda_msad_filter.cpu().tolist(),
+        "rda_msad_gate": rda_msad_gate.cpu().tolist(),
+        "mean_target_rda_memory_distance": (
+            mean_rda_memory_distance.cpu().tolist()
+        ),
+        "mean_target_rda_memory_scale_weight": (
+            mean_rda_memory_scale_weight.cpu().tolist()
+        ),
+        "mean_target_rda_memory_gate": mean_rda_memory_gate.cpu().tolist(),
+        "source_prototype_memory_updates_active": (
+            source_prototype_memory is not None
+            and iteration <= adaptation_warmup_iterations
         ),
         "pyramid_residual_weight": float(
             target_output["pyramid_residual_weight"].detach()
@@ -1778,6 +2172,7 @@ def evaluate_trials(
     boundary_bias_ratio_tolerance: float = 0.15,
     common_bias_max_adjustment: float = 0.50,
     final_target_evidence: TargetEvidenceSnapshot | None = None,
+    source_prototype_memory: SourceMultiPrototypeMemory | None = None,
 ) -> dict:
     model.eval()
     probabilities = []
@@ -1789,10 +2184,27 @@ def evaluate_trials(
     pyramid_raw_gates = []
     pyramid_guard_factors = []
     pyramid_unsupported_excesses = []
+    multiview_token_attentions = []
+    multiview_dynamic_attentions = []
+    multiview_source_anchors = []
+    multiview_token_uncertainties = []
+    multiview_token_conflicts = []
+    rda_msad_filter_weights = []
+    rda_msad_gates = []
+    rda_memory_distances = []
+    rda_memory_valid_masks = []
+    rda_memory_scale_weights = []
+    rda_memory_gates = []
     labels = []
     reliability = (
         prototype_bank.scale_class_reliability()
         if prototype_bank is not None
+        else None
+    )
+    source_multiview_anchor = (
+        prototype_bank.source_relation_weights().mean(dim=0)
+        if prototype_bank is not None
+        and model.multiview_source_anchor_mix > 0
         else None
     )
     prior_adjustment = (
@@ -1829,7 +2241,10 @@ def evaluate_trials(
         else None
     )
     pyramid_bias_risk = None
-    if model.use_pyramid_bias_guard and common_bias_components is not None:
+    if (
+        model.use_pyramid_bias_guard
+        or model.use_sign_aware_pyramid_guard
+    ) and common_bias_components is not None:
         if common_bias_max_adjustment > 0:
             pyramid_bias_risk = (
                 -common_bias_components["combined"]
@@ -1864,9 +2279,20 @@ def evaluate_trials(
                 mask,
                 compute_domain=False,
                 scale_class_reliability=reliability,
+                multiview_source_anchor=source_multiview_anchor,
                 class_logit_adjustment=target_logit_adjustment,
                 pyramid_gate_ramp=1.0,
                 pyramid_bias_risk=pyramid_bias_risk,
+                source_prototype_memory=(
+                    source_prototype_memory.memory
+                    if source_prototype_memory is not None
+                    else None
+                ),
+                source_prototype_initialized=(
+                    source_prototype_memory.initialized
+                    if source_prototype_memory is not None
+                    else None
+                ),
             )
             probabilities.append(output["probability"].cpu().numpy())
             scale_probabilities.append(
@@ -1891,6 +2317,37 @@ def evaluate_trials(
             pyramid_unsupported_excesses.append(
                 output["pyramid_unsupported_excess"].cpu().numpy()
             )
+            multiview_token_attentions.append(
+                output["multiview_token_attention"].cpu().numpy()
+            )
+            multiview_dynamic_attentions.append(
+                output["multiview_dynamic_attention"].cpu().numpy()
+            )
+            multiview_source_anchors.append(
+                output["multiview_source_anchor"].cpu().numpy()
+            )
+            multiview_token_uncertainties.append(
+                output["multiview_token_uncertainty"].cpu().numpy()
+            )
+            multiview_token_conflicts.append(
+                output["multiview_token_conflict"].cpu().numpy()
+            )
+            rda_msad_filter_weights.append(
+                output["rda_msad_filter_weight"].cpu().numpy()
+            )
+            rda_msad_gates.append(output["rda_msad_gate"].cpu().numpy())
+            rda_memory_distances.append(
+                output["rda_memory_distance"].cpu().numpy()
+            )
+            rda_memory_valid_masks.append(
+                output["rda_memory_valid"].cpu().numpy()
+            )
+            rda_memory_scale_weights.append(
+                output["rda_memory_scale_weight"].cpu().numpy()
+            )
+            rda_memory_gates.append(
+                output["rda_memory_gate"].cpu().numpy()
+            )
             labels.append(batch["y"].numpy())
     labels_array = np.concatenate(labels)
     probability_array = np.concatenate(probabilities)
@@ -1906,6 +2363,29 @@ def evaluate_trials(
     pyramid_unsupported_excess_array = np.concatenate(
         pyramid_unsupported_excesses
     )
+    multiview_attention_array = np.concatenate(multiview_token_attentions)
+    multiview_dynamic_attention_array = np.concatenate(
+        multiview_dynamic_attentions
+    )
+    multiview_source_anchor_array = np.stack(multiview_source_anchors)
+    multiview_uncertainty_array = np.concatenate(
+        multiview_token_uncertainties
+    )
+    multiview_conflict_array = np.concatenate(multiview_token_conflicts)
+    rda_msad_filter_array = np.concatenate(rda_msad_filter_weights)
+    rda_msad_gate_array = np.stack(rda_msad_gates)
+    rda_memory_distance_array = np.concatenate(rda_memory_distances)
+    rda_memory_valid_array = np.concatenate(rda_memory_valid_masks)
+    rda_memory_scale_weight_array = np.concatenate(
+        rda_memory_scale_weights
+    )
+    rda_memory_gate_array = np.concatenate(rda_memory_gates)
+    multiview_token_names = list(model.scale_keys)
+    if model.multiview_fusion_mode == "class_query_low_rank":
+        multiview_token_names.extend(
+            f"{model.scale_keys[left]}x{model.scale_keys[right]}"
+            for left, right in model.multiview_pairs
+        )
     return {
         "fused": _classification_metrics(labels_array, probability_array),
         "by_scale": {
@@ -1939,6 +2419,36 @@ def evaluate_trials(
         "mean_pyramid_unsupported_excess_by_class": (
             pyramid_unsupported_excess_array.mean(axis=0).tolist()
         ),
+        "multiview_token_names": multiview_token_names,
+        "mean_multiview_token_attention": (
+            multiview_attention_array.mean(axis=0).tolist()
+        ),
+        "mean_multiview_dynamic_attention": (
+            multiview_dynamic_attention_array.mean(axis=0).tolist()
+        ),
+        "source_multiview_token_anchor": (
+            multiview_source_anchor_array.mean(axis=0).tolist()
+        ),
+        "mean_multiview_token_uncertainty": (
+            multiview_uncertainty_array.mean(axis=0).tolist()
+        ),
+        "mean_multiview_token_conflict": (
+            multiview_conflict_array.mean(axis=0).tolist()
+        ),
+        "mean_rda_msad_filter_weight": (
+            rda_msad_filter_array.mean(axis=0).tolist()
+        ),
+        "mean_rda_msad_gate": rda_msad_gate_array.mean(axis=0).tolist(),
+        "mean_rda_memory_distance": (
+            rda_memory_distance_array.mean(axis=0).tolist()
+        ),
+        "rda_memory_valid_fraction": (
+            rda_memory_valid_array.mean(axis=0).tolist()
+        ),
+        "mean_rda_memory_scale_weight": (
+            rda_memory_scale_weight_array.mean(axis=0).tolist()
+        ),
+        "mean_rda_memory_gate": rda_memory_gate_array.mean(axis=0).tolist(),
         "pyramid_bias_risk": (
             pyramid_bias_risk.cpu().tolist()
             if pyramid_bias_risk is not None
@@ -2188,6 +2698,41 @@ def run_fold(
         pyramid_residual_clip=args.pyramid_residual_clip,
         pyramid_guard_strength=args.pyramid_guard_strength,
         pyramid_guard_tolerance=args.pyramid_guard_tolerance,
+        multiview_fusion_mode=spec.multiview_fusion_mode,
+        use_multiview_uncertainty=spec.use_multiview_uncertainty,
+        use_sign_aware_pyramid_guard=(
+            spec.use_sign_aware_pyramid_guard
+        ),
+        multiview_low_rank=args.multiview_low_rank,
+        multiview_uncertainty_strength=(
+            args.multiview_uncertainty_strength
+        ),
+        multiview_conflict_strength=args.multiview_conflict_strength,
+        multiview_source_anchor_mix=(
+            args.multiview_source_anchor_mix
+            if spec.use_source_multiview_anchor
+            else 0.0
+        ),
+        pyramid_gate_shrinkage=(
+            args.pyramid_gate_shrinkage
+            if spec.use_stable_pyramid_gate
+            else 0.0
+        ),
+        pyramid_gate_ceiling=(
+            args.pyramid_gate_ceiling
+            if spec.use_stable_pyramid_gate
+            else 1.0
+        ),
+        use_temporal_msad=spec.use_temporal_msad,
+        use_source_prototype_memory=spec.use_source_prototype_memory,
+        use_relative_degradation_fusion=(
+            spec.use_relative_degradation_fusion
+        ),
+        rda_memory_topk=args.rda_memory_topk,
+        rda_memory_temperature=args.rda_memory_temperature,
+        rda_memory_strength=args.rda_memory_strength,
+        rda_degradation_strength=args.rda_degradation_strength,
+        rda_msad_strength=args.rda_msad_strength,
     ).to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     optimizer = torch.optim.AdamW(
@@ -2233,6 +2778,16 @@ def run_fold(
             relation_momentum=args.relation_momentum,
             relation_temperature=args.relation_temperature,
             relation_uniform_mix=args.relation_uniform_mix,
+        )
+    source_prototype_memory = None
+    if spec.use_source_prototype_memory:
+        source_prototype_memory = SourceMultiPrototypeMemory(
+            len(spec.scales),
+            NUM_CLASSES,
+            args.rda_memory_slots,
+            args.d_model,
+            args.rda_memory_momentum,
+            device,
         )
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -2296,6 +2851,7 @@ def run_fold(
             args.pyramid_gate_sparsity_weight,
             args.pyramid_gate_teacher_temperature,
             args.pyramid_gate_teacher_margin,
+            source_prototype_memory=source_prototype_memory,
         )
         if iteration == 1 or iteration % args.log_interval == 0 or iteration == iterations:
             training_trace.append(record)
@@ -2337,6 +2893,7 @@ def run_fold(
                 args.boundary_bias_ratio_tolerance,
                 args.common_bias_max_adjustment,
                 final_target_evidence,
+                source_prototype_memory=source_prototype_memory,
             )
             target_evaluation_trace.append(
                 {"iteration": iteration, "evaluation": candidate_evaluation}
@@ -2434,6 +2991,22 @@ def run_fold(
             "pyramid_gate_mode": spec.pyramid_gate_mode,
             "use_pyramid_bias_guard": spec.use_pyramid_bias_guard,
             "use_pyramid_gate_warmup": spec.use_pyramid_gate_warmup,
+            "multiview_fusion_mode": spec.multiview_fusion_mode,
+            "use_multiview_uncertainty": spec.use_multiview_uncertainty,
+            "use_sign_aware_pyramid_guard": (
+                spec.use_sign_aware_pyramid_guard
+            ),
+            "use_source_multiview_anchor": (
+                spec.use_source_multiview_anchor
+            ),
+            "use_stable_pyramid_gate": spec.use_stable_pyramid_gate,
+            "use_temporal_msad": spec.use_temporal_msad,
+            "use_source_prototype_memory": (
+                spec.use_source_prototype_memory
+            ),
+            "use_relative_degradation_fusion": (
+                spec.use_relative_degradation_fusion
+            ),
             "channel_attention": True,
             "d_model": args.d_model,
             "num_heads": args.num_heads,
@@ -2449,6 +3022,34 @@ def run_fold(
             "pyramid_residual_clip": args.pyramid_residual_clip,
             "pyramid_guard_strength": args.pyramid_guard_strength,
             "pyramid_guard_tolerance": args.pyramid_guard_tolerance,
+            "multiview_low_rank": args.multiview_low_rank,
+            "multiview_uncertainty_strength": (
+                args.multiview_uncertainty_strength
+            ),
+            "multiview_conflict_strength": (
+                args.multiview_conflict_strength
+            ),
+            "multiview_source_anchor_mix": (
+                args.multiview_source_anchor_mix
+                if spec.use_source_multiview_anchor
+                else 0.0
+            ),
+            "pyramid_gate_shrinkage": (
+                args.pyramid_gate_shrinkage
+                if spec.use_stable_pyramid_gate
+                else 0.0
+            ),
+            "pyramid_gate_ceiling": (
+                args.pyramid_gate_ceiling
+                if spec.use_stable_pyramid_gate
+                else 1.0
+            ),
+            "rda_memory_slots_per_scale_class": args.rda_memory_slots,
+            "rda_memory_topk": args.rda_memory_topk,
+            "rda_memory_temperature": args.rda_memory_temperature,
+            "rda_memory_strength": args.rda_memory_strength,
+            "rda_degradation_strength": args.rda_degradation_strength,
+            "rda_msad_strength": args.rda_msad_strength,
             "fusion_output": (
                 "one class-specific feature per emotion, scored by the "
                 "matching classifier row"
@@ -2482,6 +3083,35 @@ def run_fold(
             "pyramid_residual_clip": args.pyramid_residual_clip,
             "pyramid_guard_strength": args.pyramid_guard_strength,
             "pyramid_guard_tolerance": args.pyramid_guard_tolerance,
+            "multiview_low_rank": args.multiview_low_rank,
+            "multiview_uncertainty_strength": (
+                args.multiview_uncertainty_strength
+            ),
+            "multiview_conflict_strength": (
+                args.multiview_conflict_strength
+            ),
+            "multiview_source_anchor_mix": (
+                args.multiview_source_anchor_mix
+                if spec.use_source_multiview_anchor
+                else 0.0
+            ),
+            "pyramid_gate_shrinkage": (
+                args.pyramid_gate_shrinkage
+                if spec.use_stable_pyramid_gate
+                else 0.0
+            ),
+            "pyramid_gate_ceiling": (
+                args.pyramid_gate_ceiling
+                if spec.use_stable_pyramid_gate
+                else 1.0
+            ),
+            "rda_memory_slots": args.rda_memory_slots,
+            "rda_memory_momentum": args.rda_memory_momentum,
+            "rda_memory_topk": args.rda_memory_topk,
+            "rda_memory_temperature": args.rda_memory_temperature,
+            "rda_memory_strength": args.rda_memory_strength,
+            "rda_degradation_strength": args.rda_degradation_strength,
+            "rda_msad_strength": args.rda_msad_strength,
             "pyramid_gate_supervision_weight": (
                 args.pyramid_gate_supervision_weight
             ),
@@ -2524,6 +3154,13 @@ def run_fold(
         },
         "final_prototype_bank": (
             prototype_bank.state() if prototype_bank is not None else None
+        ),
+        "final_source_prototype_memory": (
+            source_prototype_memory.state(
+                args.adaptation_warmup_iterations
+            )
+            if source_prototype_memory is not None
+            else None
         ),
         "final_target_prior_estimator": target_prior_estimator.state(),
         "final_learned_scale_class_relation_residual": (
@@ -2586,6 +3223,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pyramid-residual-clip", type=float, default=0.50)
     parser.add_argument("--pyramid-guard-strength", type=float, default=4.0)
     parser.add_argument("--pyramid-guard-tolerance", type=float, default=0.05)
+    parser.add_argument("--multiview-low-rank", type=int, default=16)
+    parser.add_argument(
+        "--multiview-uncertainty-strength", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--multiview-conflict-strength", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--multiview-source-anchor-mix", type=float, default=0.50
+    )
+    parser.add_argument(
+        "--pyramid-gate-shrinkage", type=float, default=0.50
+    )
+    parser.add_argument(
+        "--pyramid-gate-ceiling", type=float, default=0.25
+    )
+    parser.add_argument("--rda-memory-slots", type=int, default=4)
+    parser.add_argument("--rda-memory-momentum", type=float, default=0.90)
+    parser.add_argument("--rda-memory-topk", type=int, default=2)
+    parser.add_argument(
+        "--rda-memory-temperature", type=float, default=0.25
+    )
+    parser.add_argument("--rda-memory-strength", type=float, default=0.25)
+    parser.add_argument(
+        "--rda-degradation-strength", type=float, default=1.0
+    )
+    parser.add_argument("--rda-msad-strength", type=float, default=0.25)
     parser.add_argument(
         "--pyramid-gate-supervision-weight", type=float, default=0.05
     )
@@ -2711,14 +3375,38 @@ def validate_args(args, spec: ExperimentSpec) -> None:
         raise ValueError("pyramid-residual-initial must be within (0,1)")
     if args.pyramid_residual_clip <= 0:
         raise ValueError("pyramid-residual-clip must be positive")
+    if args.multiview_low_rank < 1:
+        raise ValueError("multiview-low-rank must be positive")
     if min(
         args.pyramid_guard_strength,
         args.pyramid_guard_tolerance,
         args.pyramid_gate_supervision_weight,
         args.pyramid_gate_sparsity_weight,
         args.pyramid_gate_teacher_margin,
+        args.multiview_uncertainty_strength,
+        args.multiview_conflict_strength,
     ) < 0:
         raise ValueError("pyramid gate/guard parameters must be nonnegative")
+    if not 0 <= args.multiview_source_anchor_mix <= 1:
+        raise ValueError("multiview-source-anchor-mix must be within [0,1]")
+    if not 0 <= args.pyramid_gate_shrinkage <= 1:
+        raise ValueError("pyramid-gate-shrinkage must be within [0,1]")
+    if not 0 < args.pyramid_gate_ceiling <= 1:
+        raise ValueError("pyramid-gate-ceiling must be within (0,1]")
+    if args.rda_memory_slots < 1 or args.rda_memory_topk < 1:
+        raise ValueError("RDA memory slots/top-k must be positive")
+    if args.rda_memory_topk > args.rda_memory_slots:
+        raise ValueError("RDA memory top-k cannot exceed memory slots")
+    if not 0 <= args.rda_memory_momentum < 1:
+        raise ValueError("RDA memory momentum must be within [0,1)")
+    if args.rda_memory_temperature <= 0:
+        raise ValueError("RDA memory temperature must be positive")
+    if min(
+        args.rda_memory_strength,
+        args.rda_degradation_strength,
+        args.rda_msad_strength,
+    ) < 0:
+        raise ValueError("RDA strengths must be nonnegative")
     if args.pyramid_gate_teacher_temperature <= 0:
         raise ValueError("pyramid gate teacher temperature must be positive")
     if args.prior_correction_strength < 0:
