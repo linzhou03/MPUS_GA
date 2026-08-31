@@ -525,6 +525,35 @@ Consequently, resetting the same random seed produces byte-identical shared
 H5/R weights, so an ablation cannot gain merely by shifting the random-number
 sequence used for downstream shared layers.
 
+### Brain-region-guided electrode topology prior (P family)
+
+The P family keeps R2 unchanged and adds a soft sensor-space topology bias to
+the dynamic 62-electrode graph. This is intentionally described as an
+electrode prior rather than source-localized cortical connectivity. The fixed
+matrix combines four local montage neighbours, seven coarse scalp regions,
+bilateral homologous electrode pairs, and self-connections. It is injected
+into the graph score before top-k selection; the union of dynamic and prior
+candidates remains available, so the prior never acts as a hard mask.
+
+The same 62-channel order is validated when every processed NPZ is loaded.
+P2 learns one bounded prior strength shared by 1/2/4 s, while P3 learns one
+strength per temporal scale. These constant-initialized gates consume no
+random numbers, preserving R2 initialization. P4 applies a deterministic
+channel permutation to the same matrix as a matched negative control.
+
+| Paired tags | Purpose |
+|---|---|
+| A_P0 / B_P0 | exact R2 control with no topology prior |
+| A_P1 / B_P1 | fixed soft electrode-topology prior |
+| A_P2 / B_P2 | learned topology strength shared across scales |
+| A_P3 / B_P3 | learned topology strength for each of 1/2/4 s |
+| A_P4 / B_P4 | P3 with a permuted-topology negative control |
+
+No target labels, target pseudo-label routing, raw-signal reprocessing, or
+target checkpoint selection is introduced. Result JSON files record the
+topology mode, canonical channel order, region names, and final effective
+strength for each scale.
+
 For a two-direction seed-42 pilot, start in `/home/gzw/projects`, use isolated
 output paths, and assign one physical GPU to each direction:
 

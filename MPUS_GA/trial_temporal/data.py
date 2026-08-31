@@ -10,6 +10,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from .topology import SEED_62_CHANNEL_NAMES
+
 
 NUM_CHANNELS = 62
 NUM_BANDS = 5
@@ -96,6 +98,11 @@ def load_scale_arrays(
                 raise ValueError(f"Invalid feature shape in {path}: {features.shape}")
             if not np.isclose(float(archive["window_seconds"]), scale):
                 raise ValueError(f"Scale mismatch in {path}")
+            channel_names = tuple(archive["channel_names"].tolist())
+            if channel_names != SEED_62_CHANNEL_NAMES:
+                raise ValueError(
+                    f"Channel order does not match the topology prior in {path}"
+                )
             fields["features"].append(features.astype(np.float32, copy=False))
             fields["labels"].append(archive["label_3class"].astype(np.int64))
             fields["subjects"].append(archive["subject_id"].astype(np.int64))

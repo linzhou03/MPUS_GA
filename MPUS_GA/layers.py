@@ -62,14 +62,90 @@ class AttentiveGraphLayer(nn.Module):
         self.gconv = DenseGCNConv(in_features, out_features)
         self.attn_lin = nn.Linear(in_features, in_features)
 
-    def forward(self, x):
+    def adjacency(
+        self,
+        x,
+        adjacency_prior=None,
+        prior_strength=None,
+        prior_topk=0,
+    ):
         x_attn = torch.tanh(self.attn_lin(x))
-        adj = torch.matmul(x_attn, x_attn.transpose(2, 1))
-        adj = F.softmax(adj, dim=2)
-        mask = torch.zeros_like(adj, device=x.device)
-        _, top_indices = torch.topk(adj, min(self.topk, adj.size(2)), dim=2)
-        mask.scatter_(2, top_indices, 1)
-        adj = adj * mask
+        score = torch.matmul(x_attn, x_attn.transpose(2, 1))
+        dynamic_topk = min(self.topk, score.size(2))
+
+        # Preserve the historical path exactly when no prior is requested so
+        # P0 remains a byte-identical R2 control.
+        if adjacency_prior is None:
+            adj = F.softmax(score, dim=2)
+            mask = torch.zeros_like(adj, device=x.device)
+            _, top_indices = torch.topk(adj, dynamic_topk, dim=2)
+            mask.scatter_(2, top_indices, 1)
+            return adj * mask
+
+        prior = adjacency_prior.to(device=x.device, dtype=x.dtype)
+        if prior.shape != score.shape[-2:]:
+            raise ValueError("adjacency prior must match the electrode axes")
+        if prior_topk < 0:
+            raise ValueError("prior_topk must be nonnegative")
+        strength = torch.as_tensor(
+            1.0 if prior_strength is None else prior_strength,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        if strength.numel() != 1:
+            raise ValueError("prior strength must be one scalar")
+        # Express the prior gate in units of each batch's detached dynamic
+        # score standard deviation. Its meaning therefore stays comparable
+        # across d_model values without changing the P0 score temperature.
+        score_scale = score.detach().std(
+            dim=(1, 2), keepdim=True, unbiased=False
+        ).clamp_min(1e-6)
+        biased_score = score + (
+            strength.reshape(()).clamp_min(0.0)
+            * score_scale
+            * prior.unsqueeze(0)
+        )
+
+        candidate = torch.zeros_like(biased_score, dtype=torch.bool)
+        dynamic_indices = biased_score.topk(dynamic_topk, dim=2).indices
+        candidate.scatter_(2, dynamic_indices, True)
+        if prior_topk:
+            available = min(int(prior_topk), prior.shape[1] - 1)
+            prior_score = prior.masked_fill(
+                torch.eye(
+                    prior.shape[0], device=prior.device, dtype=torch.bool
+                ),
+                float("-inf"),
+            )
+            prior_indices = prior_score.topk(available, dim=1).indices
+            prior_candidate = torch.zeros_like(prior, dtype=torch.bool)
+            prior_candidate.scatter_(1, prior_indices, True)
+            prior_candidate = (
+                prior_candidate | prior_candidate.transpose(0, 1)
+            )
+            candidate |= prior_candidate.unsqueeze(0)
+
+        # Only the anatomical candidates are symmetrized. Dynamic top-k edges
+        # retain the directed sparsity of the historical R2 graph.
+        diagonal = torch.arange(score.shape[1], device=x.device)
+        candidate[:, diagonal, diagonal] = True
+        return F.softmax(
+            biased_score.masked_fill(~candidate, float("-inf")), dim=2
+        )
+
+    def forward(
+        self,
+        x,
+        adjacency_prior=None,
+        prior_strength=None,
+        prior_topk=0,
+    ):
+        adj = self.adjacency(
+            x,
+            adjacency_prior=adjacency_prior,
+            prior_strength=prior_strength,
+            prior_topk=prior_topk,
+        )
         x_gcn = F.relu(self.gconv(x, adj))
         return x_gcn
 
@@ -85,10 +161,21 @@ class SpatialStream(nn.Module):
                 )
             )
 
-    def forward(self, x):
+    def forward(
+        self,
+        x,
+        adjacency_prior=None,
+        prior_strength=None,
+        prior_topk=0,
+    ):
         layer_outputs = []
         for layer in self.layers:
-            x = layer(x)
+            x = layer(
+                x,
+                adjacency_prior=adjacency_prior,
+                prior_strength=prior_strength,
+                prior_topk=prior_topk,
+            )
             layer_outputs.append(x)
         return layer_outputs
 

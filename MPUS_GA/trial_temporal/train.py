@@ -35,6 +35,7 @@ from .data import (
 )
 from .losses import class_conditional_prototype_alignment_loss
 from .model import MultiScaleMultiSourceDANN
+from .topology import REGION_NAMES, SEED_62_CHANNEL_NAMES
 
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
@@ -73,6 +74,8 @@ class ExperimentSpec:
     use_temporal_msad: bool = False
     use_source_prototype_memory: bool = False
     use_relative_degradation_fusion: bool = False
+    brain_topology_mode: str = "none"
+    brain_prior_permuted: bool = False
     use_source_excess_suppression: bool = True
     use_boundary_attractor_suppression: bool = True
     target_dataset: str = "seed_v"
@@ -279,11 +282,42 @@ R_EXPERIMENT_ORDER = tuple(
     for variant in _R_DEFINITIONS
     for direction in "AB"
 )
+
+_P_DEFINITIONS = {
+    "P0": {
+        "description": "exact R2 control without an electrode-topology prior",
+        "brain_topology_mode": "none",
+    },
+    "P1": {
+        "description": "R2 with a fixed soft SEED electrode-topology prior",
+        "brain_topology_mode": "fixed",
+    },
+    "P2": {
+        "description": "R2 with one learned shared topology-prior strength",
+        "brain_topology_mode": "learnable_shared",
+    },
+    "P3": {
+        "description": "R2 with learned 1/2/4-second topology strengths",
+        "brain_topology_mode": "learnable_scale",
+    },
+    "P4": {
+        "description": "P3 with a deterministically permuted topology control",
+        "brain_topology_mode": "learnable_scale",
+        "brain_prior_permuted": True,
+    },
+}
+
+P_EXPERIMENT_ORDER = tuple(
+    f"{direction}_{variant}"
+    for variant in _P_DEFINITIONS
+    for direction in "AB"
+)
 EXPERIMENT_ORDER = (
     LEGACY_EXPERIMENT_ORDER
     + G_EXPERIMENT_ORDER
     + H_EXPERIMENT_ORDER
     + R_EXPERIMENT_ORDER
+    + P_EXPERIMENT_ORDER
 )
 
 
@@ -433,6 +467,42 @@ def _build_experiments() -> dict[str, ExperimentSpec]:
                 ),
                 use_relative_degradation_fusion=definition.get(
                     "use_relative_degradation_fusion", False
+                ),
+                use_source_excess_suppression=True,
+                use_boundary_attractor_suppression=True,
+                target_dataset=transfer["target_dataset"],
+                target_subject_count=transfer["target_subject_count"],
+                target_trials=transfer["target_trials"],
+            )
+    for variant, definition in _P_DEFINITIONS.items():
+        for direction, transfer in _TRANSFER_DIRECTIONS.items():
+            name = f"{direction}_{variant}"
+            experiments[name] = ExperimentSpec(
+                name=name,
+                description=(
+                    f"{transfer['description']}; {definition['description']}"
+                ),
+                transfer_direction=direction,
+                ablation=variant,
+                source_domains=transfer["source_domains"],
+                scales=(1.0, 2.0, 4.0),
+                fusion_mode="class_conditional",
+                domain_mode="scale_conditional",
+                use_prototypes=True,
+                use_feature_pyramid=True,
+                pyramid_gate_mode="sample_class",
+                use_pyramid_gate_warmup=True,
+                multiview_fusion_mode="class_query_low_rank",
+                use_multiview_uncertainty=True,
+                use_sign_aware_pyramid_guard=True,
+                use_source_multiview_anchor=True,
+                use_stable_pyramid_gate=True,
+                use_temporal_msad=True,
+                use_source_prototype_memory=True,
+                use_relative_degradation_fusion=False,
+                brain_topology_mode=definition["brain_topology_mode"],
+                brain_prior_permuted=definition.get(
+                    "brain_prior_permuted", False
                 ),
                 use_source_excess_suppression=True,
                 use_boundary_attractor_suppression=True,
@@ -2449,6 +2519,9 @@ def evaluate_trials(
             rda_memory_scale_weight_array.mean(axis=0).tolist()
         ),
         "mean_rda_memory_gate": rda_memory_gate_array.mean(axis=0).tolist(),
+        "brain_topology_strength_by_scale": (
+            model.brain_topology_strength().detach().cpu().tolist()
+        ),
         "pyramid_bias_risk": (
             pyramid_bias_risk.cpu().tolist()
             if pyramid_bias_risk is not None
@@ -2733,6 +2806,12 @@ def run_fold(
         rda_memory_strength=args.rda_memory_strength,
         rda_degradation_strength=args.rda_degradation_strength,
         rda_msad_strength=args.rda_msad_strength,
+        brain_topology_mode=spec.brain_topology_mode,
+        brain_prior_initial_strength=args.brain_prior_initial_strength,
+        brain_prior_max_strength=args.brain_prior_max_strength,
+        brain_prior_topk=args.brain_prior_topk,
+        brain_prior_local_neighbors=args.brain_prior_local_neighbors,
+        brain_prior_permuted=spec.brain_prior_permuted,
     ).to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     optimizer = torch.optim.AdamW(
@@ -3007,6 +3086,10 @@ def run_fold(
             "use_relative_degradation_fusion": (
                 spec.use_relative_degradation_fusion
             ),
+            "brain_topology_mode": spec.brain_topology_mode,
+            "brain_prior_permuted": spec.brain_prior_permuted,
+            "brain_prior_channel_order": list(SEED_62_CHANNEL_NAMES),
+            "brain_prior_regions": list(REGION_NAMES),
             "channel_attention": True,
             "d_model": args.d_model,
             "num_heads": args.num_heads,
@@ -3050,6 +3133,14 @@ def run_fold(
             "rda_memory_strength": args.rda_memory_strength,
             "rda_degradation_strength": args.rda_degradation_strength,
             "rda_msad_strength": args.rda_msad_strength,
+            "brain_prior_initial_strength": (
+                args.brain_prior_initial_strength
+            ),
+            "brain_prior_max_strength": args.brain_prior_max_strength,
+            "brain_prior_topk": args.brain_prior_topk,
+            "brain_prior_local_neighbors": (
+                args.brain_prior_local_neighbors
+            ),
             "fusion_output": (
                 "one class-specific feature per emotion, scored by the "
                 "matching classifier row"
@@ -3112,6 +3203,14 @@ def run_fold(
             "rda_memory_strength": args.rda_memory_strength,
             "rda_degradation_strength": args.rda_degradation_strength,
             "rda_msad_strength": args.rda_msad_strength,
+            "brain_prior_initial_strength": (
+                args.brain_prior_initial_strength
+            ),
+            "brain_prior_max_strength": args.brain_prior_max_strength,
+            "brain_prior_topk": args.brain_prior_topk,
+            "brain_prior_local_neighbors": (
+                args.brain_prior_local_neighbors
+            ),
             "pyramid_gate_supervision_weight": (
                 args.pyramid_gate_supervision_weight
             ),
@@ -3250,6 +3349,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--rda-degradation-strength", type=float, default=1.0
     )
     parser.add_argument("--rda-msad-strength", type=float, default=0.25)
+    parser.add_argument(
+        "--brain-prior-initial-strength", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--brain-prior-max-strength", type=float, default=2.0
+    )
+    parser.add_argument("--brain-prior-topk", type=int, default=4)
+    parser.add_argument(
+        "--brain-prior-local-neighbors", type=int, default=4
+    )
     parser.add_argument(
         "--pyramid-gate-supervision-weight", type=float, default=0.05
     )
@@ -3407,6 +3516,18 @@ def validate_args(args, spec: ExperimentSpec) -> None:
         args.rda_msad_strength,
     ) < 0:
         raise ValueError("RDA strengths must be nonnegative")
+    if args.brain_prior_max_strength <= 0:
+        raise ValueError("brain-prior-max-strength must be positive")
+    if not (
+        0
+        < args.brain_prior_initial_strength
+        < args.brain_prior_max_strength
+    ):
+        raise ValueError(
+            "brain-prior-initial-strength must be within (0, maximum)"
+        )
+    if args.brain_prior_topk < 0 or args.brain_prior_local_neighbors < 1:
+        raise ValueError("brain-prior neighbour counts are invalid")
     if args.pyramid_gate_teacher_temperature <= 0:
         raise ValueError("pyramid gate teacher temperature must be positive")
     if args.prior_correction_strength < 0:
