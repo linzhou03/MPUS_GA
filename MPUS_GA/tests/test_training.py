@@ -14,7 +14,6 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from MPUS_GA.trial_temporal.losses import (  # noqa: E402
     class_conditional_prototype_alignment_loss,
 )
-from MPUS_GA.layers import AttentiveGraphLayer  # noqa: E402
 from MPUS_GA.trial_temporal.data import _artifact_files  # noqa: E402
 from MPUS_GA.trial_temporal.model import (  # noqa: E402
     EEGChannelAttention,
@@ -39,13 +38,6 @@ from MPUS_GA.trial_temporal.train import (  # noqa: E402
     collect_unlabeled_target_evidence,
     independent_scale_consensus,
     train_step,
-)
-from MPUS_GA.trial_temporal.topology import (  # noqa: E402
-    HOMOTOPIC_PAIRS,
-    REGION_NAMES,
-    SEED_62_CHANNEL_NAMES,
-    build_seed_topology_prior,
-    channel_region_ids,
 )
 
 
@@ -79,95 +71,6 @@ def test_channel_attention_shape_range_and_gradient() -> None:
     assert torch.all((weights > 0.5) & (weights < 1.5))
     output.square().mean().backward()
     assert x.grad is not None
-
-
-def test_seed_topology_prior_is_symmetric_and_covers_regions() -> None:
-    prior = build_seed_topology_prior(local_neighbors=4)
-    assert prior.shape == (62, 62)
-    assert len(SEED_62_CHANNEL_NAMES) == 62
-    assert channel_region_ids().unique().numel() == len(REGION_NAMES)
-    torch.testing.assert_close(prior, prior.transpose(0, 1))
-    torch.testing.assert_close(prior.diagonal(), torch.ones(62))
-    index = {
-        channel: offset
-        for offset, channel in enumerate(SEED_62_CHANNEL_NAMES)
-    }
-    for left, right in HOMOTOPIC_PAIRS:
-        assert prior[index[left], index[right]] >= 0.9
-
-
-def test_permuted_topology_is_a_matched_negative_control() -> None:
-    prior = build_seed_topology_prior()
-    permuted = build_seed_topology_prior(permuted=True)
-    assert not torch.equal(prior, permuted)
-    torch.testing.assert_close(
-        prior.flatten().sort().values,
-        permuted.flatten().sort().values,
-    )
-
-
-def test_prior_graph_adjacency_is_sparse_and_row_normalized() -> None:
-    layer = AttentiveGraphLayer(8, 8, topk=3)
-    feature = torch.randn(2, 62, 8)
-    prior = build_seed_topology_prior(local_neighbors=4)
-    adjacency = layer.adjacency(
-        feature,
-        adjacency_prior=prior,
-        prior_strength=torch.tensor(1.0),
-        prior_topk=2,
-    )
-    assert adjacency.shape == (2, 62, 62)
-    torch.testing.assert_close(
-        adjacency.sum(dim=-1), torch.ones(2, 62), atol=1e-6, rtol=1e-6
-    )
-    assert torch.all((adjacency > 0).sum(dim=-1) <= 11)
-
-
-def test_learnable_scale_topology_keeps_r2_initialization_and_gradient() -> None:
-    arguments = {
-        "scales": (1.0, 2.0, 4.0),
-        "num_domains": 2,
-        "d_model": 32,
-        "num_heads": 4,
-        "spatial_layers": 1,
-        "temporal_layers": 1,
-        "fusion_layers": 1,
-        "dim_feedforward": 64,
-        "dropout": 0.0,
-        "spatial_topk": 4,
-        "multiview_fusion_mode": "class_query_low_rank",
-        "use_multiview_uncertainty": True,
-        "multiview_source_anchor_mix": 0.5,
-        "pyramid_gate_shrinkage": 0.5,
-        "pyramid_gate_ceiling": 0.25,
-        "pyramid_gate_mode": "sample_class",
-        "use_temporal_msad": True,
-        "use_source_prototype_memory": True,
-    }
-    torch.manual_seed(71)
-    baseline = MultiScaleMultiSourceDANN(**arguments)
-    torch.manual_seed(71)
-    topology = MultiScaleMultiSourceDANN(
-        **arguments,
-        brain_topology_mode="learnable_scale",
-    )
-    topology_parameters = dict(topology.named_parameters())
-    for name, parameter in baseline.named_parameters():
-        torch.testing.assert_close(parameter, topology_parameters[name])
-    torch.testing.assert_close(
-        topology.brain_topology_strength(), torch.ones(3)
-    )
-
-    x = {
-        key: torch.randn(2, 2, 62, 5)
-        for key in ("1s", "2s", "4s")
-    }
-    mask = {key: torch.ones(2, 2, dtype=torch.bool) for key in x}
-    output = topology(x, mask, compute_domain=False)
-    output["logits"].square().mean().backward()
-    assert topology.brain_prior_strength_logit is not None
-    assert topology.brain_prior_strength_logit.grad is not None
-    assert output["brain_topology_strength"].shape == (3,)
 
 
 def test_class_conditional_fusion_uses_external_scale_class_reliability() -> None:
@@ -1155,16 +1058,6 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
         "B_R3",
         "A_R4",
         "B_R4",
-        "A_P0",
-        "B_P0",
-        "A_P1",
-        "B_P1",
-        "A_P2",
-        "B_P2",
-        "A_P3",
-        "B_P3",
-        "A_P4",
-        "B_P4",
     )
     assert set(EXPERIMENTS) == set(EXPERIMENT_ORDER)
     assert EXPERIMENTS["A0"].scales == (1.0,)
@@ -1212,31 +1105,6 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
     assert not EXPERIMENTS["A_R4"].use_temporal_msad
     assert EXPERIMENTS["A_R4"].use_source_prototype_memory
     assert not EXPERIMENTS["A_R4"].use_relative_degradation_fusion
-    assert EXPERIMENTS["A_P0"].brain_topology_mode == "none"
-    assert EXPERIMENTS["A_P1"].brain_topology_mode == "fixed"
-    assert EXPERIMENTS["A_P2"].brain_topology_mode == "learnable_shared"
-    assert EXPERIMENTS["A_P3"].brain_topology_mode == "learnable_scale"
-    assert EXPERIMENTS["A_P4"].brain_prior_permuted
-    assert EXPERIMENTS["A_P0"].use_temporal_msad
-    assert EXPERIMENTS["A_P0"].use_source_prototype_memory
-    for field in (
-        "scales",
-        "fusion_mode",
-        "domain_mode",
-        "use_feature_pyramid",
-        "pyramid_gate_mode",
-        "multiview_fusion_mode",
-        "use_multiview_uncertainty",
-        "use_sign_aware_pyramid_guard",
-        "use_source_multiview_anchor",
-        "use_stable_pyramid_gate",
-        "use_temporal_msad",
-        "use_source_prototype_memory",
-        "use_relative_degradation_fusion",
-    ):
-        assert getattr(EXPERIMENTS["A_P0"], field) == getattr(
-            EXPERIMENTS["A_R2"], field
-        )
     paired_fields = (
         "ablation",
         "scales",
@@ -1255,8 +1123,6 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
         "use_temporal_msad",
         "use_source_prototype_memory",
         "use_relative_degradation_fusion",
-        "brain_topology_mode",
-        "brain_prior_permuted",
         "use_source_excess_suppression",
         "use_boundary_attractor_suppression",
         "domain_weight",
@@ -1280,11 +1146,6 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
                 EXPERIMENTS[f"B_{variant}"], field
             )
     for variant in ("R0", "R1", "R2", "R3", "R4"):
-        for field in paired_fields:
-            assert getattr(EXPERIMENTS[f"A_{variant}"], field) == getattr(
-                EXPERIMENTS[f"B_{variant}"], field
-            )
-    for variant in ("P0", "P1", "P2", "P3", "P4"):
         for field in paired_fields:
             assert getattr(EXPERIMENTS[f"A_{variant}"], field) == getattr(
                 EXPERIMENTS[f"B_{variant}"], field

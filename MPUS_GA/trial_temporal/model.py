@@ -12,7 +12,6 @@ import torch.nn.functional as F
 from MPUS_GA.layers import GRL, PositionalEncoding, SpatialStream
 
 from .data import NUM_BANDS, NUM_CHANNELS, NUM_CLASSES, scale_key
-from .topology import build_seed_topology_prior
 
 
 class EEGChannelAttention(nn.Module):
@@ -52,12 +51,8 @@ class WindowSpatialEncoder(nn.Module):
         dropout: float,
         use_channel_attention: bool = True,
         channel_attention_reduction: int = 4,
-        brain_topology_prior: torch.Tensor | None = None,
-        brain_prior_topk: int = 0,
     ) -> None:
         super().__init__()
-        if brain_prior_topk < 0:
-            raise ValueError("brain_prior_topk must be nonnegative")
         self.channel_attention = (
             EEGChannelAttention(NUM_CHANNELS, channel_attention_reduction)
             if use_channel_attention
@@ -73,33 +68,11 @@ class WindowSpatialEncoder(nn.Module):
         self.spatial_stream = SpatialStream(
             d_model, [d_model] * spatial_layers, spatial_topk
         )
-        if brain_topology_prior is not None and brain_topology_prior.shape != (
-            NUM_CHANNELS,
-            NUM_CHANNELS,
-        ):
-            raise ValueError("brain topology prior must be [channels,channels]")
-        if brain_topology_prior is not None and not torch.allclose(
-            brain_topology_prior,
-            brain_topology_prior.transpose(0, 1),
-            atol=1e-6,
-        ):
-            raise ValueError("brain topology prior must be symmetric")
-        self.register_buffer(
-            "brain_topology_prior",
-            brain_topology_prior,
-            persistent=True,
-        )
-        self.brain_prior_topk = int(brain_prior_topk)
         self.residual_norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
         self.electrode_attention = nn.Linear(d_model, 1)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        mask: torch.Tensor,
-        brain_prior_strength: torch.Tensor | float | None = None,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         if x.ndim != 4 or x.shape[2:] != (NUM_CHANNELS, NUM_BANDS):
             raise ValueError(
                 f"x must have shape [batch,time,{NUM_CHANNELS},{NUM_BANDS}]"
@@ -114,16 +87,7 @@ class WindowSpatialEncoder(nn.Module):
             valid, _ = self.channel_attention(valid)
         band_weight = self.band_gate(valid.mean(dim=1))
         base = self.input_projection(valid * (1.0 + band_weight.unsqueeze(1)))
-        spatial = self.spatial_stream(
-            base,
-            adjacency_prior=self.brain_topology_prior,
-            prior_strength=brain_prior_strength,
-            prior_topk=(
-                self.brain_prior_topk
-                if self.brain_topology_prior is not None
-                else 0
-            ),
-        )[-1]
+        spatial = self.spatial_stream(base)[-1]
         spatial = self.residual_norm(base + self.dropout(spatial))
         electrode_weight = F.softmax(self.electrode_attention(spatial), dim=1)
         window_embedding = (spatial * electrode_weight).sum(dim=1)
@@ -361,12 +325,6 @@ class MultiScaleMultiSourceDANN(nn.Module):
         "class_query",
         "class_query_low_rank",
     }
-    VALID_BRAIN_TOPOLOGY_MODES = {
-        "none",
-        "fixed",
-        "learnable_shared",
-        "learnable_scale",
-    }
     VALID_DOMAIN_MODES = {
         "scale_conditional",
         "scale_global",
@@ -417,12 +375,6 @@ class MultiScaleMultiSourceDANN(nn.Module):
         rda_memory_strength: float = 0.25,
         rda_degradation_strength: float = 1.0,
         rda_msad_strength: float = 0.25,
-        brain_topology_mode: str = "none",
-        brain_prior_initial_strength: float = 1.0,
-        brain_prior_max_strength: float = 2.0,
-        brain_prior_topk: int = 4,
-        brain_prior_local_neighbors: int = 4,
-        brain_prior_permuted: bool = False,
     ) -> None:
         super().__init__()
         self.scales = tuple(sorted(map(float, scales)))
@@ -477,18 +429,6 @@ class MultiScaleMultiSourceDANN(nn.Module):
             rda_msad_strength,
         ) < 0:
             raise ValueError("RDA strengths must be nonnegative")
-        if brain_topology_mode not in self.VALID_BRAIN_TOPOLOGY_MODES:
-            raise ValueError(
-                f"Unsupported brain topology mode: {brain_topology_mode}"
-            )
-        if brain_prior_max_strength <= 0:
-            raise ValueError("brain prior maximum strength must be positive")
-        if not 0 < brain_prior_initial_strength < brain_prior_max_strength:
-            raise ValueError(
-                "brain prior initial strength must be within (0, maximum)"
-            )
-        if brain_prior_topk < 0 or brain_prior_local_neighbors < 1:
-            raise ValueError("brain prior neighbour counts must be nonnegative")
         if multiview_source_anchor_mix > 0 and multiview_fusion_mode == "none":
             raise ValueError("a multiview source anchor requires multiview fusion")
         if multiview_fusion_mode != "none" and not use_feature_pyramid:
@@ -545,25 +485,6 @@ class MultiScaleMultiSourceDANN(nn.Module):
         self.rda_memory_strength = float(rda_memory_strength)
         self.rda_degradation_strength = float(rda_degradation_strength)
         self.rda_msad_strength = float(rda_msad_strength)
-        self.brain_topology_mode = brain_topology_mode
-        self.brain_prior_initial_strength = float(
-            brain_prior_initial_strength
-        )
-        self.brain_prior_max_strength = float(brain_prior_max_strength)
-        self.brain_prior_topk = int(brain_prior_topk)
-        self.brain_prior_local_neighbors = int(
-            brain_prior_local_neighbors
-        )
-        self.brain_prior_permuted = bool(brain_prior_permuted)
-
-        brain_topology_prior = (
-            build_seed_topology_prior(
-                local_neighbors=self.brain_prior_local_neighbors,
-                permuted=self.brain_prior_permuted,
-            )
-            if self.brain_topology_mode != "none"
-            else None
-        )
 
         self.spatial = WindowSpatialEncoder(
             d_model,
@@ -572,8 +493,6 @@ class MultiScaleMultiSourceDANN(nn.Module):
             dropout,
             use_channel_attention,
             channel_attention_reduction,
-            brain_topology_prior=brain_topology_prior,
-            brain_prior_topk=self.brain_prior_topk,
         )
         self.temporal = nn.ModuleDict(
             {
@@ -750,43 +669,6 @@ class MultiScaleMultiSourceDANN(nn.Module):
             self.rda_memory_gate_logit = nn.Parameter(
                 torch.full((num_classes,), initial_memory_gate)
             )
-
-        # P-family topology gates are constant-initialized after every R2
-        # module. They consume no random numbers, so P0-P4 retain identical
-        # shared and R2 initialization for a fixed seed.
-        self.brain_prior_strength_logit: nn.Parameter | None = None
-        initial_ratio = (
-            self.brain_prior_initial_strength
-            / self.brain_prior_max_strength
-        )
-        initial_logit = math.log(initial_ratio / (1.0 - initial_ratio))
-        if self.brain_topology_mode == "learnable_shared":
-            self.brain_prior_strength_logit = nn.Parameter(
-                torch.tensor(initial_logit)
-            )
-        elif self.brain_topology_mode == "learnable_scale":
-            self.brain_prior_strength_logit = nn.Parameter(
-                torch.full((len(self.scales),), initial_logit)
-            )
-
-    def brain_topology_strength(self) -> torch.Tensor:
-        """Return one nonnegative topology-bias strength per time scale."""
-
-        reference = self.scale_embedding
-        if self.brain_topology_mode == "none":
-            return reference.new_zeros(len(self.scales))
-        if self.brain_topology_mode == "fixed":
-            return reference.new_full(
-                (len(self.scales),), self.brain_prior_initial_strength
-            )
-        if self.brain_prior_strength_logit is None:
-            raise RuntimeError("learnable brain topology gate is unavailable")
-        strength = self.brain_prior_max_strength * torch.sigmoid(
-            self.brain_prior_strength_logit
-        )
-        if strength.ndim == 0:
-            strength = strength.expand(len(self.scales))
-        return strength
 
     def _retrieve_source_prototypes(
         self,
@@ -1449,17 +1331,8 @@ class MultiScaleMultiSourceDANN(nn.Module):
 
         pooled = []
         encoded_sequences = []
-        brain_prior_strength = self.brain_topology_strength()
-        for scale_index, key in enumerate(self.scale_keys):
-            sequence = self.spatial(
-                x_by_scale[key],
-                mask_by_scale[key],
-                brain_prior_strength=(
-                    brain_prior_strength[scale_index]
-                    if self.brain_topology_mode != "none"
-                    else None
-                ),
-            )
+        for key in self.scale_keys:
+            sequence = self.spatial(x_by_scale[key], mask_by_scale[key])
             encoded = self.temporal[key].encode_sequence(
                 sequence, mask_by_scale[key]
             )
@@ -1630,7 +1503,6 @@ class MultiScaleMultiSourceDANN(nn.Module):
                 "rda_memory_scale_weight"
             ],
             "rda_memory_gate": fusion["rda_memory_gate"],
-            "brain_topology_strength": brain_prior_strength,
             "scale_class_relation_residual": self.scale_class_relation_residual,
             "scale_domain_logits": scale_domain_logits,
             "fused_domain_logits": fused_domain_logits,
