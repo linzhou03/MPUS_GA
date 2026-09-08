@@ -424,10 +424,13 @@ class MultiScaleMultiSourceDANN(nn.Module):
         use_physiology_reliability: bool = False,
         physiology_reliability_hidden: int = 16,
         use_class_scale_reliability_fusion: bool = False,
+        use_guarded_class_scale_reliability_fusion: bool = False,
         class_scale_fusion_strength: float = 0.50,
         class_scale_entropy_strength: float = 0.50,
         class_scale_conflict_strength: float = 1.00,
         class_scale_reliability_floor: float = 0.25,
+        class_scale_guard_max_log_adjustment: float = 0.25,
+        class_scale_guard_consensus_floor: float = 0.25,
     ) -> None:
         super().__init__()
         self.scales = tuple(sorted(map(float, scales)))
@@ -500,6 +503,15 @@ class MultiScaleMultiSourceDANN(nn.Module):
             raise ValueError("class-scale reliability strengths must be nonnegative")
         if not 0 < class_scale_reliability_floor <= 1:
             raise ValueError("class-scale reliability floor must be within (0,1]")
+        if class_scale_guard_max_log_adjustment <= 0:
+            raise ValueError("class-scale guard adjustment must be positive")
+        if not 0 <= class_scale_guard_consensus_floor < 1:
+            raise ValueError("class-scale guard consensus floor must be in [0,1)")
+        if (
+            use_class_scale_reliability_fusion
+            and use_guarded_class_scale_reliability_fusion
+        ):
+            raise ValueError("standard and guarded reliability modes are exclusive")
         if multiview_source_anchor_mix > 0 and multiview_fusion_mode == "none":
             raise ValueError("a multiview source anchor requires multiview fusion")
         if multiview_fusion_mode != "none" and not use_feature_pyramid:
@@ -568,6 +580,9 @@ class MultiScaleMultiSourceDANN(nn.Module):
         self.use_class_scale_reliability_fusion = bool(
             use_class_scale_reliability_fusion
         )
+        self.use_guarded_class_scale_reliability_fusion = bool(
+            use_guarded_class_scale_reliability_fusion
+        )
         self.class_scale_fusion_strength = float(class_scale_fusion_strength)
         self.class_scale_entropy_strength = float(
             class_scale_entropy_strength
@@ -577,6 +592,12 @@ class MultiScaleMultiSourceDANN(nn.Module):
         )
         self.class_scale_reliability_floor = float(
             class_scale_reliability_floor
+        )
+        self.class_scale_guard_max_log_adjustment = float(
+            class_scale_guard_max_log_adjustment
+        )
+        self.class_scale_guard_consensus_floor = float(
+            class_scale_guard_consensus_floor
         )
 
         self.spatial = WindowSpatialEncoder(
@@ -1113,6 +1134,7 @@ class MultiScaleMultiSourceDANN(nn.Module):
         source_memory_distance: torch.Tensor | None = None,
         source_memory_valid: torch.Tensor | None = None,
         class_scale_reliability_ramp: float = 1.0,
+        guarded_scale_class_reliability: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         batch, scale_count, _ = scale_logits.shape
         if not 0 <= pyramid_gate_ramp <= 1:
@@ -1122,7 +1144,16 @@ class MultiScaleMultiSourceDANN(nn.Module):
         sample_scale_class_reliability = scale_logits.new_ones(
             (batch, scale_count, self.num_classes)
         )
-        if self.use_class_scale_reliability_fusion and scale_count > 1:
+        guarded_reliability_activation = scale_logits.new_zeros(
+            (batch, self.num_classes)
+        )
+        guarded_log_adjustment = scale_logits.new_zeros(
+            (batch, scale_count, self.num_classes)
+        )
+        if (
+            self.use_class_scale_reliability_fusion
+            or self.use_guarded_class_scale_reliability_fusion
+        ) and scale_count > 1:
             independent_probability = F.softmax(scale_logits.detach(), dim=-1)
             normalized_entropy = -(
                 independent_probability
@@ -1135,10 +1166,71 @@ class MultiScaleMultiSourceDANN(nn.Module):
                 * normalized_entropy.unsqueeze(-1)
                 -self.class_scale_conflict_strength * class_conflict
             )
-            sample_scale_class_reliability = (
-                self.class_scale_reliability_floor
-                + (1.0 - self.class_scale_reliability_floor) * raw_reliability
-            )
+            if self.use_class_scale_reliability_fusion:
+                sample_scale_class_reliability = (
+                    self.class_scale_reliability_floor
+                    + (1.0 - self.class_scale_reliability_floor)
+                    * raw_reliability
+                )
+            else:
+                sample_distribution = raw_reliability / raw_reliability.sum(
+                    dim=1, keepdim=True
+                ).clamp_min(1e-8)
+                if guarded_scale_class_reliability is None:
+                    source_distribution = torch.full(
+                        (scale_count, self.num_classes),
+                        1.0 / scale_count,
+                        device=scale_logits.device,
+                        dtype=scale_logits.dtype,
+                    )
+                else:
+                    source_distribution = guarded_scale_class_reliability.to(
+                        scale_logits
+                    )
+                    if source_distribution.shape != (
+                        scale_count,
+                        self.num_classes,
+                    ):
+                        raise ValueError(
+                            "guarded_scale_class_reliability must be "
+                            "[scales, classes]"
+                        )
+                    source_distribution = (
+                        source_distribution.clamp_min(1e-8)
+                        / source_distribution.sum(
+                            dim=0, keepdim=True
+                        ).clamp_min(1e-8)
+                    )
+                joint_distribution = torch.sqrt(
+                    sample_distribution
+                    * source_distribution.unsqueeze(0)
+                )
+                joint_distribution = joint_distribution / joint_distribution.sum(
+                    dim=1, keepdim=True
+                ).clamp_min(1e-8)
+                sample_scale_class_reliability = (
+                    joint_distribution * scale_count
+                )
+                guarded_log_adjustment = torch.log(
+                    sample_scale_class_reliability.clamp_min(1e-8)
+                ).clamp(
+                    -self.class_scale_guard_max_log_adjustment,
+                    self.class_scale_guard_max_log_adjustment,
+                )
+                consensus_probability = mean_probability.squeeze(1)
+                consensus_entropy = -(
+                    consensus_probability
+                    * torch.log(consensus_probability.clamp_min(1e-8))
+                ).sum(dim=-1) / math.log(self.num_classes)
+                consensus_certainty = (1.0 - consensus_entropy).clamp(0.0, 1.0)
+                evidence_gate = (
+                    consensus_certainty - self.class_scale_guard_consensus_floor
+                ).clamp_min(0.0) / (
+                    1.0 - self.class_scale_guard_consensus_floor
+                )
+                guarded_reliability_activation = (
+                    evidence_gate.unsqueeze(-1) * consensus_probability
+                )
         if scale_count == 1:
             class_weight = scale_logits.new_full(
                 (batch, scale_count, self.num_classes), 1.0 / scale_count
@@ -1180,6 +1272,10 @@ class MultiScaleMultiSourceDANN(nn.Module):
                 "sample_scale_class_reliability": (
                     sample_scale_class_reliability
                 ),
+                "guarded_reliability_activation": (
+                    guarded_reliability_activation
+                ),
+                "guarded_scale_class_log_adjustment": guarded_log_adjustment,
             }
         if self.fusion_mode == "uniform":
             class_weight = scale_logits.new_full(
@@ -1211,6 +1307,13 @@ class MultiScaleMultiSourceDANN(nn.Module):
                     self.class_scale_fusion_strength
                     * float(class_scale_reliability_ramp)
                     * torch.log(sample_scale_class_reliability.clamp_min(1e-6))
+                )
+            elif self.use_guarded_class_scale_reliability_fusion:
+                gate_logits = gate_logits + (
+                    self.class_scale_fusion_strength
+                    * float(class_scale_reliability_ramp)
+                    * guarded_reliability_activation.unsqueeze(1)
+                    * guarded_log_adjustment
                 )
             class_weight = F.softmax(gate_logits, dim=1)
         pyramid_class_weight = class_weight
@@ -1267,6 +1370,10 @@ class MultiScaleMultiSourceDANN(nn.Module):
                 "sample_scale_class_reliability": (
                     sample_scale_class_reliability
                 ),
+                "guarded_reliability_activation": (
+                    guarded_reliability_activation
+                ),
+                "guarded_scale_class_log_adjustment": guarded_log_adjustment,
             }
 
         projected_levels = torch.stack(
@@ -1464,6 +1571,8 @@ class MultiScaleMultiSourceDANN(nn.Module):
             "sample_scale_class_reliability": (
                 sample_scale_class_reliability
             ),
+            "guarded_reliability_activation": guarded_reliability_activation,
+            "guarded_scale_class_log_adjustment": guarded_log_adjustment,
         }
 
     @staticmethod
@@ -1492,6 +1601,7 @@ class MultiScaleMultiSourceDANN(nn.Module):
         source_prototype_initialized: torch.Tensor | None = None,
         physiology_by_scale: Mapping[str, torch.Tensor] | None = None,
         class_scale_reliability_ramp: float = 1.0,
+        guarded_scale_class_reliability: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | None]:
         if tuple(x_by_scale) != self.scale_keys:
             raise ValueError(
@@ -1629,6 +1739,9 @@ class MultiScaleMultiSourceDANN(nn.Module):
                 else None
             ),
             class_scale_reliability_ramp=class_scale_reliability_ramp,
+            guarded_scale_class_reliability=(
+                guarded_scale_class_reliability
+            ),
         )
         logits = fusion["logits"]
         embedding = fusion["embedding"]
@@ -1730,6 +1843,12 @@ class MultiScaleMultiSourceDANN(nn.Module):
             "physiology_probability": physiology_probability,
             "sample_scale_class_reliability": fusion[
                 "sample_scale_class_reliability"
+            ],
+            "guarded_reliability_activation": fusion[
+                "guarded_reliability_activation"
+            ],
+            "guarded_scale_class_log_adjustment": fusion[
+                "guarded_scale_class_log_adjustment"
             ],
             "scale_class_relation_residual": self.scale_class_relation_residual,
             "scale_domain_logits": scale_domain_logits,

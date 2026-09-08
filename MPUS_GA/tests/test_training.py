@@ -125,6 +125,61 @@ def test_class_scale_reliability_fusion_prefers_certain_scale() -> None:
     assert torch.all((reliability >= 0.1) & (reliability <= 1.0))
 
 
+def test_guarded_reliability_is_source_calibrated_bounded_and_confident() -> None:
+    model = _small_model(
+        scales=(1.0, 2.0),
+        num_domains=2,
+        use_guarded_class_scale_reliability_fusion=True,
+        class_scale_fusion_strength=1.0,
+        class_scale_entropy_strength=2.0,
+        class_scale_conflict_strength=0.0,
+        class_scale_guard_max_log_adjustment=0.2,
+        class_scale_guard_consensus_floor=0.0,
+    )
+    for parameter in model.class_scale_gate.parameters():
+        torch.nn.init.zeros_(parameter)
+    embeddings = torch.zeros(1, 2, 32)
+    logits = torch.tensor([[[5.0, -2.0, -2.0], [1.0, 0.0, 0.0]]])
+    source_reliability = torch.tensor([[0.9, 0.5, 0.5], [0.1, 0.5, 0.5]])
+    inactive = model._fuse(
+        embeddings,
+        logits,
+        None,
+        class_scale_reliability_ramp=0.0,
+        guarded_scale_class_reliability=source_reliability,
+    )
+    active = model._fuse(
+        embeddings,
+        logits,
+        None,
+        class_scale_reliability_ramp=1.0,
+        guarded_scale_class_reliability=source_reliability,
+    )
+    torch.testing.assert_close(
+        inactive["scale_class_weight"], torch.full((1, 2, 3), 0.5)
+    )
+    assert active["scale_class_weight"][0, 0, 0] > 0.5
+    assert active["scale_class_weight"][0, 0, 0] < 0.56
+    assert active["guarded_reliability_activation"][0, 0] > 0
+    assert torch.all(
+        active["guarded_scale_class_log_adjustment"].abs() <= 0.2
+    )
+
+    uncertain = model._fuse(
+        embeddings,
+        torch.zeros_like(logits),
+        None,
+        class_scale_reliability_ramp=1.0,
+        guarded_scale_class_reliability=source_reliability,
+    )
+    torch.testing.assert_close(
+        uncertain["guarded_reliability_activation"], torch.zeros(1, 3)
+    )
+    torch.testing.assert_close(
+        uncertain["scale_class_weight"], torch.full((1, 2, 3), 0.5)
+    )
+
+
 def test_balanced_multiscale_mixup_preserves_class_and_scale_pairing() -> None:
     torch.manual_seed(7)
     labels = torch.tensor([0, 0, 1, 1, 2, 2])
@@ -1181,6 +1236,12 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
         "B_D2",
         "A_D3",
         "B_D3",
+        "A",
+        "B",
+        "C",
+        "D",
+        "E",
+        "F",
     )
     assert set(EXPERIMENTS) == set(EXPERIMENT_ORDER)
     assert EXPERIMENTS["A0"].scales == (1.0,)
@@ -1239,6 +1300,26 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
     assert EXPERIMENTS["A_D1"].use_balanced_multiscale_mixup
     assert EXPERIMENTS["A_D2"].use_class_scale_adaptive_augmentation
     assert EXPERIMENTS["A_D3"].use_class_scale_reliability_fusion
+    final_directions = {
+        "A": (("seed_vii",), "seed_v", 16, 45),
+        "B": (("seed_v",), "seed_vii", 20, 80),
+        "C": (("seed_iv",), "seed_v", 16, 45),
+        "D": (("seed_v",), "seed_iv", 15, 72),
+        "E": (("seed_iv",), "seed_vii", 20, 80),
+        "F": (("seed_vii",), "seed_iv", 15, 72),
+    }
+    for name, expected in final_directions.items():
+        source, target, subjects, trials = expected
+        spec = EXPERIMENTS[name]
+        assert spec.ablation == "final"
+        assert spec.source_domains == source
+        assert spec.target_dataset == target
+        assert spec.target_subject_count == subjects
+        assert spec.target_trials == trials
+        assert spec.use_balanced_multiscale_mixup
+        assert spec.use_class_scale_adaptive_augmentation
+        assert spec.use_guarded_class_scale_reliability_fusion
+        assert not spec.use_class_scale_reliability_fusion
     paired_fields = (
         "ablation",
         "scales",
@@ -1263,6 +1344,7 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
         "use_balanced_multiscale_mixup",
         "use_class_scale_adaptive_augmentation",
         "use_class_scale_reliability_fusion",
+        "use_guarded_class_scale_reliability_fusion",
         "use_source_excess_suppression",
         "use_boundary_attractor_suppression",
         "domain_weight",

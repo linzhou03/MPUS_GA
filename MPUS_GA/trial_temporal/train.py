@@ -80,6 +80,7 @@ class ExperimentSpec:
     use_balanced_multiscale_mixup: bool = False
     use_class_scale_adaptive_augmentation: bool = False
     use_class_scale_reliability_fusion: bool = False
+    use_guarded_class_scale_reliability_fusion: bool = False
     use_source_excess_suppression: bool = True
     use_boundary_attractor_suppression: bool = True
     target_dataset: str = "seed_v"
@@ -168,6 +169,39 @@ _TRANSFER_DIRECTIONS = {
         "target_dataset": "seed_vii",
         "target_subject_count": 20,
         "target_trials": 80,
+    },
+}
+
+_FINAL_TRANSFER_DIRECTIONS = {
+    "A": _TRANSFER_DIRECTIONS["A"],
+    "B": _TRANSFER_DIRECTIONS["B"],
+    "C": {
+        "description": "SEED-IV to SEED-V",
+        "source_domains": ("seed_iv",),
+        "target_dataset": "seed_v",
+        "target_subject_count": 16,
+        "target_trials": 45,
+    },
+    "D": {
+        "description": "SEED-V to SEED-IV",
+        "source_domains": ("seed_v",),
+        "target_dataset": "seed_iv",
+        "target_subject_count": 15,
+        "target_trials": 72,
+    },
+    "E": {
+        "description": "SEED-IV to SEED-VII",
+        "source_domains": ("seed_iv",),
+        "target_dataset": "seed_vii",
+        "target_subject_count": 20,
+        "target_trials": 80,
+    },
+    "F": {
+        "description": "SEED-VII to SEED-IV",
+        "source_domains": ("seed_vii",),
+        "target_dataset": "seed_iv",
+        "target_subject_count": 15,
+        "target_trials": 72,
     },
 }
 
@@ -296,6 +330,7 @@ D_EXPERIMENT_ORDER = tuple(
     for variant in range(4)
     for direction in "AB"
 )
+FINAL_EXPERIMENT_ORDER = tuple(_FINAL_TRANSFER_DIRECTIONS)
 EXPERIMENT_ORDER = (
     LEGACY_EXPERIMENT_ORDER
     + G_EXPERIMENT_ORDER
@@ -303,6 +338,7 @@ EXPERIMENT_ORDER = (
     + R_EXPERIMENT_ORDER
     + N_EXPERIMENT_ORDER
     + D_EXPERIMENT_ORDER
+    + FINAL_EXPERIMENT_ORDER
 )
 
 
@@ -529,6 +565,39 @@ def _build_experiments() -> dict[str, ExperimentSpec]:
             ),
             ablation="D3",
             use_class_scale_reliability_fusion=True,
+        )
+    for direction, transfer in _FINAL_TRANSFER_DIRECTIONS.items():
+        experiments[direction] = ExperimentSpec(
+            name=direction,
+            description=(
+                f"{transfer['description']}; final source-calibrated guarded "
+                "class-balanced multiscale adaptation"
+            ),
+            transfer_direction=direction,
+            ablation="final",
+            source_domains=transfer["source_domains"],
+            scales=(1.0, 2.0, 4.0),
+            fusion_mode="class_conditional",
+            domain_mode="scale_conditional",
+            use_prototypes=True,
+            use_feature_pyramid=True,
+            pyramid_gate_mode="sample_class",
+            use_pyramid_gate_warmup=True,
+            multiview_fusion_mode="class_query_low_rank",
+            use_multiview_uncertainty=True,
+            use_sign_aware_pyramid_guard=True,
+            use_source_multiview_anchor=True,
+            use_stable_pyramid_gate=True,
+            use_temporal_msad=True,
+            use_source_prototype_memory=True,
+            use_balanced_multiscale_mixup=True,
+            use_class_scale_adaptive_augmentation=True,
+            use_guarded_class_scale_reliability_fusion=True,
+            use_source_excess_suppression=True,
+            use_boundary_attractor_suppression=True,
+            target_dataset=transfer["target_dataset"],
+            target_subject_count=transfer["target_subject_count"],
+            target_trials=transfer["target_trials"],
         )
     return experiments
 
@@ -1996,6 +2065,11 @@ def train_step(
         if spec.use_class_scale_reliability_fusion
         else prototype_reliability
     )
+    guarded_reliability = (
+        competence_reliability
+        if spec.use_guarded_class_scale_reliability_fusion
+        else None
+    )
     base_source_multiview_anchor = (
         prototype_bank.source_relation_weights().mean(dim=0)
         if prototype_bank is not None
@@ -2086,6 +2160,7 @@ def train_step(
                 ),
                 physiology_by_scale=physiology,
                 class_scale_reliability_ramp=0.0,
+                guarded_scale_class_reliability=guarded_reliability,
             )
         )
     target_x, target_mask = _batch_to_device(target_batch, device)
@@ -2111,8 +2186,14 @@ def train_step(
         ),
         physiology_by_scale=target_physiology,
         class_scale_reliability_ramp=(
-            ramp if spec.use_class_scale_reliability_fusion else 0.0
+            ramp
+            if (
+                spec.use_class_scale_reliability_fusion
+                or spec.use_guarded_class_scale_reliability_fusion
+            )
+            else 0.0
         ),
+        guarded_scale_class_reliability=guarded_reliability,
     )
 
     mixup_active = (
@@ -2158,6 +2239,7 @@ def train_step(
                     else None
                 ),
                 class_scale_reliability_ramp=0.0,
+                guarded_scale_class_reliability=guarded_reliability,
             )
         )
 
@@ -2511,6 +2593,12 @@ def train_step(
     mean_sample_scale_class_reliability = target_output[
         "sample_scale_class_reliability"
     ].detach().mean(dim=0)
+    mean_guarded_reliability_activation = target_output[
+        "guarded_reliability_activation"
+    ].detach().mean(dim=0)
+    mean_guarded_log_adjustment = target_output[
+        "guarded_scale_class_log_adjustment"
+    ].detach().abs().mean(dim=0)
     active_mixup_rows = sum(
         int((view.sample_weight > 0).sum())
         for view in augmented_views
@@ -2599,6 +2687,12 @@ def train_step(
         "mean_target_scale_class_gate": mean_gate.cpu().tolist(),
         "mean_target_sample_scale_class_reliability": (
             mean_sample_scale_class_reliability.cpu().tolist()
+        ),
+        "mean_target_guarded_reliability_activation": (
+            mean_guarded_reliability_activation.cpu().tolist()
+        ),
+        "mean_target_guarded_abs_log_adjustment": (
+            mean_guarded_log_adjustment.cpu().tolist()
         ),
         "source_real_class_scale_competence": (
             class_scale_competence.value.cpu().tolist()
@@ -2849,6 +2943,8 @@ def evaluate_trials(
     rda_memory_scale_weights = []
     rda_memory_gates = []
     sample_scale_class_reliabilities = []
+    guarded_reliability_activations = []
+    guarded_log_adjustments = []
     labels = []
     prototype_reliability = (
         prototype_bank.scale_class_reliability()
@@ -2866,6 +2962,11 @@ def evaluate_trials(
         )
         if model.use_class_scale_reliability_fusion
         else prototype_reliability
+    )
+    guarded_reliability = (
+        competence_reliability
+        if model.use_guarded_class_scale_reliability_fusion
+        else None
     )
     base_source_multiview_anchor = (
         prototype_bank.source_relation_weights().mean(dim=0)
@@ -2973,8 +3074,14 @@ def evaluate_trials(
                     else None
                 ),
                 class_scale_reliability_ramp=(
-                    1.0 if model.use_class_scale_reliability_fusion else 0.0
+                    1.0
+                    if (
+                        model.use_class_scale_reliability_fusion
+                        or model.use_guarded_class_scale_reliability_fusion
+                    )
+                    else 0.0
                 ),
+                guarded_scale_class_reliability=guarded_reliability,
                 **physiology_arguments,
             )
             probabilities.append(output["probability"].cpu().numpy())
@@ -3034,6 +3141,12 @@ def evaluate_trials(
             sample_scale_class_reliabilities.append(
                 output["sample_scale_class_reliability"].cpu().numpy()
             )
+            guarded_reliability_activations.append(
+                output["guarded_reliability_activation"].cpu().numpy()
+            )
+            guarded_log_adjustments.append(
+                output["guarded_scale_class_log_adjustment"].cpu().numpy()
+            )
             labels.append(batch["y"].numpy())
     labels_array = np.concatenate(labels)
     probability_array = np.concatenate(probabilities)
@@ -3068,6 +3181,12 @@ def evaluate_trials(
     rda_memory_gate_array = np.concatenate(rda_memory_gates)
     sample_scale_class_reliability_array = np.concatenate(
         sample_scale_class_reliabilities
+    )
+    guarded_reliability_activation_array = np.concatenate(
+        guarded_reliability_activations
+    )
+    guarded_log_adjustment_array = np.concatenate(
+        guarded_log_adjustments
     )
     multiview_token_names = list(model.scale_keys)
     if model.multiview_fusion_mode == "class_query_low_rank":
@@ -3140,6 +3259,12 @@ def evaluate_trials(
         "mean_rda_memory_gate": rda_memory_gate_array.mean(axis=0).tolist(),
         "mean_sample_scale_class_reliability": (
             sample_scale_class_reliability_array.mean(axis=0).tolist()
+        ),
+        "mean_guarded_reliability_activation": (
+            guarded_reliability_activation_array.mean(axis=0).tolist()
+        ),
+        "mean_guarded_abs_log_adjustment": (
+            np.abs(guarded_log_adjustment_array).mean(axis=0).tolist()
         ),
         "source_real_class_scale_competence": (
             class_scale_competence.value.cpu().tolist()
@@ -3444,10 +3569,19 @@ def run_fold(
         use_class_scale_reliability_fusion=(
             spec.use_class_scale_reliability_fusion
         ),
+        use_guarded_class_scale_reliability_fusion=(
+            spec.use_guarded_class_scale_reliability_fusion
+        ),
         class_scale_fusion_strength=args.class_scale_fusion_strength,
         class_scale_entropy_strength=args.class_scale_entropy_strength,
         class_scale_conflict_strength=args.class_scale_conflict_strength,
         class_scale_reliability_floor=args.class_scale_reliability_floor,
+        class_scale_guard_max_log_adjustment=(
+            args.class_scale_guard_max_log_adjustment
+        ),
+        class_scale_guard_consensus_floor=(
+            args.class_scale_guard_consensus_floor
+        ),
     ).to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     optimizer = torch.optim.AdamW(
@@ -3508,6 +3642,7 @@ def run_fold(
     if (
         spec.use_class_scale_adaptive_augmentation
         or spec.use_class_scale_reliability_fusion
+        or spec.use_guarded_class_scale_reliability_fusion
     ):
         class_scale_competence = ClassScaleCompetenceEMA(
             len(spec.scales),
@@ -3770,6 +3905,9 @@ def run_fold(
             "use_class_scale_reliability_fusion": (
                 spec.use_class_scale_reliability_fusion
             ),
+            "use_guarded_class_scale_reliability_fusion": (
+                spec.use_guarded_class_scale_reliability_fusion
+            ),
             "class_scale_fusion_strength": args.class_scale_fusion_strength,
             "class_scale_entropy_strength": (
                 args.class_scale_entropy_strength
@@ -3779,6 +3917,12 @@ def run_fold(
             ),
             "class_scale_reliability_floor": (
                 args.class_scale_reliability_floor
+            ),
+            "class_scale_guard_max_log_adjustment": (
+                args.class_scale_guard_max_log_adjustment
+            ),
+            "class_scale_guard_consensus_floor": (
+                args.class_scale_guard_consensus_floor
             ),
             "channel_attention": True,
             "d_model": args.d_model,
@@ -4161,6 +4305,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--class-scale-reliability-floor", type=float, default=0.25
     )
     parser.add_argument(
+        "--class-scale-guard-max-log-adjustment", type=float, default=0.25
+    )
+    parser.add_argument(
+        "--class-scale-guard-consensus-floor", type=float, default=0.25
+    )
+    parser.add_argument(
         "--pyramid-gate-supervision-weight", type=float, default=0.05
     )
     parser.add_argument(
@@ -4349,6 +4499,12 @@ def validate_args(args, spec: ExperimentSpec) -> None:
         raise ValueError("class-scale fusion strengths must be nonnegative")
     if not 0 < args.class_scale_reliability_floor <= 1:
         raise ValueError("class-scale-reliability-floor must be within (0,1]")
+    if args.class_scale_guard_max_log_adjustment <= 0:
+        raise ValueError("class-scale-guard-max-log-adjustment must be positive")
+    if not 0 <= args.class_scale_guard_consensus_floor < 1:
+        raise ValueError(
+            "class-scale-guard-consensus-floor must be within [0,1)"
+        )
     if (
         spec.use_class_scale_adaptive_augmentation
         and not spec.use_balanced_multiscale_mixup
@@ -4359,6 +4515,11 @@ def validate_args(args, spec: ExperimentSpec) -> None:
         and not spec.use_class_scale_adaptive_augmentation
     ):
         raise ValueError("Class-scale reliability fusion requires D2 augmentation")
+    if (
+        spec.use_guarded_class_scale_reliability_fusion
+        and not spec.use_class_scale_adaptive_augmentation
+    ):
+        raise ValueError("Guarded reliability fusion requires adaptive augmentation")
     if args.pyramid_gate_teacher_temperature <= 0:
         raise ValueError("pyramid gate teacher temperature must be positive")
     if args.prior_correction_strength < 0:
