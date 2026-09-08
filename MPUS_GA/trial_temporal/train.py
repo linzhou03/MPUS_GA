@@ -7,7 +7,7 @@ import csv
 import json
 import math
 import random
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +24,7 @@ from tqdm.auto import tqdm
 
 from MPUS_GA.protocols import FIXED_UDA_PROTOCOL
 
+from .anatomical_prior import physiology_metadata
 from .data import (
     NUM_CLASSES,
     PreparedMultiSource,
@@ -73,6 +74,12 @@ class ExperimentSpec:
     use_temporal_msad: bool = False
     use_source_prototype_memory: bool = False
     use_relative_degradation_fusion: bool = False
+    use_anatomical_regions: bool = False
+    use_physiology_prior: bool = False
+    use_physiology_reliability: bool = False
+    use_balanced_multiscale_mixup: bool = False
+    use_class_scale_adaptive_augmentation: bool = False
+    use_class_scale_reliability_fusion: bool = False
     use_source_excess_suppression: bool = True
     use_boundary_attractor_suppression: bool = True
     target_dataset: str = "seed_v"
@@ -279,11 +286,23 @@ R_EXPERIMENT_ORDER = tuple(
     for variant in _R_DEFINITIONS
     for direction in "AB"
 )
+N_EXPERIMENT_ORDER = tuple(
+    f"{direction}_{variant}"
+    for variant in ("N1", "N2", "N3")
+    for direction in "AB"
+)
+D_EXPERIMENT_ORDER = tuple(
+    f"{direction}_D{variant}"
+    for variant in range(4)
+    for direction in "AB"
+)
 EXPERIMENT_ORDER = (
     LEGACY_EXPERIMENT_ORDER
     + G_EXPERIMENT_ORDER
     + H_EXPERIMENT_ORDER
     + R_EXPERIMENT_ORDER
+    + N_EXPERIMENT_ORDER
+    + D_EXPERIMENT_ORDER
 )
 
 
@@ -440,6 +459,77 @@ def _build_experiments() -> dict[str, ExperimentSpec]:
                 target_subject_count=transfer["target_subject_count"],
                 target_trials=transfer["target_trials"],
             )
+    for direction in "AB":
+        baseline = experiments[f"{direction}_R2"]
+        experiments[f"{direction}_N1"] = replace(
+            baseline,
+            name=f"{direction}_N1",
+            description=(
+                f"{_TRANSFER_DIRECTIONS[direction]['description']}; R2 with "
+                "fixed exhaustive anatomical region-balanced aggregation"
+            ),
+            ablation="N1",
+            use_anatomical_regions=True,
+        )
+        experiments[f"{direction}_N2"] = replace(
+            experiments[f"{direction}_N1"],
+            name=f"{direction}_N2",
+            description=(
+                f"{_TRANSFER_DIRECTIONS[direction]['description']}; N1 with "
+                "source-standardised continuous raw-DE physiology descriptors"
+            ),
+            ablation="N2",
+            use_physiology_prior=True,
+        )
+        experiments[f"{direction}_N3"] = replace(
+            baseline,
+            name=f"{direction}_N3",
+            description=(
+                f"{_TRANSFER_DIRECTIONS[direction]['description']}; R2 with "
+                "subject-robust compact physiology pseudo-label reliability"
+            ),
+            ablation="N3",
+            use_physiology_reliability=True,
+        )
+        experiments[f"{direction}_D0"] = replace(
+            baseline,
+            name=f"{direction}_D0",
+            description=(
+                f"{_TRANSFER_DIRECTIONS[direction]['description']}; exact R2 "
+                "control for class-balanced multiscale augmentation"
+            ),
+            ablation="D0",
+        )
+        experiments[f"{direction}_D1"] = replace(
+            experiments[f"{direction}_D0"],
+            name=f"{direction}_D1",
+            description=(
+                f"{_TRANSFER_DIRECTIONS[direction]['description']}; R2 with "
+                "class-balanced cross-subject scale-synchronous MixUp"
+            ),
+            ablation="D1",
+            use_balanced_multiscale_mixup=True,
+        )
+        experiments[f"{direction}_D2"] = replace(
+            experiments[f"{direction}_D1"],
+            name=f"{direction}_D2",
+            description=(
+                f"{_TRANSFER_DIRECTIONS[direction]['description']}; D1 with "
+                "source-real class-by-scale competence weighting"
+            ),
+            ablation="D2",
+            use_class_scale_adaptive_augmentation=True,
+        )
+        experiments[f"{direction}_D3"] = replace(
+            experiments[f"{direction}_D2"],
+            name=f"{direction}_D3",
+            description=(
+                f"{_TRANSFER_DIRECTIONS[direction]['description']}; D2 with "
+                "target uncertainty-aware class-scale reliability fusion"
+            ),
+            ablation="D3",
+            use_class_scale_reliability_fusion=True,
+        )
     return experiments
 
 
@@ -555,6 +645,17 @@ def _batch_to_device(batch: dict, device: torch.device) -> tuple[dict, dict]:
     )
 
 
+def _batch_physiology_to_device(
+    batch: dict, device: torch.device
+) -> dict[str, torch.Tensor] | None:
+    if "physiology" not in batch:
+        return None
+    return {
+        key: value.to(device, non_blocking=True)
+        for key, value in batch["physiology"].items()
+    }
+
+
 def _natural_source_class_priors(
     prepared: PreparedMultiSource, device: torch.device
 ) -> torch.Tensor:
@@ -656,6 +757,261 @@ def independent_scale_consensus(
         vote_count=vote_count,
         js_divergence=js_divergence,
     )
+
+
+def physiology_pseudo_label_reliability(
+    eeg_probability: torch.Tensor,
+    physiology_probability: torch.Tensor,
+    temperature: float = 0.15,
+    floor: float = 0.50,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Bounded agreement weight; physiology cannot create or relabel a target."""
+
+    if eeg_probability.ndim != 2 or physiology_probability.shape != (
+        eeg_probability.shape
+    ):
+        raise ValueError("EEG and physiology probabilities must be [batch,classes]")
+    if temperature <= 0:
+        raise ValueError("physiology reliability temperature must be positive")
+    if not 0 <= floor <= 1:
+        raise ValueError("physiology reliability floor must be within [0,1]")
+    eeg = eeg_probability.detach().clamp_min(1e-8)
+    physiology = physiology_probability.detach().clamp_min(1e-8)
+    midpoint = 0.5 * (eeg + physiology)
+    js_divergence = 0.5 * (
+        (eeg * (torch.log(eeg) - torch.log(midpoint))).sum(dim=-1)
+        + (
+            physiology
+            * (torch.log(physiology) - torch.log(midpoint))
+        ).sum(dim=-1)
+    )
+    agreement = torch.exp(-js_divergence / temperature)
+    return floor + (1.0 - floor) * agreement, js_divergence
+
+
+@dataclass(frozen=True)
+class BalancedMultiscaleMixup:
+    """One label-preserving augmented trial triplet for every source row."""
+
+    features: dict[str, torch.Tensor]
+    masks: dict[str, torch.Tensor]
+    labels: torch.Tensor
+    sample_weight: torch.Tensor
+    partner_index: torch.Tensor
+    mixing_coefficient: torch.Tensor
+
+
+@torch.no_grad()
+def _same_class_cross_subject_partners(
+    labels: torch.Tensor,
+    subjects: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Choose same-class partners, preferring another source subject."""
+
+    if labels.ndim != 1 or subjects.shape != labels.shape:
+        raise ValueError("MixUp labels and subjects must be one-dimensional")
+    partner = torch.arange(len(labels), device=labels.device)
+    valid = torch.zeros(len(labels), dtype=torch.bool, device=labels.device)
+    for class_index in range(NUM_CLASSES):
+        rows = torch.nonzero(labels == class_index, as_tuple=False).flatten()
+        for row in rows:
+            candidates = rows[subjects[rows] != subjects[row]]
+            if not len(candidates):
+                candidates = rows[rows != row]
+            if len(candidates):
+                choice = torch.randint(
+                    len(candidates), (1,), device=labels.device
+                )
+                partner[row] = candidates[choice]
+                valid[row] = True
+    return partner, valid
+
+
+@torch.no_grad()
+def balanced_multiscale_mixup(
+    batch: dict,
+    device: torch.device,
+    natural_class_prior: torch.Tensor,
+    beta_alpha: float,
+    rarity_power: float,
+) -> BalancedMultiscaleMixup:
+    """Generate a synchronized 1/2/4-second minority-class source view.
+
+    A row uses one same-class partner and one mixing coefficient at every
+    temporal scale. Partner sequences are linearly resampled to the anchor
+    trial length before mixing, so masks and physical trial coverage remain
+    aligned even when clips contain different numbers of windows.
+    """
+
+    if beta_alpha <= 0 or rarity_power <= 0:
+        raise ValueError("MixUp beta alpha and rarity power must be positive")
+    features, masks = _batch_to_device(batch, device)
+    labels = batch["y"].to(device, non_blocking=True)
+    subjects = batch["subject_id"].to(device, non_blocking=True)
+    prior = natural_class_prior.to(device=device, dtype=torch.float32)
+    if prior.shape != (NUM_CLASSES,) or torch.any(prior <= 0):
+        raise ValueError("Natural source class prior must be positive [classes]")
+
+    partner, has_partner = _same_class_cross_subject_partners(labels, subjects)
+    rarity = (prior.max() / prior).pow(rarity_power) - 1.0
+    rarity = rarity / rarity.max().clamp_min(1e-8)
+    sample_weight = rarity[labels] * has_partner.to(rarity.dtype)
+
+    concentration = torch.tensor(beta_alpha, device=device)
+    coefficient = torch.distributions.Beta(
+        concentration, concentration
+    ).sample((len(labels),))
+    coefficient = torch.maximum(coefficient, 1.0 - coefficient)
+    coefficient = torch.where(
+        sample_weight > 0,
+        coefficient,
+        torch.ones_like(coefficient),
+    )
+
+    augmented = {key: value.clone() for key, value in features.items()}
+    for key, value in features.items():
+        mask = masks[key]
+        for row in torch.nonzero(
+            sample_weight > 0, as_tuple=False
+        ).flatten().tolist():
+            other = int(partner[row])
+            anchor_length = int(mask[row].sum())
+            partner_length = int(mask[other].sum())
+            partner_sequence = value[other, :partner_length]
+            if partner_length != anchor_length:
+                flattened = partner_sequence.reshape(partner_length, -1)
+                partner_sequence = F.interpolate(
+                    flattened.transpose(0, 1).unsqueeze(0),
+                    size=anchor_length,
+                    mode="linear",
+                    align_corners=False,
+                ).squeeze(0).transpose(0, 1).reshape(
+                    anchor_length, value.shape[2], value.shape[3]
+                )
+            mix = coefficient[row].to(value.dtype)
+            augmented[key][row, :anchor_length] = (
+                mix * value[row, :anchor_length]
+                + (1.0 - mix) * partner_sequence
+            )
+    return BalancedMultiscaleMixup(
+        features=augmented,
+        masks=masks,
+        labels=labels,
+        sample_weight=sample_weight,
+        partner_index=partner,
+        mixing_coefficient=coefficient,
+    )
+
+
+class ClassScaleCompetenceEMA:
+    """Source-real-only class-by-scale competence for augmentation and fusion."""
+
+    def __init__(
+        self,
+        scale_count: int,
+        class_count: int,
+        momentum: float,
+        uniform_mix: float,
+        device: torch.device,
+    ) -> None:
+        if scale_count < 1 or class_count < 2:
+            raise ValueError("Competence matrix dimensions are invalid")
+        if not 0 <= momentum < 1 or not 0 <= uniform_mix <= 1:
+            raise ValueError("Competence EMA parameters are invalid")
+        self.scale_count = int(scale_count)
+        self.class_count = int(class_count)
+        self.momentum = float(momentum)
+        self.uniform_mix = float(uniform_mix)
+        self.value = torch.full(
+            (scale_count, class_count),
+            1.0 / class_count,
+            device=device,
+        )
+        self.initialized = torch.zeros(
+            class_count, dtype=torch.bool, device=device
+        )
+        self.updates = torch.zeros(
+            class_count, dtype=torch.long, device=device
+        )
+
+    @torch.no_grad()
+    def update(self, scale_logits: torch.Tensor, labels: torch.Tensor) -> None:
+        if scale_logits.ndim != 3 or scale_logits.shape[1:] != (
+            self.scale_count,
+            self.class_count,
+        ):
+            raise ValueError("Scale logits do not match competence matrix")
+        probability = F.softmax(scale_logits.detach(), dim=-1)
+        for class_index in range(self.class_count):
+            selected = labels == class_index
+            if not torch.any(selected):
+                continue
+            observed = probability[selected, :, class_index].mean(dim=0)
+            if self.initialized[class_index]:
+                self.value[:, class_index].mul_(self.momentum).add_(
+                    observed, alpha=1.0 - self.momentum
+                )
+            else:
+                self.value[:, class_index].copy_(observed)
+                self.initialized[class_index] = True
+            self.updates[class_index] += 1
+
+    @torch.no_grad()
+    def reliability(self) -> torch.Tensor:
+        normalized = self.value.clamp_min(1e-6)
+        normalized = normalized / normalized.sum(dim=0, keepdim=True)
+        uniform = torch.full_like(normalized, 1.0 / self.scale_count)
+        return (
+            (1.0 - self.uniform_mix) * normalized
+            + self.uniform_mix * uniform
+        )
+
+    @torch.no_grad()
+    def deficit_weight(self, floor: float, power: float) -> torch.Tensor:
+        if floor <= 0 or power <= 0:
+            raise ValueError("Competence deficit parameters must be positive")
+        difficulty = (1.0 - self.value.clamp(0.0, 1.0) + floor).pow(power)
+        weight = difficulty / difficulty.mean(dim=0, keepdim=True).clamp_min(
+            1e-8
+        )
+        return weight.clamp(0.5, 2.0)
+
+    def state(self) -> dict:
+        return {
+            "true_class_probability_by_scale_class": self.value.cpu().tolist(),
+            "normalized_reliability_by_scale_class": (
+                self.reliability().cpu().tolist()
+            ),
+            "initialized_by_class": self.initialized.cpu().tolist(),
+            "updates_by_class": self.updates.cpu().tolist(),
+            "momentum": self.momentum,
+            "uniform_mix": self.uniform_mix,
+            "statistics_source": "real_labeled_source_batches_only",
+        }
+
+
+@torch.no_grad()
+def _combine_scale_class_reliability(
+    first: torch.Tensor | None,
+    second: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Geometric-mean two source-only reliability matrices."""
+
+    if first is None:
+        return second
+    if second is None:
+        return first
+    if first.shape != second.shape:
+        raise ValueError("Scale-class reliability matrices must have equal shape")
+    combined = torch.sqrt(first.clamp_min(1e-8) * second.clamp_min(1e-8))
+    return combined / combined.sum(dim=0, keepdim=True).clamp_min(1e-8)
+
+
+def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    weights = weights.to(values)
+    if values.shape != weights.shape:
+        raise ValueError("Weighted mean values and weights must have equal shape")
+    return (values * weights).sum() / weights.sum().clamp_min(1e-8)
 
 
 class TargetPriorEstimator:
@@ -1178,6 +1534,7 @@ class PrototypeBank:
         probability: torch.Tensor,
         confidence_threshold: float,
         valid_mask: torch.Tensor | None = None,
+        sample_weight: torch.Tensor | None = None,
     ) -> float:
         probability = probability.detach()
         confidence, pseudo_label = probability.max(dim=1)
@@ -1186,10 +1543,16 @@ class PrototypeBank:
             if valid_mask.shape != valid.shape:
                 raise ValueError("valid_mask must be [batch]")
             valid = valid & valid_mask.detach().bool().to(valid.device)
+        if sample_weight is not None and sample_weight.shape != valid.shape:
+            raise ValueError("sample_weight must be [batch]")
         confidence_weight = (
             (confidence - confidence_threshold)
             / max(1.0 - confidence_threshold, 1e-6)
         ).clamp(0.0, 1.0)
+        if sample_weight is not None:
+            confidence_weight = confidence_weight * sample_weight.detach().to(
+                confidence_weight
+            ).clamp(0.0, 1.0)
         for class_index in range(self.target.shape[1]):
             selected = valid & (pseudo_label == class_index)
             weight = selected.to(confidence_weight) * confidence_weight
@@ -1592,6 +1955,16 @@ def train_step(
     pyramid_gate_teacher_temperature: float = 0.10,
     pyramid_gate_teacher_margin: float = 0.05,
     source_prototype_memory: SourceMultiPrototypeMemory | None = None,
+    physiology_classification_weight: float = 0.05,
+    physiology_reliability_temperature: float = 0.15,
+    physiology_reliability_floor: float = 0.50,
+    class_scale_competence: ClassScaleCompetenceEMA | None = None,
+    mixup_warmup_iterations: int = 50,
+    mixup_beta_alpha: float = 0.40,
+    mixup_rarity_power: float = 0.50,
+    mixup_loss_weight: float = 0.25,
+    competence_deficit_floor: float = 0.25,
+    competence_deficit_power: float = 1.0,
 ) -> dict:
     if "y" in target_batch:
         raise RuntimeError("Target adaptation batch unexpectedly contains labels")
@@ -1606,16 +1979,35 @@ def train_step(
     )
     pyramid_gate_ramp = ramp if spec.use_pyramid_gate_warmup else 1.0
     adaptation_active = iteration > adaptation_warmup_iterations
-    reliability = (
+    prototype_reliability = (
         prototype_bank.scale_class_reliability()
         if prototype_bank is not None
         else None
     )
-    source_multiview_anchor = (
+    competence_reliability = (
+        class_scale_competence.reliability()
+        if class_scale_competence is not None
+        else None
+    )
+    reliability = (
+        _combine_scale_class_reliability(
+            prototype_reliability, competence_reliability
+        )
+        if spec.use_class_scale_reliability_fusion
+        else prototype_reliability
+    )
+    base_source_multiview_anchor = (
         prototype_bank.source_relation_weights().mean(dim=0)
         if prototype_bank is not None
         and spec.use_source_multiview_anchor
         else None
+    )
+    source_multiview_anchor = (
+        _combine_scale_class_reliability(
+            base_source_multiview_anchor, competence_reliability
+        )
+        if spec.use_class_scale_reliability_fusion
+        else base_source_multiview_anchor
     )
     prior_adjustment = (
         target_prior_estimator.logit_adjustment(
@@ -1671,6 +2063,7 @@ def train_step(
     source_labels = []
     for batch in source_batches:
         x, mask = _batch_to_device(batch, device)
+        physiology = _batch_physiology_to_device(batch, device)
         labels = batch["y"].to(device, non_blocking=True)
         source_labels.append(labels)
         source_outputs.append(
@@ -1691,9 +2084,12 @@ def train_step(
                     if source_prototype_memory is not None
                     else None
                 ),
+                physiology_by_scale=physiology,
+                class_scale_reliability_ramp=0.0,
             )
         )
     target_x, target_mask = _batch_to_device(target_batch, device)
+    target_physiology = _batch_physiology_to_device(target_batch, device)
     target_output = model(
         target_x,
         target_mask,
@@ -1713,7 +2109,57 @@ def train_step(
             if source_prototype_memory is not None
             else None
         ),
+        physiology_by_scale=target_physiology,
+        class_scale_reliability_ramp=(
+            ramp if spec.use_class_scale_reliability_fusion else 0.0
+        ),
     )
+
+    mixup_active = (
+        spec.use_balanced_multiscale_mixup
+        and iteration > mixup_warmup_iterations
+        and mixup_loss_weight > 0
+    )
+    augmented_views: list[BalancedMultiscaleMixup | None] = []
+    augmented_outputs: list[dict | None] = []
+    for domain_index, batch in enumerate(source_batches):
+        if not mixup_active:
+            augmented_views.append(None)
+            augmented_outputs.append(None)
+            continue
+        augmented = balanced_multiscale_mixup(
+            batch,
+            device,
+            source_class_priors[domain_index],
+            mixup_beta_alpha,
+            mixup_rarity_power,
+        )
+        augmented_views.append(augmented)
+        if not torch.any(augmented.sample_weight > 0):
+            augmented_outputs.append(None)
+            continue
+        augmented_outputs.append(
+            model(
+                augmented.features,
+                augmented.masks,
+                grl_alpha=0.0,
+                compute_domain=False,
+                scale_class_reliability=reliability,
+                multiview_source_anchor=source_multiview_anchor,
+                pyramid_gate_ramp=pyramid_gate_ramp,
+                source_prototype_memory=(
+                    source_prototype_memory.memory
+                    if source_prototype_memory is not None
+                    else None
+                ),
+                source_prototype_initialized=(
+                    source_prototype_memory.initialized
+                    if source_prototype_memory is not None
+                    else None
+                ),
+                class_scale_reliability_ramp=0.0,
+            )
+        )
 
     target_consensus = independent_scale_consensus(
         target_output["calibrated_scale_logits"],
@@ -1721,6 +2167,24 @@ def train_step(
         consensus_jsd_threshold,
         consensus_minimum_votes,
     )
+    if spec.use_physiology_reliability:
+        if target_output["physiology_probability"] is None:
+            raise RuntimeError("Physiology reliability output is unavailable")
+        target_physiology_weight, target_physiology_jsd = (
+            physiology_pseudo_label_reliability(
+                target_consensus.probability,
+                target_output["physiology_probability"],
+                physiology_reliability_temperature,
+                physiology_reliability_floor,
+            )
+        )
+    else:
+        target_physiology_weight = target_consensus.probability.new_ones(
+            len(target_consensus.probability)
+        )
+        target_physiology_jsd = target_consensus.probability.new_zeros(
+            len(target_consensus.probability)
+        )
 
     fused_classification_by_source = torch.stack(
         [
@@ -1738,6 +2202,25 @@ def train_step(
             for output, labels in zip(source_outputs, source_labels, strict=True)
         ]
     )
+    if spec.use_physiology_reliability:
+        physiology_classification_by_source = torch.stack(
+            [
+                F.cross_entropy(
+                    output["physiology_logits"].reshape(-1, NUM_CLASSES),
+                    labels[:, None]
+                    .expand(-1, output["physiology_logits"].shape[1])
+                    .reshape(-1),
+                    label_smoothing=label_smoothing,
+                )
+                for output, labels in zip(
+                    source_outputs, source_labels, strict=True
+                )
+            ]
+        )
+    else:
+        physiology_classification_by_source = torch.zeros_like(
+            fused_classification_by_source
+        ) + target_output["logits"].sum() * 0.0
     classification_by_source = (
         fused_classification_by_source
         + scale_classification_weight * scale_classification_by_source
@@ -1787,12 +2270,72 @@ def train_step(
         )
     )
     classification_loss = (classification_by_source * source_weights).sum()
+    physiology_classification_loss = (
+        physiology_classification_by_source * source_weights
+    ).sum()
     gate_supervision_loss = (
         gate_supervision_by_source * source_weights
     ).sum()
     pyramid_gate_supervision_loss = (
         pyramid_gate_supervision_by_source * source_weights
     ).sum()
+    augmentation_fused_by_source = []
+    augmentation_scale_by_source = []
+    augmentation_by_source = []
+    competence_deficit = (
+        class_scale_competence.deficit_weight(
+            competence_deficit_floor, competence_deficit_power
+        )
+        if class_scale_competence is not None
+        and spec.use_class_scale_adaptive_augmentation
+        else None
+    )
+    zero_augmentation = target_output["logits"].sum() * 0.0
+    for augmented, output in zip(
+        augmented_views, augmented_outputs, strict=True
+    ):
+        if augmented is None or output is None:
+            augmentation_fused_by_source.append(zero_augmentation)
+            augmentation_scale_by_source.append(zero_augmentation)
+            augmentation_by_source.append(zero_augmentation)
+            continue
+        fused_loss = F.cross_entropy(
+            output["logits"],
+            augmented.labels,
+            label_smoothing=label_smoothing,
+            reduction="none",
+        )
+        fused_loss = _weighted_mean(fused_loss, augmented.sample_weight)
+        scale_logits = output["scale_logits"]
+        expanded_labels = augmented.labels[:, None].expand(
+            -1, scale_logits.shape[1]
+        )
+        scale_loss = F.cross_entropy(
+            scale_logits.reshape(-1, NUM_CLASSES),
+            expanded_labels.reshape(-1),
+            label_smoothing=label_smoothing,
+            reduction="none",
+        ).reshape(scale_logits.shape[:2])
+        scale_weight = augmented.sample_weight[:, None].expand_as(scale_loss)
+        if competence_deficit is not None:
+            adaptive_weight = competence_deficit[:, augmented.labels].transpose(
+                0, 1
+            )
+            scale_weight = scale_weight * adaptive_weight
+        scale_loss = _weighted_mean(scale_loss, scale_weight)
+        augmentation_fused_by_source.append(fused_loss)
+        augmentation_scale_by_source.append(scale_loss)
+        augmentation_by_source.append(
+            fused_loss + scale_classification_weight * scale_loss
+        )
+    augmentation_fused_by_source = torch.stack(
+        augmentation_fused_by_source
+    )
+    augmentation_scale_by_source = torch.stack(
+        augmentation_scale_by_source
+    )
+    augmentation_by_source = torch.stack(augmentation_by_source)
+    augmentation_loss = (augmentation_by_source * source_weights).sum()
     domain_loss, domain_by_scale = _domain_loss(
         source_outputs,
         target_output,
@@ -1809,6 +2352,11 @@ def train_step(
                 prototype_bank.joint_weights(),
                 pseudo_confidence_threshold,
                 target_consensus.valid_mask,
+                (
+                    target_physiology_weight
+                    if spec.use_physiology_reliability
+                    else None
+                ),
             )
         )
     else:
@@ -1822,6 +2370,9 @@ def train_step(
         )
     total_loss = (
         classification_loss
+        + mixup_loss_weight * augmentation_loss
+        + physiology_classification_weight
+        * physiology_classification_loss
         + gate_supervision_weight * gate_supervision_loss
         + ramp
         * (
@@ -1841,6 +2392,12 @@ def train_step(
     )
     optimizer.step()
     scheduler.step()
+
+    if class_scale_competence is not None:
+        for output, labels in zip(
+            source_outputs, source_labels, strict=True
+        ):
+            class_scale_competence.update(output["scale_logits"], labels)
 
     # R memory has a strict information boundary: source true labels only.
     # It is updated during the source warmup, then frozen for all subsequent
@@ -1884,10 +2441,27 @@ def train_step(
                 target_consensus.probability,
                 pseudo_confidence_threshold,
                 target_consensus.valid_mask,
+                sample_weight=(
+                    target_physiology_weight
+                    if spec.use_physiology_reliability
+                    else None
+                ),
             )
         else:
             pseudo_coverage = 0.0
-        reliability = prototype_bank.scale_class_reliability()
+        prototype_reliability = prototype_bank.scale_class_reliability()
+        competence_reliability = (
+            class_scale_competence.reliability()
+            if class_scale_competence is not None
+            else None
+        )
+        reliability = (
+            _combine_scale_class_reliability(
+                prototype_reliability, competence_reliability
+            )
+            if spec.use_class_scale_reliability_fusion
+            else prototype_reliability
+        )
         source_weights = prototype_bank.source_weights(source_class_priors)
 
     mean_gate = target_output["scale_class_weight"].detach().mean(dim=0)
@@ -1934,6 +2508,26 @@ def train_step(
     mean_rda_memory_gate = target_output[
         "rda_memory_gate"
     ].detach().mean(dim=0)
+    mean_sample_scale_class_reliability = target_output[
+        "sample_scale_class_reliability"
+    ].detach().mean(dim=0)
+    active_mixup_rows = sum(
+        int((view.sample_weight > 0).sum())
+        for view in augmented_views
+        if view is not None
+    )
+    total_mixup_rows = sum(
+        len(view.sample_weight)
+        for view in augmented_views
+        if view is not None
+    )
+    active_coefficients = torch.cat(
+        [
+            view.mixing_coefficient[view.sample_weight > 0]
+            for view in augmented_views
+            if view is not None and torch.any(view.sample_weight > 0)
+        ]
+    ) if active_mixup_rows else target_output["logits"].new_ones(1)
     consensus_statistics = target_consensus.statistics(NUM_CLASSES)
     if not adaptation_active:
         consensus_statistics["active_class_counts"] = [0] * NUM_CLASSES
@@ -1953,6 +2547,23 @@ def train_step(
         ),
         "total": float(total_loss.detach()),
         "classification": float(classification_loss.detach()),
+        "multiscale_mixup": float(augmentation_loss.detach()),
+        "multiscale_mixup_fused": float(
+            (augmentation_fused_by_source * source_weights).sum().detach()
+        ),
+        "multiscale_mixup_scale": float(
+            (augmentation_scale_by_source * source_weights).sum().detach()
+        ),
+        "multiscale_mixup_active": mixup_active,
+        "multiscale_mixup_active_fraction": (
+            active_mixup_rows / total_mixup_rows if total_mixup_rows else 0.0
+        ),
+        "multiscale_mixup_mean_anchor_coefficient": float(
+            active_coefficients.mean().detach()
+        ),
+        "physiology_classification": float(
+            physiology_classification_loss.detach()
+        ),
         "fused_classification": float(
             (fused_classification_by_source * source_weights).sum().detach()
         ),
@@ -1971,9 +2582,39 @@ def train_step(
         "domain_by_scale": domain_by_scale,
         "prototype": float(prototype_loss.detach()),
         "pseudo_label_coverage": pseudo_coverage,
+        "physiology_reliability_active": (
+            spec.use_physiology_reliability and adaptation_active
+        ),
+        "mean_target_physiology_reliability": float(
+            target_physiology_weight.mean().detach()
+        ),
+        "min_target_physiology_reliability": float(
+            target_physiology_weight.min().detach()
+        ),
+        "mean_target_physiology_js_divergence": float(
+            target_physiology_jsd.mean().detach()
+        ),
         "target_scale_consensus": consensus_statistics,
         "source_weights": [float(value) for value in source_weights.detach()],
         "mean_target_scale_class_gate": mean_gate.cpu().tolist(),
+        "mean_target_sample_scale_class_reliability": (
+            mean_sample_scale_class_reliability.cpu().tolist()
+        ),
+        "source_real_class_scale_competence": (
+            class_scale_competence.value.cpu().tolist()
+            if class_scale_competence is not None
+            else None
+        ),
+        "source_real_class_scale_reliability": (
+            class_scale_competence.reliability().cpu().tolist()
+            if class_scale_competence is not None
+            else None
+        ),
+        "augmentation_class_scale_deficit_weight": (
+            competence_deficit.cpu().tolist()
+            if competence_deficit is not None
+            else None
+        ),
         "mean_target_pyramid_scale_class_gate": (
             mean_pyramid_gate.cpu().tolist()
         ),
@@ -2135,7 +2776,18 @@ def collect_unlabeled_target_evidence(
                 "Target evidence refresh must use an unlabeled target view"
             )
         x, mask = _batch_to_device(batch, device)
-        output = model(x, mask, compute_domain=False)
+        physiology = _batch_physiology_to_device(batch, device)
+        physiology_arguments = (
+            {"physiology_by_scale": physiology}
+            if physiology is not None
+            else {}
+        )
+        output = model(
+            x,
+            mask,
+            compute_domain=False,
+            **physiology_arguments,
+        )
         probability = F.softmax(output["scale_logits"], dim=-1)
         hard = F.one_hot(
             probability.argmax(dim=-1), num_classes=NUM_CLASSES
@@ -2173,6 +2825,7 @@ def evaluate_trials(
     common_bias_max_adjustment: float = 0.50,
     final_target_evidence: TargetEvidenceSnapshot | None = None,
     source_prototype_memory: SourceMultiPrototypeMemory | None = None,
+    class_scale_competence: ClassScaleCompetenceEMA | None = None,
 ) -> dict:
     model.eval()
     probabilities = []
@@ -2195,17 +2848,37 @@ def evaluate_trials(
     rda_memory_valid_masks = []
     rda_memory_scale_weights = []
     rda_memory_gates = []
+    sample_scale_class_reliabilities = []
     labels = []
-    reliability = (
+    prototype_reliability = (
         prototype_bank.scale_class_reliability()
         if prototype_bank is not None
         else None
     )
-    source_multiview_anchor = (
+    competence_reliability = (
+        class_scale_competence.reliability()
+        if class_scale_competence is not None
+        else None
+    )
+    reliability = (
+        _combine_scale_class_reliability(
+            prototype_reliability, competence_reliability
+        )
+        if model.use_class_scale_reliability_fusion
+        else prototype_reliability
+    )
+    base_source_multiview_anchor = (
         prototype_bank.source_relation_weights().mean(dim=0)
         if prototype_bank is not None
         and model.multiview_source_anchor_mix > 0
         else None
+    )
+    source_multiview_anchor = (
+        _combine_scale_class_reliability(
+            base_source_multiview_anchor, competence_reliability
+        )
+        if model.use_class_scale_reliability_fusion
+        else base_source_multiview_anchor
     )
     prior_adjustment = (
         target_prior_estimator.logit_adjustment(prior_correction_strength)
@@ -2274,6 +2947,12 @@ def evaluate_trials(
             if "y" not in batch:
                 raise RuntimeError("Evaluation requires labeled trials")
             x, mask = _batch_to_device(batch, device)
+            physiology = _batch_physiology_to_device(batch, device)
+            physiology_arguments = (
+                {"physiology_by_scale": physiology}
+                if physiology is not None
+                else {}
+            )
             output = model(
                 x,
                 mask,
@@ -2293,6 +2972,10 @@ def evaluate_trials(
                     if source_prototype_memory is not None
                     else None
                 ),
+                class_scale_reliability_ramp=(
+                    1.0 if model.use_class_scale_reliability_fusion else 0.0
+                ),
+                **physiology_arguments,
             )
             probabilities.append(output["probability"].cpu().numpy())
             scale_probabilities.append(
@@ -2348,6 +3031,9 @@ def evaluate_trials(
             rda_memory_gates.append(
                 output["rda_memory_gate"].cpu().numpy()
             )
+            sample_scale_class_reliabilities.append(
+                output["sample_scale_class_reliability"].cpu().numpy()
+            )
             labels.append(batch["y"].numpy())
     labels_array = np.concatenate(labels)
     probability_array = np.concatenate(probabilities)
@@ -2380,6 +3066,9 @@ def evaluate_trials(
         rda_memory_scale_weights
     )
     rda_memory_gate_array = np.concatenate(rda_memory_gates)
+    sample_scale_class_reliability_array = np.concatenate(
+        sample_scale_class_reliabilities
+    )
     multiview_token_names = list(model.scale_keys)
     if model.multiview_fusion_mode == "class_query_low_rank":
         multiview_token_names.extend(
@@ -2449,6 +3138,19 @@ def evaluate_trials(
             rda_memory_scale_weight_array.mean(axis=0).tolist()
         ),
         "mean_rda_memory_gate": rda_memory_gate_array.mean(axis=0).tolist(),
+        "mean_sample_scale_class_reliability": (
+            sample_scale_class_reliability_array.mean(axis=0).tolist()
+        ),
+        "source_real_class_scale_competence": (
+            class_scale_competence.value.cpu().tolist()
+            if class_scale_competence is not None
+            else None
+        ),
+        "source_real_class_scale_reliability": (
+            class_scale_competence.reliability().cpu().tolist()
+            if class_scale_competence is not None
+            else None
+        ),
         "pyramid_bias_risk": (
             pyramid_bias_risk.cpu().tolist()
             if pyramid_bias_risk is not None
@@ -2733,6 +3435,19 @@ def run_fold(
         rda_memory_strength=args.rda_memory_strength,
         rda_degradation_strength=args.rda_degradation_strength,
         rda_msad_strength=args.rda_msad_strength,
+        use_anatomical_regions=spec.use_anatomical_regions,
+        anatomical_region_max_strength=args.anatomical_region_max_strength,
+        use_physiology_prior=spec.use_physiology_prior,
+        physiology_max_strength=args.physiology_max_strength,
+        use_physiology_reliability=spec.use_physiology_reliability,
+        physiology_reliability_hidden=args.physiology_reliability_hidden,
+        use_class_scale_reliability_fusion=(
+            spec.use_class_scale_reliability_fusion
+        ),
+        class_scale_fusion_strength=args.class_scale_fusion_strength,
+        class_scale_entropy_strength=args.class_scale_entropy_strength,
+        class_scale_conflict_strength=args.class_scale_conflict_strength,
+        class_scale_reliability_floor=args.class_scale_reliability_floor,
     ).to(device)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     optimizer = torch.optim.AdamW(
@@ -2787,6 +3502,18 @@ def run_fold(
             args.rda_memory_slots,
             args.d_model,
             args.rda_memory_momentum,
+            device,
+        )
+    class_scale_competence = None
+    if (
+        spec.use_class_scale_adaptive_augmentation
+        or spec.use_class_scale_reliability_fusion
+    ):
+        class_scale_competence = ClassScaleCompetenceEMA(
+            len(spec.scales),
+            NUM_CLASSES,
+            args.class_scale_competence_momentum,
+            args.class_scale_competence_uniform_mix,
             device,
         )
     if device.type == "cuda":
@@ -2852,6 +3579,20 @@ def run_fold(
             args.pyramid_gate_teacher_temperature,
             args.pyramid_gate_teacher_margin,
             source_prototype_memory=source_prototype_memory,
+            physiology_classification_weight=(
+                args.physiology_classification_weight
+            ),
+            physiology_reliability_temperature=(
+                args.physiology_reliability_temperature
+            ),
+            physiology_reliability_floor=args.physiology_reliability_floor,
+            class_scale_competence=class_scale_competence,
+            mixup_warmup_iterations=args.mixup_warmup_iterations,
+            mixup_beta_alpha=args.mixup_beta_alpha,
+            mixup_rarity_power=args.mixup_rarity_power,
+            mixup_loss_weight=args.mixup_loss_weight,
+            competence_deficit_floor=args.competence_deficit_floor,
+            competence_deficit_power=args.competence_deficit_power,
         )
         if iteration == 1 or iteration % args.log_interval == 0 or iteration == iterations:
             training_trace.append(record)
@@ -2894,6 +3635,7 @@ def run_fold(
                 args.common_bias_max_adjustment,
                 final_target_evidence,
                 source_prototype_memory=source_prototype_memory,
+                class_scale_competence=class_scale_competence,
             )
             target_evaluation_trace.append(
                 {"iteration": iteration, "evaluation": candidate_evaluation}
@@ -3006,6 +3748,37 @@ def run_fold(
             ),
             "use_relative_degradation_fusion": (
                 spec.use_relative_degradation_fusion
+            ),
+            "use_anatomical_regions": spec.use_anatomical_regions,
+            "anatomical_region_max_strength": (
+                args.anatomical_region_max_strength
+            ),
+            "use_physiology_prior": spec.use_physiology_prior,
+            "physiology_max_strength": args.physiology_max_strength,
+            "use_physiology_reliability": (
+                spec.use_physiology_reliability
+            ),
+            "physiology_reliability_hidden": (
+                args.physiology_reliability_hidden
+            ),
+            "use_balanced_multiscale_mixup": (
+                spec.use_balanced_multiscale_mixup
+            ),
+            "use_class_scale_adaptive_augmentation": (
+                spec.use_class_scale_adaptive_augmentation
+            ),
+            "use_class_scale_reliability_fusion": (
+                spec.use_class_scale_reliability_fusion
+            ),
+            "class_scale_fusion_strength": args.class_scale_fusion_strength,
+            "class_scale_entropy_strength": (
+                args.class_scale_entropy_strength
+            ),
+            "class_scale_conflict_strength": (
+                args.class_scale_conflict_strength
+            ),
+            "class_scale_reliability_floor": (
+                args.class_scale_reliability_floor
             ),
             "channel_attention": True,
             "d_model": args.d_model,
@@ -3146,6 +3919,27 @@ def run_fold(
             "gate_teacher_temperature": args.gate_teacher_temperature,
             "consensus_jsd_threshold": args.consensus_jsd_threshold,
             "consensus_minimum_votes": args.consensus_minimum_votes,
+            "physiology_classification_weight": (
+                args.physiology_classification_weight
+            ),
+            "physiology_reliability_temperature": (
+                args.physiology_reliability_temperature
+            ),
+            "physiology_reliability_floor": (
+                args.physiology_reliability_floor
+            ),
+            "mixup_warmup_iterations": args.mixup_warmup_iterations,
+            "mixup_beta_alpha": args.mixup_beta_alpha,
+            "mixup_rarity_power": args.mixup_rarity_power,
+            "mixup_loss_weight": args.mixup_loss_weight,
+            "class_scale_competence_momentum": (
+                args.class_scale_competence_momentum
+            ),
+            "class_scale_competence_uniform_mix": (
+                args.class_scale_competence_uniform_mix
+            ),
+            "competence_deficit_floor": args.competence_deficit_floor,
+            "competence_deficit_power": args.competence_deficit_power,
             "removed_losses": [
                 "supervised_contrastive",
                 "information_maximization",
@@ -3162,9 +3956,83 @@ def run_fold(
             if source_prototype_memory is not None
             else None
         ),
+        "final_class_scale_competence": (
+            class_scale_competence.state()
+            if class_scale_competence is not None
+            else None
+        ),
         "final_target_prior_estimator": target_prior_estimator.state(),
         "final_learned_scale_class_relation_residual": (
             model.scale_class_relation_residual.detach().cpu().tolist()
+        ),
+        "anatomical_physiology_prior": (
+            {
+                **physiology_metadata(),
+                "source_only_standardisation_by_scale": (
+                    {
+                        scale_key(scale): {
+                            "mean": mean.tolist(),
+                            "std": std.tolist(),
+                        }
+                        for scale, (mean, std) in (
+                            prepared.physiology_stats or {}
+                        ).items()
+                    }
+                    if spec.use_physiology_prior
+                    else None
+                ),
+                "normalisation": (
+                    "within_subject_median_mad_using_unlabeled_trials"
+                    if spec.use_physiology_reliability
+                    else (
+                        "source_global_mean_std"
+                        if spec.use_physiology_prior
+                        else None
+                    )
+                ),
+                "descriptor_mode": (
+                    "compact_four_indicators"
+                    if spec.use_physiology_reliability
+                    else (
+                        "full_44_indicators"
+                        if spec.use_physiology_prior
+                        else None
+                    )
+                ),
+                "role": (
+                    "bounded_pseudo_label_prototype_weight_only"
+                    if spec.use_physiology_reliability
+                    else (
+                        "direct_scale_token_residual"
+                        if spec.use_physiology_prior
+                        else "anatomical_region_balanced_residual"
+                    )
+                ),
+                "final_anatomical_region_gate": (
+                    float(
+                        args.anatomical_region_max_strength
+                        * torch.sigmoid(
+                            model.spatial.anatomical_region_gate_logit.detach()
+                        )
+                    )
+                    if model.spatial.anatomical_region_gate_logit is not None
+                    else None
+                ),
+                "final_physiology_gate_by_scale": (
+                    (
+                        args.physiology_max_strength
+                        * torch.sigmoid(model.physiology_gate_logit.detach())
+                    ).cpu().tolist()
+                    if model.physiology_gate_logit is not None
+                    else None
+                ),
+            }
+            if (
+                spec.use_anatomical_regions
+                or spec.use_physiology_prior
+                or spec.use_physiology_reliability
+            )
+            else None
         ),
         "final_pyramid_residual_weight": float(
             evaluation["pyramid_residual_weight"]
@@ -3250,6 +4118,48 @@ def build_parser() -> argparse.ArgumentParser:
         "--rda-degradation-strength", type=float, default=1.0
     )
     parser.add_argument("--rda-msad-strength", type=float, default=0.25)
+    parser.add_argument(
+        "--anatomical-region-max-strength", type=float, default=0.25
+    )
+    parser.add_argument("--physiology-max-strength", type=float, default=0.25)
+    parser.add_argument("--physiology-reliability-hidden", type=int, default=16)
+    parser.add_argument(
+        "--physiology-classification-weight", type=float, default=0.05
+    )
+    parser.add_argument(
+        "--physiology-reliability-temperature", type=float, default=0.15
+    )
+    parser.add_argument(
+        "--physiology-reliability-floor", type=float, default=0.50
+    )
+    parser.add_argument("--mixup-warmup-iterations", type=int, default=50)
+    parser.add_argument("--mixup-beta-alpha", type=float, default=0.40)
+    parser.add_argument("--mixup-rarity-power", type=float, default=0.50)
+    parser.add_argument("--mixup-loss-weight", type=float, default=0.25)
+    parser.add_argument(
+        "--class-scale-competence-momentum", type=float, default=0.95
+    )
+    parser.add_argument(
+        "--class-scale-competence-uniform-mix", type=float, default=0.10
+    )
+    parser.add_argument(
+        "--competence-deficit-floor", type=float, default=0.25
+    )
+    parser.add_argument(
+        "--competence-deficit-power", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--class-scale-fusion-strength", type=float, default=0.50
+    )
+    parser.add_argument(
+        "--class-scale-entropy-strength", type=float, default=0.50
+    )
+    parser.add_argument(
+        "--class-scale-conflict-strength", type=float, default=1.0
+    )
+    parser.add_argument(
+        "--class-scale-reliability-floor", type=float, default=0.25
+    )
     parser.add_argument(
         "--pyramid-gate-supervision-weight", type=float, default=0.05
     )
@@ -3405,8 +4315,50 @@ def validate_args(args, spec: ExperimentSpec) -> None:
         args.rda_memory_strength,
         args.rda_degradation_strength,
         args.rda_msad_strength,
+        args.anatomical_region_max_strength,
+        args.physiology_max_strength,
+        args.physiology_classification_weight,
     ) < 0:
-        raise ValueError("RDA strengths must be nonnegative")
+        raise ValueError("RDA/anatomical/physiology strengths must be nonnegative")
+    if args.physiology_reliability_hidden < 1:
+        raise ValueError("physiology-reliability-hidden must be positive")
+    if args.physiology_reliability_temperature <= 0:
+        raise ValueError("physiology-reliability-temperature must be positive")
+    if not 0 <= args.physiology_reliability_floor <= 1:
+        raise ValueError("physiology-reliability-floor must be within [0,1]")
+    if not 0 <= args.mixup_warmup_iterations < FIXED_UDA_PROTOCOL.training_iterations:
+        raise ValueError("mixup-warmup-iterations must be within [0,1000)")
+    if min(
+        args.mixup_beta_alpha,
+        args.mixup_rarity_power,
+        args.competence_deficit_floor,
+        args.competence_deficit_power,
+    ) <= 0:
+        raise ValueError("MixUp and competence deficit parameters must be positive")
+    if args.mixup_loss_weight < 0:
+        raise ValueError("mixup-loss-weight must be nonnegative")
+    if not 0 <= args.class_scale_competence_momentum < 1:
+        raise ValueError("class-scale-competence-momentum must be within [0,1)")
+    if not 0 <= args.class_scale_competence_uniform_mix <= 1:
+        raise ValueError("class-scale-competence-uniform-mix must be within [0,1]")
+    if min(
+        args.class_scale_fusion_strength,
+        args.class_scale_entropy_strength,
+        args.class_scale_conflict_strength,
+    ) < 0:
+        raise ValueError("class-scale fusion strengths must be nonnegative")
+    if not 0 < args.class_scale_reliability_floor <= 1:
+        raise ValueError("class-scale-reliability-floor must be within (0,1]")
+    if (
+        spec.use_class_scale_adaptive_augmentation
+        and not spec.use_balanced_multiscale_mixup
+    ):
+        raise ValueError("Class-scale adaptive augmentation requires MixUp")
+    if (
+        spec.use_class_scale_reliability_fusion
+        and not spec.use_class_scale_adaptive_augmentation
+    ):
+        raise ValueError("Class-scale reliability fusion requires D2 augmentation")
     if args.pyramid_gate_teacher_temperature <= 0:
         raise ValueError("pyramid gate teacher temperature must be positive")
     if args.prior_correction_strength < 0:
@@ -3472,7 +4424,16 @@ def main() -> None:
             "evidence refresh, diagnostic-only target-prior estimation, no "
             "checkpoint selection, one final labeled target evaluation"
         )
-    prepared = prepare_sources(args.data_dir, spec.source_domains, spec.scales)
+    prepared = prepare_sources(
+        args.data_dir,
+        spec.source_domains,
+        spec.scales,
+        use_physiology=(
+            spec.use_physiology_prior or spec.use_physiology_reliability
+        ),
+        compact_physiology=spec.use_physiology_reliability,
+        subject_robust_physiology=spec.use_physiology_reliability,
+    )
     for seed in args.random_seeds:
         for subject in args.target_subjects:
             run_fold(args, spec, prepared, seed, subject, device)

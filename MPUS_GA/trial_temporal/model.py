@@ -11,6 +11,11 @@ import torch.nn.functional as F
 
 from MPUS_GA.layers import GRL, PositionalEncoding, SpatialStream
 
+from .anatomical_prior import (
+    COMPACT_PHYSIOLOGY_DIM,
+    PHYSIOLOGY_DIM,
+    region_weight_matrix_torch,
+)
 from .data import NUM_BANDS, NUM_CHANNELS, NUM_CLASSES, scale_key
 
 
@@ -51,8 +56,27 @@ class WindowSpatialEncoder(nn.Module):
         dropout: float,
         use_channel_attention: bool = True,
         channel_attention_reduction: int = 4,
+        use_anatomical_regions: bool = False,
+        anatomical_region_max_strength: float = 0.25,
     ) -> None:
         super().__init__()
+        if anatomical_region_max_strength < 0:
+            raise ValueError("anatomical_region_max_strength must be nonnegative")
+        self.use_anatomical_regions = bool(use_anatomical_regions)
+        self.anatomical_region_max_strength = float(
+            anatomical_region_max_strength
+        )
+        self.anatomical_region_gate_logit: nn.Parameter | None = None
+        if self.use_anatomical_regions:
+            self.register_buffer(
+                "anatomical_region_weights", region_weight_matrix_torch()
+            )
+            initial_fraction = 0.20
+            self.anatomical_region_gate_logit = nn.Parameter(
+                torch.tensor(math.log(initial_fraction / (1.0 - initial_fraction)))
+            )
+        else:
+            self.register_buffer("anatomical_region_weights", None)
         self.channel_attention = (
             EEGChannelAttention(NUM_CHANNELS, channel_attention_reduction)
             if use_channel_attention
@@ -91,6 +115,24 @@ class WindowSpatialEncoder(nn.Module):
         spatial = self.residual_norm(base + self.dropout(spatial))
         electrode_weight = F.softmax(self.electrode_attention(spatial), dim=1)
         window_embedding = (spatial * electrode_weight).sum(dim=1)
+        if self.use_anatomical_regions:
+            if (
+                self.anatomical_region_weights is None
+                or self.anatomical_region_gate_logit is None
+            ):
+                raise RuntimeError("Anatomical region prior is unavailable")
+            region_tokens = torch.einsum(
+                "rc,wcd->wrd",
+                self.anatomical_region_weights.to(spatial),
+                spatial,
+            )
+            region_balanced = F.layer_norm(
+                region_tokens.mean(dim=1), (spatial.shape[-1],)
+            )
+            region_strength = self.anatomical_region_max_strength * torch.sigmoid(
+                self.anatomical_region_gate_logit
+            )
+            window_embedding = window_embedding + region_strength * region_balanced
 
         sequence = window_embedding.new_zeros(
             (x.shape[0], x.shape[1], window_embedding.shape[-1])
@@ -375,6 +417,17 @@ class MultiScaleMultiSourceDANN(nn.Module):
         rda_memory_strength: float = 0.25,
         rda_degradation_strength: float = 1.0,
         rda_msad_strength: float = 0.25,
+        use_anatomical_regions: bool = False,
+        anatomical_region_max_strength: float = 0.25,
+        use_physiology_prior: bool = False,
+        physiology_max_strength: float = 0.25,
+        use_physiology_reliability: bool = False,
+        physiology_reliability_hidden: int = 16,
+        use_class_scale_reliability_fusion: bool = False,
+        class_scale_fusion_strength: float = 0.50,
+        class_scale_entropy_strength: float = 0.50,
+        class_scale_conflict_strength: float = 1.00,
+        class_scale_reliability_floor: float = 0.25,
     ) -> None:
         super().__init__()
         self.scales = tuple(sorted(map(float, scales)))
@@ -429,6 +482,24 @@ class MultiScaleMultiSourceDANN(nn.Module):
             rda_msad_strength,
         ) < 0:
             raise ValueError("RDA strengths must be nonnegative")
+        if min(anatomical_region_max_strength, physiology_max_strength) < 0:
+            raise ValueError("anatomical/physiology strengths must be nonnegative")
+        if use_physiology_prior and not use_anatomical_regions:
+            raise ValueError("physiology prior requires anatomical regions")
+        if use_physiology_prior and use_physiology_reliability:
+            raise ValueError(
+                "direct physiology injection and reliability mode are exclusive"
+            )
+        if physiology_reliability_hidden < 1:
+            raise ValueError("physiology_reliability_hidden must be positive")
+        if min(
+            class_scale_fusion_strength,
+            class_scale_entropy_strength,
+            class_scale_conflict_strength,
+        ) < 0:
+            raise ValueError("class-scale reliability strengths must be nonnegative")
+        if not 0 < class_scale_reliability_floor <= 1:
+            raise ValueError("class-scale reliability floor must be within (0,1]")
         if multiview_source_anchor_mix > 0 and multiview_fusion_mode == "none":
             raise ValueError("a multiview source anchor requires multiview fusion")
         if multiview_fusion_mode != "none" and not use_feature_pyramid:
@@ -485,6 +556,28 @@ class MultiScaleMultiSourceDANN(nn.Module):
         self.rda_memory_strength = float(rda_memory_strength)
         self.rda_degradation_strength = float(rda_degradation_strength)
         self.rda_msad_strength = float(rda_msad_strength)
+        self.use_anatomical_regions = bool(use_anatomical_regions)
+        self.anatomical_region_max_strength = float(
+            anatomical_region_max_strength
+        )
+        self.use_physiology_prior = bool(use_physiology_prior)
+        self.physiology_max_strength = float(physiology_max_strength)
+        self.use_physiology_reliability = bool(
+            use_physiology_reliability
+        )
+        self.use_class_scale_reliability_fusion = bool(
+            use_class_scale_reliability_fusion
+        )
+        self.class_scale_fusion_strength = float(class_scale_fusion_strength)
+        self.class_scale_entropy_strength = float(
+            class_scale_entropy_strength
+        )
+        self.class_scale_conflict_strength = float(
+            class_scale_conflict_strength
+        )
+        self.class_scale_reliability_floor = float(
+            class_scale_reliability_floor
+        )
 
         self.spatial = WindowSpatialEncoder(
             d_model,
@@ -493,6 +586,8 @@ class MultiScaleMultiSourceDANN(nn.Module):
             dropout,
             use_channel_attention,
             channel_attention_reduction,
+            self.use_anatomical_regions,
+            self.anatomical_region_max_strength,
         )
         self.temporal = nn.ModuleDict(
             {
@@ -669,6 +764,42 @@ class MultiScaleMultiSourceDANN(nn.Module):
             self.rda_memory_gate_logit = nn.Parameter(
                 torch.full((num_classes,), initial_memory_gate)
             )
+
+        # N2 is appended after all R2/N1 modules. Its private RNG scope leaves
+        # the shared model initialisation and the training RNG stream unchanged.
+        self.physiology_projection: nn.Module = nn.Identity()
+        self.physiology_gate_logit: nn.Parameter | None = None
+        if self.use_physiology_prior:
+            private_seed = torch.initial_seed() + 1907
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(private_seed)
+                self.physiology_projection = nn.Sequential(
+                    nn.LayerNorm(PHYSIOLOGY_DIM),
+                    nn.Linear(PHYSIOLOGY_DIM, d_model),
+                    nn.GELU(),
+                    nn.LayerNorm(d_model),
+                )
+            initial_fraction = 0.20
+            self.physiology_gate_logit = nn.Parameter(
+                torch.full(
+                    (len(self.scales),),
+                    math.log(initial_fraction / (1.0 - initial_fraction)),
+                )
+            )
+        self.physiology_reliability_head: nn.Module = nn.Identity()
+        if self.use_physiology_reliability:
+            private_seed = torch.initial_seed() + 2903
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(private_seed)
+                self.physiology_reliability_head = nn.Sequential(
+                    nn.LayerNorm(COMPACT_PHYSIOLOGY_DIM),
+                    nn.Linear(
+                        COMPACT_PHYSIOLOGY_DIM,
+                        physiology_reliability_hidden,
+                    ),
+                    nn.GELU(),
+                    nn.Linear(physiology_reliability_hidden, num_classes),
+                )
 
     def _retrieve_source_prototypes(
         self,
@@ -981,10 +1112,33 @@ class MultiScaleMultiSourceDANN(nn.Module):
         source_memory_features: torch.Tensor | None = None,
         source_memory_distance: torch.Tensor | None = None,
         source_memory_valid: torch.Tensor | None = None,
+        class_scale_reliability_ramp: float = 1.0,
     ) -> dict[str, torch.Tensor]:
         batch, scale_count, _ = scale_logits.shape
         if not 0 <= pyramid_gate_ramp <= 1:
             raise ValueError("pyramid_gate_ramp must be within [0,1]")
+        if not 0 <= class_scale_reliability_ramp <= 1:
+            raise ValueError("class-scale reliability ramp must be within [0,1]")
+        sample_scale_class_reliability = scale_logits.new_ones(
+            (batch, scale_count, self.num_classes)
+        )
+        if self.use_class_scale_reliability_fusion and scale_count > 1:
+            independent_probability = F.softmax(scale_logits.detach(), dim=-1)
+            normalized_entropy = -(
+                independent_probability
+                * torch.log(independent_probability.clamp_min(1e-8))
+            ).sum(dim=-1) / math.log(self.num_classes)
+            mean_probability = independent_probability.mean(dim=1, keepdim=True)
+            class_conflict = (independent_probability - mean_probability).abs()
+            raw_reliability = torch.exp(
+                -self.class_scale_entropy_strength
+                * normalized_entropy.unsqueeze(-1)
+                -self.class_scale_conflict_strength * class_conflict
+            )
+            sample_scale_class_reliability = (
+                self.class_scale_reliability_floor
+                + (1.0 - self.class_scale_reliability_floor) * raw_reliability
+            )
         if scale_count == 1:
             class_weight = scale_logits.new_full(
                 (batch, scale_count, self.num_classes), 1.0 / scale_count
@@ -1023,6 +1177,9 @@ class MultiScaleMultiSourceDANN(nn.Module):
                     class_weight.shape
                 ),
                 "rda_memory_gate": zero_gate,
+                "sample_scale_class_reliability": (
+                    sample_scale_class_reliability
+                ),
             }
         if self.fusion_mode == "uniform":
             class_weight = scale_logits.new_full(
@@ -1048,6 +1205,12 @@ class MultiScaleMultiSourceDANN(nn.Module):
                     )
                 gate_logits = gate_logits + self.relation_strength * torch.log(
                     reliability.clamp_min(1e-6)
+                )
+            if self.use_class_scale_reliability_fusion:
+                gate_logits = gate_logits + (
+                    self.class_scale_fusion_strength
+                    * float(class_scale_reliability_ramp)
+                    * torch.log(sample_scale_class_reliability.clamp_min(1e-6))
                 )
             class_weight = F.softmax(gate_logits, dim=1)
         pyramid_class_weight = class_weight
@@ -1101,6 +1264,9 @@ class MultiScaleMultiSourceDANN(nn.Module):
                     class_weight.shape
                 ),
                 "rda_memory_gate": zero_gate,
+                "sample_scale_class_reliability": (
+                    sample_scale_class_reliability
+                ),
             }
 
         projected_levels = torch.stack(
@@ -1295,6 +1461,9 @@ class MultiScaleMultiSourceDANN(nn.Module):
             "rda_token_degradation": rda_degradation,
             "rda_memory_scale_weight": rda_memory_scale_weight,
             "rda_memory_gate": rda_memory_gate,
+            "sample_scale_class_reliability": (
+                sample_scale_class_reliability
+            ),
         }
 
     @staticmethod
@@ -1321,6 +1490,8 @@ class MultiScaleMultiSourceDANN(nn.Module):
         pyramid_bias_risk: torch.Tensor | None = None,
         source_prototype_memory: torch.Tensor | None = None,
         source_prototype_initialized: torch.Tensor | None = None,
+        physiology_by_scale: Mapping[str, torch.Tensor] | None = None,
+        class_scale_reliability_ramp: float = 1.0,
     ) -> dict[str, torch.Tensor | None]:
         if tuple(x_by_scale) != self.scale_keys:
             raise ValueError(
@@ -1328,6 +1499,11 @@ class MultiScaleMultiSourceDANN(nn.Module):
             )
         if tuple(mask_by_scale) != self.scale_keys:
             raise ValueError("Feature and mask scales do not match")
+        if self.use_physiology_prior or self.use_physiology_reliability:
+            if physiology_by_scale is None:
+                raise ValueError("Physiology-enabled model requires descriptors")
+            if tuple(physiology_by_scale) != self.scale_keys:
+                raise ValueError("Physiology and feature scales do not match")
 
         pooled = []
         encoded_sequences = []
@@ -1343,6 +1519,45 @@ class MultiScaleMultiSourceDANN(nn.Module):
                 )
             )
         tokens = torch.stack(pooled, dim=1) + self.scale_embedding.unsqueeze(0)
+        physiology_gate = tokens.new_zeros(len(self.scales))
+        physiology_logits = None
+        physiology_probability = None
+        if self.use_physiology_prior:
+            if self.physiology_gate_logit is None:
+                raise RuntimeError("Physiology gate is unavailable")
+            descriptors = torch.stack(
+                [physiology_by_scale[key] for key in self.scale_keys], dim=1
+            ).to(tokens)
+            if descriptors.shape != (
+                tokens.shape[0],
+                len(self.scales),
+                PHYSIOLOGY_DIM,
+            ):
+                raise ValueError(
+                    "Physiology descriptors must be [batch,scales,44]"
+                )
+            physiology_gate = self.physiology_max_strength * torch.sigmoid(
+                self.physiology_gate_logit
+            )
+            tokens = tokens + physiology_gate.view(1, -1, 1) * (
+                self.physiology_projection(descriptors)
+            )
+        elif self.use_physiology_reliability:
+            descriptors = torch.stack(
+                [physiology_by_scale[key] for key in self.scale_keys], dim=1
+            ).to(tokens)
+            if descriptors.shape != (
+                tokens.shape[0],
+                len(self.scales),
+                COMPACT_PHYSIOLOGY_DIM,
+            ):
+                raise ValueError(
+                    "Reliability descriptors must be [batch,scales,4]"
+                )
+            physiology_logits = self.physiology_reliability_head(descriptors)
+            physiology_probability = F.softmax(
+                physiology_logits, dim=-1
+            ).mean(dim=1)
 
         # Hard independence boundary: every per-scale classifier consumes only
         # its own scale token. Cross-scale context and the scale-class relation
@@ -1413,6 +1628,7 @@ class MultiScaleMultiSourceDANN(nn.Module):
                 if self.use_source_prototype_memory
                 else None
             ),
+            class_scale_reliability_ramp=class_scale_reliability_ramp,
         )
         logits = fusion["logits"]
         embedding = fusion["embedding"]
@@ -1503,6 +1719,18 @@ class MultiScaleMultiSourceDANN(nn.Module):
                 "rda_memory_scale_weight"
             ],
             "rda_memory_gate": fusion["rda_memory_gate"],
+            "anatomical_region_gate": (
+                self.spatial.anatomical_region_max_strength
+                * torch.sigmoid(self.spatial.anatomical_region_gate_logit)
+                if self.spatial.anatomical_region_gate_logit is not None
+                else scale_logits.new_zeros(())
+            ),
+            "physiology_gate": physiology_gate,
+            "physiology_logits": physiology_logits,
+            "physiology_probability": physiology_probability,
+            "sample_scale_class_reliability": fusion[
+                "sample_scale_class_reliability"
+            ],
             "scale_class_relation_residual": self.scale_class_relation_residual,
             "scale_domain_logits": scale_domain_logits,
             "fused_domain_logits": fused_domain_logits,

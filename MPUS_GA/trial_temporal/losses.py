@@ -16,6 +16,7 @@ def class_conditional_prototype_alignment_loss(
     joint_weights: torch.Tensor,
     confidence_threshold: float,
     target_valid_mask: torch.Tensor | None = None,
+    target_sample_weight: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, float]:
     """Align each source-domain/scale/class centroid to its target centroid.
 
@@ -43,6 +44,10 @@ def class_conditional_prototype_alignment_loss(
         len(target_embeddings),
     ):
         raise ValueError("target_valid_mask must be [batch]")
+    if target_sample_weight is not None and target_sample_weight.shape != (
+        len(target_embeddings),
+    ):
+        raise ValueError("target_sample_weight must be [batch]")
 
     detached_probability = target_probability.detach()
     confidence, pseudo_label = detached_probability.max(dim=1)
@@ -53,6 +58,10 @@ def class_conditional_prototype_alignment_loss(
         (confidence - confidence_threshold)
         / max(1.0 - confidence_threshold, 1e-6)
     ).clamp(0.0, 1.0)
+    if target_sample_weight is not None:
+        confidence_weight = confidence_weight * target_sample_weight.detach().to(
+            confidence_weight
+        ).clamp(0.0, 1.0)
     coverage = float(valid.float().mean())
     class_losses = []
     for class_index in range(classes):

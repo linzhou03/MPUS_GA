@@ -25,6 +25,7 @@ from MPUS_GA.trial_temporal.train import (  # noqa: E402
     EVALUATION_PROTOCOL_FIXED_FINAL,
     EXPERIMENT_ORDER,
     EXPERIMENTS,
+    ClassScaleCompetenceEMA,
     PrototypeBank,
     SourceMultiPrototypeMemory,
     TargetPriorEstimator,
@@ -35,8 +36,10 @@ from MPUS_GA.trial_temporal.train import (  # noqa: E402
     _should_evaluate_target,
     _target_evaluation_is_better,
     _target_subjects,
+    balanced_multiscale_mixup,
     collect_unlabeled_target_evidence,
     independent_scale_consensus,
+    physiology_pseudo_label_reliability,
     train_step,
 )
 
@@ -87,6 +90,112 @@ def test_class_conditional_fusion_uses_external_scale_class_reliability() -> Non
     )
     assert torch.all(class_weight[:, 0, 0] > class_weight[:, 1, 0])
     assert torch.all(class_weight[:, 1, 1] > class_weight[:, 0, 1])
+
+
+def test_class_scale_reliability_fusion_prefers_certain_scale() -> None:
+    model = _small_model(
+        scales=(1.0, 2.0),
+        num_domains=2,
+        use_class_scale_reliability_fusion=True,
+        class_scale_fusion_strength=1.0,
+        class_scale_entropy_strength=2.0,
+        class_scale_conflict_strength=0.0,
+        class_scale_reliability_floor=0.1,
+    )
+    for parameter in model.class_scale_gate.parameters():
+        torch.nn.init.zeros_(parameter)
+    embeddings = torch.zeros(1, 2, 32)
+    logits = torch.tensor([[[5.0, -2.0, -2.0], [0.0, 0.0, 0.0]]])
+    without_routing = model._fuse(
+        embeddings, logits, None, class_scale_reliability_ramp=0.0
+    )
+    with_routing = model._fuse(
+        embeddings, logits, None, class_scale_reliability_ramp=1.0
+    )
+    torch.testing.assert_close(
+        without_routing["scale_class_weight"],
+        torch.full((1, 2, 3), 0.5),
+    )
+    assert (
+        with_routing["scale_class_weight"][0, 0, 0]
+        > with_routing["scale_class_weight"][0, 1, 0]
+    )
+    reliability = with_routing["sample_scale_class_reliability"]
+    assert reliability.shape == (1, 2, 3)
+    assert torch.all((reliability >= 0.1) & (reliability <= 1.0))
+
+
+def test_balanced_multiscale_mixup_preserves_class_and_scale_pairing() -> None:
+    torch.manual_seed(7)
+    labels = torch.tensor([0, 0, 1, 1, 2, 2])
+    subjects = torch.arange(1, 7)
+    base = torch.arange(6, dtype=torch.float32).view(6, 1, 1, 1)
+    features = {
+        "1s": base.expand(-1, 3, 62, 5).clone(),
+        "2s": (10.0 + base).expand(-1, 3, 62, 5).clone(),
+        "4s": (20.0 + base).expand(-1, 3, 62, 5).clone(),
+    }
+    masks = {
+        key: torch.ones(6, 3, dtype=torch.bool) for key in features
+    }
+    batch = {
+        "x": features,
+        "mask": masks,
+        "y": labels,
+        "subject_id": subjects,
+    }
+    augmented = balanced_multiscale_mixup(
+        batch,
+        torch.device("cpu"),
+        torch.tensor([0.2, 0.2, 0.6]),
+        beta_alpha=0.4,
+        rarity_power=0.5,
+    )
+    assert torch.all(labels[augmented.partner_index] == labels)
+    assert torch.all(
+        subjects[augmented.partner_index[:4]] != subjects[:4]
+    )
+    assert torch.all(augmented.sample_weight[:4] > 0)
+    assert torch.all(augmented.sample_weight[4:] == 0)
+    for scale_index, key in enumerate(("1s", "2s", "4s")):
+        offset = 10.0 * scale_index
+        for row in range(4):
+            partner = int(augmented.partner_index[row])
+            coefficient = augmented.mixing_coefficient[row]
+            expected = coefficient * (offset + row) + (
+                1.0 - coefficient
+            ) * (offset + partner)
+            torch.testing.assert_close(
+                augmented.features[key][row],
+                torch.full((3, 62, 5), float(expected)),
+            )
+        torch.testing.assert_close(
+            augmented.features[key][4:], features[key][4:]
+        )
+
+
+def test_class_scale_competence_uses_real_true_class_probability() -> None:
+    tracker = ClassScaleCompetenceEMA(
+        scale_count=2,
+        class_count=3,
+        momentum=0.9,
+        uniform_mix=0.1,
+        device=torch.device("cpu"),
+    )
+    logits = torch.tensor(
+        [
+            [[4.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            [[0.0, 4.0, 0.0], [0.0, 1.0, 0.0]],
+            [[0.0, 0.0, 4.0], [0.0, 0.0, 2.0]],
+        ]
+    )
+    tracker.update(logits, torch.tensor([0, 1, 2]))
+    assert tracker.initialized.all()
+    assert torch.all(tracker.value[0] > tracker.value[1])
+    reliability = tracker.reliability()
+    torch.testing.assert_close(reliability.sum(dim=0), torch.ones(3))
+    deficit = tracker.deficit_weight(floor=0.25, power=1.0)
+    assert torch.all(deficit[1] > deficit[0])
 
 
 def test_weighted_pyramid_keeps_one_feature_per_class() -> None:
@@ -1058,6 +1167,20 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
         "B_R3",
         "A_R4",
         "B_R4",
+        "A_N1",
+        "B_N1",
+        "A_N2",
+        "B_N2",
+        "A_N3",
+        "B_N3",
+        "A_D0",
+        "B_D0",
+        "A_D1",
+        "B_D1",
+        "A_D2",
+        "B_D2",
+        "A_D3",
+        "B_D3",
     )
     assert set(EXPERIMENTS) == set(EXPERIMENT_ORDER)
     assert EXPERIMENTS["A0"].scales == (1.0,)
@@ -1105,6 +1228,17 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
     assert not EXPERIMENTS["A_R4"].use_temporal_msad
     assert EXPERIMENTS["A_R4"].use_source_prototype_memory
     assert not EXPERIMENTS["A_R4"].use_relative_degradation_fusion
+    assert EXPERIMENTS["A_N1"].use_anatomical_regions
+    assert not EXPERIMENTS["A_N1"].use_physiology_prior
+    assert EXPERIMENTS["A_N2"].use_anatomical_regions
+    assert EXPERIMENTS["A_N2"].use_physiology_prior
+    assert not EXPERIMENTS["A_N3"].use_anatomical_regions
+    assert not EXPERIMENTS["A_N3"].use_physiology_prior
+    assert EXPERIMENTS["A_N3"].use_physiology_reliability
+    assert not EXPERIMENTS["A_D0"].use_balanced_multiscale_mixup
+    assert EXPERIMENTS["A_D1"].use_balanced_multiscale_mixup
+    assert EXPERIMENTS["A_D2"].use_class_scale_adaptive_augmentation
+    assert EXPERIMENTS["A_D3"].use_class_scale_reliability_fusion
     paired_fields = (
         "ablation",
         "scales",
@@ -1123,6 +1257,12 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
         "use_temporal_msad",
         "use_source_prototype_memory",
         "use_relative_degradation_fusion",
+        "use_anatomical_regions",
+        "use_physiology_prior",
+        "use_physiology_reliability",
+        "use_balanced_multiscale_mixup",
+        "use_class_scale_adaptive_augmentation",
+        "use_class_scale_reliability_fusion",
         "use_source_excess_suppression",
         "use_boundary_attractor_suppression",
         "domain_weight",
@@ -1150,10 +1290,27 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
             assert getattr(EXPERIMENTS[f"A_{variant}"], field) == getattr(
                 EXPERIMENTS[f"B_{variant}"], field
             )
+    for variant in ("N1", "N2", "N3"):
+        for field in paired_fields:
+            assert getattr(EXPERIMENTS[f"A_{variant}"], field) == getattr(
+                EXPERIMENTS[f"B_{variant}"], field
+            )
     assert _target_subjects("all", 20) == list(range(1, 21))
     assert _adaptation_ramp(300, 300, 600) == 0.0
     assert 0.0 < _adaptation_ramp(450, 300, 600) < 1.0
     assert _adaptation_ramp(600, 300, 600) == 1.0
+
+
+def test_physiology_reliability_is_bounded_and_only_measures_agreement() -> None:
+    eeg = torch.tensor([[0.8, 0.1, 0.1], [0.8, 0.1, 0.1]])
+    physiology = torch.tensor([[0.8, 0.1, 0.1], [0.1, 0.8, 0.1]])
+    weight, divergence = physiology_pseudo_label_reliability(
+        eeg, physiology, temperature=0.15, floor=0.5
+    )
+    assert weight[0] == 1.0
+    assert 0.5 <= weight[1] < weight[0]
+    assert divergence[0] == 0.0
+    assert divergence[1] > divergence[0]
 
 
 def test_target_evaluation_schedule_keeps_fixed_and_caga_protocols_separate() -> None:
@@ -1516,6 +1673,81 @@ def test_r3_train_step_queries_frozen_source_memory() -> None:
     assert not torch.equal(gate_before, model.rda_memory_gate_logit)
     assert len(record["mean_target_rda_memory_distance"]) == 3
     assert len(record["mean_target_rda_memory_scale_weight"]) == 3
+
+
+def test_d3_train_step_uses_source_only_synchronous_minority_mixup() -> None:
+    device = torch.device("cpu")
+    model = _small_model(
+        scales=(1.0, 2.0, 4.0),
+        num_domains=2,
+        pyramid_gate_mode="sample_class",
+        multiview_fusion_mode="class_query_low_rank",
+        use_multiview_uncertainty=True,
+        use_sign_aware_pyramid_guard=True,
+        multiview_source_anchor_mix=0.5,
+        pyramid_gate_shrinkage=0.5,
+        pyramid_gate_ceiling=0.25,
+        use_temporal_msad=True,
+        use_source_prototype_memory=True,
+        use_class_scale_reliability_fusion=True,
+        multiview_low_rank=8,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+
+    def features() -> dict:
+        return {
+            key: torch.randn(6, 3, 62, 5)
+            for key in ("1s", "2s", "4s")
+        }
+
+    masks = {
+        key: torch.ones(6, 3, dtype=torch.bool)
+        for key in ("1s", "2s", "4s")
+    }
+    labels = torch.tensor([0, 0, 1, 1, 2, 2])
+    source_batch = {
+        "x": features(),
+        "mask": masks,
+        "y": labels,
+        "subject_id": torch.arange(1, 7),
+        "domain_id": torch.zeros(6, dtype=torch.long),
+    }
+    target_batch = {
+        "x": features(),
+        "mask": masks,
+        "subject_id": torch.arange(7, 13),
+        "domain_id": torch.ones(6, dtype=torch.long),
+    }
+    memory = SourceMultiPrototypeMemory(3, 3, 2, 32, 0.9, device)
+    competence = ClassScaleCompetenceEMA(3, 3, 0.95, 0.1, device)
+    record = train_step(
+        model,
+        [source_batch],
+        target_batch,
+        optimizer,
+        scheduler,
+        device,
+        iteration=51,
+        spec=EXPERIMENTS["A_D3"],
+        source_class_priors=torch.tensor([[0.20, 0.20, 0.60]]),
+        prototype_bank=None,
+        label_smoothing=0.1,
+        gradient_clip=5.0,
+        adaptation_warmup_iterations=300,
+        adaptation_ramp_end=600,
+        pseudo_confidence_threshold=0.6,
+        source_prototype_memory=memory,
+        class_scale_competence=competence,
+    )
+    assert "y" not in target_batch
+    assert math.isfinite(record["total"])
+    assert record["multiscale_mixup_active"]
+    assert record["multiscale_mixup_active_fraction"] == 4 / 6
+    assert record["multiscale_mixup"] > 0
+    assert competence.initialized.all()
+    assert memory.initialized.all()
+    assert record["source_real_class_scale_reliability"] is not None
 
 
 def test_train_step_rejects_target_labels_before_model_access() -> None:
