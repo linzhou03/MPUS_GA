@@ -25,6 +25,27 @@ DIRECTIONS = {
 RANDOM_SEED = 43
 
 
+def resolve_gpu_uuid(physical_gpu: str) -> str:
+    """Resolve by PCI identity so a failed lower-index GPU cannot poison CUDA."""
+
+    output = subprocess.check_output(
+        [
+            "nvidia-smi",
+            "-i",
+            physical_gpu,
+            "--query-gpu=uuid",
+            "--format=csv,noheader",
+        ],
+        text=True,
+    ).strip()
+    gpu_uuid = output.splitlines()[0].strip() if output else ""
+    if not gpu_uuid.startswith("GPU-"):
+        raise RuntimeError(
+            f"Could not resolve physical GPU {physical_gpu} to a GPU UUID"
+        )
+    return gpu_uuid
+
+
 def command(
     python: str,
     experiment: str,
@@ -93,6 +114,7 @@ def main() -> None:
     ):
         parser.error("Run name must be six_direction_final_<unique-name>")
     data_dir = (args.data_dir or package / "data_processed").resolve()
+    gpu_uuid = resolve_gpu_uuid(args.gpu)
     result_root = package / f"results_{run_name}"
     log_dir = package / "logs" / run_name
     result_root.mkdir(parents=True, exist_ok=True)
@@ -126,6 +148,7 @@ def main() -> None:
         print(f"Results: {result_root}")
         print(f"Logs: {log_dir}")
         print(f"Physical GPU: {args.gpu}")
+        print(f"CUDA GPU UUID: {gpu_uuid}")
         print(f"Sequential experiments: {' -> '.join(EXPERIMENTS)}")
         return
 
@@ -146,6 +169,7 @@ def main() -> None:
         "experiments": list(EXPERIMENTS),
         "directions": DIRECTIONS,
         "physical_gpu": args.gpu,
+        "cuda_visible_device": gpu_uuid,
         "seed": RANDOM_SEED,
         "subjects": args.target_subjects,
         "data_dir": str(data_dir),
@@ -177,7 +201,8 @@ def main() -> None:
 
     environment = dict(
         os.environ,
-        CUDA_VISIBLE_DEVICES=args.gpu,
+        CUDA_DEVICE_ORDER="PCI_BUS_ID",
+        CUDA_VISIBLE_DEVICES=gpu_uuid,
         PYTHONUNBUFFERED="1",
         PYTHONDONTWRITEBYTECODE="1",
     )
