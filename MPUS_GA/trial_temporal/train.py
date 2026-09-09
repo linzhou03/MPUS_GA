@@ -36,6 +36,7 @@ from .data import (
 )
 from .losses import class_conditional_prototype_alignment_loss
 from .model import MultiScaleMultiSourceDANN
+from .subgroup_alignment import SelectiveSubgroupAlignment, SubgroupConfig
 
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
@@ -82,6 +83,7 @@ class ExperimentSpec:
     use_class_scale_reliability_fusion: bool = False
     use_guarded_class_scale_reliability_fusion: bool = False
     use_domain_gap_scale_calibration: bool = False
+    use_subgroup_alignment: bool = False
     use_source_excess_suppression: bool = True
     use_boundary_attractor_suppression: bool = True
     target_dataset: str = "seed_v"
@@ -605,6 +607,33 @@ def _build_experiments() -> dict[str, ExperimentSpec]:
 
 
 EXPERIMENTS = _build_experiments()
+
+
+def subgroup_experiment(direction: str) -> ExperimentSpec:
+    """R2 backbone with selective subgroup contrast replacing centroid alignment."""
+    if direction not in _FINAL_TRANSFER_DIRECTIONS:
+        raise ValueError("R2 subgroup experiments use directions A through F")
+    transfer = _FINAL_TRANSFER_DIRECTIONS[direction]
+    return replace(
+        EXPERIMENTS["A_R2"],
+        name=direction,
+        description=f"{transfer['description']}; R2 selective latent subgroup contrast",
+        transfer_direction=direction,
+        ablation="r2_subgroup",
+        source_domains=transfer["source_domains"],
+        target_dataset=transfer["target_dataset"],
+        target_subject_count=transfer["target_subject_count"],
+        target_trials=transfer["target_trials"],
+        use_subgroup_alignment=True,
+        prototype_weight=0.0,
+    )
+
+
+def subgroup_config(args) -> SubgroupConfig:
+    return SubgroupConfig(**{
+        name: getattr(args, f"subgroup_{name}")
+        for name in SubgroupConfig.__dataclass_fields__
+    })
 
 
 def set_seed(seed: int, device: torch.device) -> None:
@@ -2251,9 +2280,12 @@ def train_step(
     mixup_loss_weight: float = 0.25,
     competence_deficit_floor: float = 0.25,
     competence_deficit_power: float = 1.0,
+    subgroup_alignment: SelectiveSubgroupAlignment | None = None,
 ) -> dict:
     if "y" in target_batch:
         raise RuntimeError("Target adaptation batch unexpectedly contains labels")
+    if spec.use_subgroup_alignment != (subgroup_alignment is not None):
+        raise RuntimeError("Subgroup experiment and training controller must agree")
     if not spec.use_source_excess_suppression:
         common_bias_strength = 0.0
     if not spec.use_boundary_attractor_suppression:
@@ -2650,7 +2682,7 @@ def train_step(
         source_labels,
         target_consensus,
     )
-    if prototype_bank is not None and adaptation_active:
+    if prototype_bank is not None and adaptation_active and not spec.use_subgroup_alignment:
         prototype_loss, pseudo_coverage = (
             class_conditional_prototype_alignment_loss(
                 [output["scale_embeddings"] for output in source_outputs],
@@ -2676,8 +2708,19 @@ def train_step(
             .float()
             .mean()
         )
+    subgroup_loss = target_output["logits"].sum() * 0.0
+    subgroup_record = None
+    subgroup_coefficient = 0.0
+    if subgroup_alignment is not None:
+        subgroup_loss, subgroup_record = subgroup_alignment.loss(
+            source_outputs, source_batches, target_output, target_batch, iteration
+        )
+        subgroup_coefficient = (
+            subgroup_alignment.config.weight * subgroup_alignment.config.ramp(iteration)
+        )
     total_loss = (
         classification_loss
+        + subgroup_coefficient * subgroup_loss
         + mixup_loss_weight * augmentation_loss
         + physiology_classification_weight
         * physiology_classification_loss
@@ -2700,6 +2743,8 @@ def train_step(
     )
     optimizer.step()
     scheduler.step()
+    if subgroup_alignment is not None:
+        subgroup_alignment.after_step(model)
 
     if class_scale_competence is not None:
         for output, labels in zip(
@@ -2910,6 +2955,9 @@ def train_step(
         "domain": float(domain_loss.detach()),
         "domain_by_scale": domain_by_scale,
         "prototype": float(prototype_loss.detach()),
+        "subgroup_contrast": float(subgroup_loss.detach()),
+        "subgroup_contrast_coefficient": subgroup_coefficient,
+        "subgroup_alignment": subgroup_record,
         "pseudo_label_coverage": pseudo_coverage,
         "physiology_reliability_active": (
             spec.use_physiology_reliability and adaptation_active
@@ -3721,6 +3769,12 @@ def run_fold(
     experiment_dir.mkdir(parents=True, exist_ok=True)
     result_path = experiment_dir / f"seed_{seed}_subject_{subject:02d}.json"
     if result_path.exists() and not args.overwrite:
+        if spec.use_subgroup_alignment:
+            saved = json.loads(result_path.read_text(encoding="utf-8"))
+            if saved.get("experiment_spec") != asdict(spec) or (
+                saved.get("subgroup_alignment") or {}
+            ).get("config") != asdict(subgroup_config(args)):
+                raise ValueError("Existing result uses another method/config; use a new result root")
         tqdm.write(f"Skip existing {result_path}")
         return
 
@@ -3929,6 +3983,10 @@ def run_fold(
             args.domain_gap_min_updates,
             device,
         )
+    subgroup_alignment = (
+        SelectiveSubgroupAlignment(model, subgroup_config(args), device)
+        if spec.use_subgroup_alignment else None
+    )
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
@@ -4007,15 +4065,20 @@ def run_fold(
             mixup_loss_weight=args.mixup_loss_weight,
             competence_deficit_floor=args.competence_deficit_floor,
             competence_deficit_power=args.competence_deficit_power,
+            subgroup_alignment=subgroup_alignment,
         )
         if iteration == 1 or iteration % args.log_interval == 0 or iteration == iterations:
             training_trace.append(record)
-            progress.set_postfix(
-                total=f"{record['total']:.3f}",
-                cls=f"{record['classification']:.3f}",
-                dom=f"{record['domain']:.3f}",
-                proto=f"{record['prototype']:.3f}",
-            )
+            postfix = {
+                "total": f"{record['total']:.3f}",
+                "cls": f"{record['classification']:.3f}",
+                "dom": f"{record['domain']:.3f}",
+                "proto": f"{record['prototype']:.3f}",
+            }
+            if subgroup_alignment is not None:
+                postfix["sub"] = f"{record['subgroup_contrast']:.3f}"
+                postfix["match"] = f"{record['subgroup_alignment']['sample_match_coverage']:.2f}"
+            progress.set_postfix(postfix)
         if _should_evaluate_target(
             args.evaluation_protocol,
             iteration,
@@ -4078,6 +4141,8 @@ def run_fold(
         "variant": f"{VARIANT}-{args.evaluation_protocol}",
         "experiment": spec.name,
         "experiment_spec": asdict(spec),
+        "method": args.method,
+        "subgroup_alignment": subgroup_alignment.state() if subgroup_alignment is not None else None,
         "protocol": {
             "name": (
                 f"{'_'.join(prepared.domain_names)}_to_"
@@ -4511,6 +4576,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="Class-conditional multiscale fixed-1000 UDA"
     )
     parser.add_argument("--experiment", choices=EXPERIMENT_ORDER, required=True)
+    parser.add_argument("--method", choices=("experiment", "r2_subgroup"), default="experiment",
+                        help="r2_subgroup builds A-F from R2, without later D/N/domain-gap additions")
+    for name, default in asdict(SubgroupConfig()).items():
+        parser.add_argument("--subgroup-" + name.replace("_", "-"), type=type(default), default=default)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--result-root", type=Path, default=DEFAULT_RESULT_ROOT)
     parser.add_argument("--random-seeds", nargs="+", type=int, default=(42, 43, 44))
@@ -4692,6 +4761,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args, spec: ExperimentSpec) -> None:
+    if spec.use_subgroup_alignment:
+        subgroup_config(args).validate()
+        if args.evaluation_protocol != EVALUATION_PROTOCOL_FIXED_FINAL:
+            raise ValueError("R2 subgroup alignment requires fixed-final evaluation")
+        if args.result_root.expanduser().resolve() == DEFAULT_RESULT_ROOT.resolve():
+            raise ValueError("R2 subgroup alignment requires an independent --result-root")
+        if spec.prototype_weight != 0:
+            raise ValueError("Subgroup contrast replaces coarse centroid alignment")
     if isinstance(args.target_subjects, str):
         args.target_subjects = _target_subjects(
             args.target_subjects, spec.target_subject_count
@@ -4888,7 +4965,8 @@ def validate_args(args, spec: ExperimentSpec) -> None:
 
 def main() -> None:
     args = build_parser().parse_args()
-    spec = EXPERIMENTS[args.experiment]
+    spec = (subgroup_experiment(args.experiment) if args.method == "r2_subgroup"
+            else EXPERIMENTS[args.experiment])
     validate_args(args, spec)
     args.data_dir = args.data_dir.expanduser().resolve()
     args.result_root = args.result_root.expanduser().resolve()
