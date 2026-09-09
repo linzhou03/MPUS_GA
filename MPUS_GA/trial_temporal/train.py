@@ -81,6 +81,7 @@ class ExperimentSpec:
     use_class_scale_adaptive_augmentation: bool = False
     use_class_scale_reliability_fusion: bool = False
     use_guarded_class_scale_reliability_fusion: bool = False
+    use_domain_gap_scale_calibration: bool = False
     use_source_excess_suppression: bool = True
     use_boundary_attractor_suppression: bool = True
     target_dataset: str = "seed_v"
@@ -570,8 +571,8 @@ def _build_experiments() -> dict[str, ExperimentSpec]:
         experiments[direction] = ExperimentSpec(
             name=direction,
             description=(
-                f"{transfer['description']}; final source-calibrated guarded "
-                "class-balanced multiscale adaptation"
+                f"{transfer['description']}; final domain-gap-calibrated "
+                "guarded class-balanced multiscale adaptation"
             ),
             transfer_direction=direction,
             ablation="final",
@@ -593,6 +594,7 @@ def _build_experiments() -> dict[str, ExperimentSpec]:
             use_balanced_multiscale_mixup=True,
             use_class_scale_adaptive_augmentation=True,
             use_guarded_class_scale_reliability_fusion=True,
+            use_domain_gap_scale_calibration=True,
             use_source_excess_suppression=True,
             use_boundary_attractor_suppression=True,
             target_dataset=transfer["target_dataset"],
@@ -1056,6 +1058,220 @@ class ClassScaleCompetenceEMA:
             "momentum": self.momentum,
             "uniform_mix": self.uniform_mix,
             "statistics_source": "real_labeled_source_batches_only",
+        }
+
+
+class DomainGapScaleCalibrator:
+    """Bounded scale transferability from source and unlabeled target evidence."""
+
+    def __init__(
+        self,
+        scale_count: int,
+        class_count: int,
+        momentum: float,
+        agreement_momentum: float,
+        spread_weight: float,
+        gap_strength: float,
+        uniform_mix: float,
+        max_log_deviation: float,
+        minimum_updates: int,
+        device: torch.device,
+    ) -> None:
+        if scale_count < 2 or class_count < 2:
+            raise ValueError("Domain-gap calibration requires multiple scales")
+        if not 0 <= momentum < 1 or not 0 <= agreement_momentum < 1:
+            raise ValueError("Domain-gap EMA momenta must be within [0,1)")
+        if spread_weight < 0 or gap_strength < 0:
+            raise ValueError("Domain-gap weights must be nonnegative")
+        if not 0 <= uniform_mix <= 1 or max_log_deviation <= 0:
+            raise ValueError("Domain-gap calibration bounds are invalid")
+        if minimum_updates < 1:
+            raise ValueError("Domain-gap minimum updates must be positive")
+        self.scale_count = int(scale_count)
+        self.class_count = int(class_count)
+        self.momentum = float(momentum)
+        self.agreement_momentum = float(agreement_momentum)
+        self.spread_weight = float(spread_weight)
+        self.gap_strength = float(gap_strength)
+        self.uniform_mix = float(uniform_mix)
+        self.max_log_deviation = float(max_log_deviation)
+        self.minimum_updates = int(minimum_updates)
+        self.domain_gap = torch.zeros(scale_count, device=device)
+        self.domain_initialized = torch.tensor(False, device=device)
+        self.domain_updates = torch.zeros((), dtype=torch.long, device=device)
+        self.target_agreement = torch.full(
+            (scale_count, class_count), 1.0 / class_count, device=device
+        )
+        self.agreement_initialized = torch.zeros(
+            (scale_count, class_count), dtype=torch.bool, device=device
+        )
+        self.agreement_updates = torch.zeros(
+            (scale_count, class_count), dtype=torch.long, device=device
+        )
+
+    @torch.no_grad()
+    def update(
+        self,
+        source_scale_embeddings: list[torch.Tensor],
+        target_scale_embeddings: torch.Tensor,
+        target_scale_logits: torch.Tensor,
+        confidence_threshold: float,
+    ) -> None:
+        """Update without target labels or fused target predictions."""
+
+        if not source_scale_embeddings:
+            raise ValueError("At least one source embedding batch is required")
+        source = torch.cat(
+            [embedding.detach() for embedding in source_scale_embeddings], dim=0
+        )
+        target = target_scale_embeddings.detach()
+        if source.ndim != 3 or target.ndim != 3:
+            raise ValueError("Scale embeddings must be [batch,scales,features]")
+        if source.shape[1:] != target.shape[1:]:
+            raise ValueError("Source and target scale embeddings must match")
+        if source.shape[1] != self.scale_count:
+            raise ValueError("Scale embedding count does not match calibrator")
+        if target_scale_logits.shape[:2] != target.shape[:2] or (
+            target_scale_logits.ndim != 3
+            or target_scale_logits.shape[2] != self.class_count
+        ):
+            raise ValueError("Target scale logits do not match calibrator")
+        if not 0 <= confidence_threshold < 1:
+            raise ValueError("Confidence threshold must be within [0,1)")
+
+        source_mean = source.mean(dim=0)
+        target_mean = target.mean(dim=0)
+        source_variance = source.var(dim=0, unbiased=False)
+        target_variance = target.var(dim=0, unbiased=False)
+        pooled_variance = 0.5 * (source_variance + target_variance)
+        mean_gap = (
+            (source_mean - target_mean).square()
+            / pooled_variance.clamp_min(1e-6)
+        ).mean(dim=-1)
+        spread_gap = (
+            torch.log(source_variance.clamp_min(1e-6))
+            - torch.log(target_variance.clamp_min(1e-6))
+        ).square().mean(dim=-1)
+        observed_gap = mean_gap + self.spread_weight * spread_gap
+        if bool(self.domain_initialized):
+            self.domain_gap.mul_(self.momentum).add_(
+                observed_gap, alpha=1.0 - self.momentum
+            )
+        else:
+            self.domain_gap.copy_(observed_gap)
+            self.domain_initialized.fill_(True)
+        self.domain_updates += 1
+
+        probability = F.softmax(target_scale_logits.detach(), dim=-1)
+        probability_sum = probability.sum(dim=1)
+        for scale_index in range(self.scale_count):
+            peer_probability = (
+                probability_sum - probability[:, scale_index]
+            ) / (self.scale_count - 1)
+            peer_confidence, peer_label = peer_probability.max(dim=-1)
+            confident = peer_confidence >= confidence_threshold
+            for class_index in range(self.class_count):
+                selected = confident & (peer_label == class_index)
+                if not torch.any(selected):
+                    continue
+                weight = peer_confidence[selected]
+                observed = (
+                    probability[selected, scale_index, class_index] * weight
+                ).sum() / weight.sum().clamp_min(1e-8)
+                if self.agreement_initialized[scale_index, class_index]:
+                    self.target_agreement[scale_index, class_index].mul_(
+                        self.agreement_momentum
+                    ).add_(observed, alpha=1.0 - self.agreement_momentum)
+                else:
+                    self.target_agreement[scale_index, class_index].copy_(
+                        observed
+                    )
+                    self.agreement_initialized[scale_index, class_index] = True
+                self.agreement_updates[scale_index, class_index] += 1
+
+    @torch.no_grad()
+    def reliability(
+        self, source_competence: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        """Return normalized, uniform-shrunk class-by-scale reliability."""
+
+        if int(self.domain_updates) < self.minimum_updates:
+            return None
+        uniform = torch.full_like(
+            self.target_agreement, 1.0 / self.scale_count
+        )
+        if source_competence is None:
+            source_reliability = uniform
+        else:
+            if source_competence.shape != self.target_agreement.shape:
+                raise ValueError("Source competence does not match calibrator")
+            source_reliability = source_competence.clamp_min(1e-8)
+            source_reliability = source_reliability / source_reliability.sum(
+                dim=0, keepdim=True
+            ).clamp_min(1e-8)
+
+        relative_gap = self.domain_gap / self.domain_gap.mean().clamp_min(1e-8)
+        domain_reliability = F.softmax(
+            -self.gap_strength * relative_gap, dim=0
+        ).unsqueeze(-1).expand_as(self.target_agreement)
+        target_reliability = self.target_agreement.clamp_min(1e-8)
+        target_reliability = target_reliability / target_reliability.sum(
+            dim=0, keepdim=True
+        ).clamp_min(1e-8)
+        log_score = (
+            torch.log(source_reliability)
+            + torch.log(domain_reliability)
+            + torch.log(target_reliability)
+        ) / 3.0
+        raw = F.softmax(log_score, dim=0)
+        bounded_log_relative = torch.log(
+            (raw * self.scale_count).clamp_min(1e-8)
+        ).clamp(-self.max_log_deviation, self.max_log_deviation)
+        bounded = F.softmax(bounded_log_relative, dim=0)
+        return (1.0 - self.uniform_mix) * bounded + self.uniform_mix * uniform
+
+    @torch.no_grad()
+    def domain_reliability(self) -> torch.Tensor | None:
+        if int(self.domain_updates) < self.minimum_updates:
+            return None
+        relative_gap = self.domain_gap / self.domain_gap.mean().clamp_min(1e-8)
+        return F.softmax(-self.gap_strength * relative_gap, dim=0)
+
+    def state(self, source_competence: torch.Tensor | None = None) -> dict:
+        calibrated = self.reliability(source_competence)
+        domain_reliability = self.domain_reliability()
+        return {
+            "domain_gap_by_scale": self.domain_gap.cpu().tolist(),
+            "domain_reliability_by_scale": (
+                domain_reliability.cpu().tolist()
+                if domain_reliability is not None
+                else None
+            ),
+            "target_leave_one_out_agreement_by_scale_class": (
+                self.target_agreement.cpu().tolist()
+            ),
+            "calibrated_reliability_by_scale_class": (
+                calibrated.cpu().tolist() if calibrated is not None else None
+            ),
+            "domain_initialized": bool(self.domain_initialized),
+            "domain_updates": int(self.domain_updates),
+            "agreement_initialized_by_scale_class": (
+                self.agreement_initialized.cpu().tolist()
+            ),
+            "agreement_updates_by_scale_class": (
+                self.agreement_updates.cpu().tolist()
+            ),
+            "momentum": self.momentum,
+            "agreement_momentum": self.agreement_momentum,
+            "spread_weight": self.spread_weight,
+            "gap_strength": self.gap_strength,
+            "uniform_mix": self.uniform_mix,
+            "max_log_deviation": self.max_log_deviation,
+            "minimum_updates": self.minimum_updates,
+            "statistics_source": (
+                "source_and_unlabeled_target_embeddings_plus_independent_"
+                "target_scale_logits; no_target_labels_or_fused_predictions"
+            ),
         }
 
 
@@ -2028,6 +2244,7 @@ def train_step(
     physiology_reliability_temperature: float = 0.15,
     physiology_reliability_floor: float = 0.50,
     class_scale_competence: ClassScaleCompetenceEMA | None = None,
+    domain_gap_scale_calibrator: DomainGapScaleCalibrator | None = None,
     mixup_warmup_iterations: int = 50,
     mixup_beta_alpha: float = 0.40,
     mixup_rarity_power: float = 0.50,
@@ -2058,18 +2275,27 @@ def train_step(
         if class_scale_competence is not None
         else None
     )
-    reliability = (
-        _combine_scale_class_reliability(
-            prototype_reliability, competence_reliability
-        )
-        if spec.use_class_scale_reliability_fusion
-        else prototype_reliability
-    )
-    guarded_reliability = (
-        competence_reliability
-        if spec.use_guarded_class_scale_reliability_fusion
+    calibrated_reliability = (
+        domain_gap_scale_calibrator.reliability(competence_reliability)
+        if domain_gap_scale_calibrator is not None
         else None
     )
+    reliability = prototype_reliability
+    if spec.use_class_scale_reliability_fusion:
+        reliability = _combine_scale_class_reliability(
+            prototype_reliability, competence_reliability
+        )
+    elif spec.use_domain_gap_scale_calibration:
+        reliability = _combine_scale_class_reliability(
+            prototype_reliability, calibrated_reliability
+        )
+    guarded_reliability = (
+        calibrated_reliability
+        if calibrated_reliability is not None
+        else competence_reliability
+    )
+    if not spec.use_guarded_class_scale_reliability_fusion:
+        guarded_reliability = None
     base_source_multiview_anchor = (
         prototype_bank.source_relation_weights().mean(dim=0)
         if prototype_bank is not None
@@ -2481,6 +2707,14 @@ def train_step(
         ):
             class_scale_competence.update(output["scale_logits"], labels)
 
+    if domain_gap_scale_calibrator is not None and adaptation_active:
+        domain_gap_scale_calibrator.update(
+            [output["scale_embeddings"] for output in source_outputs],
+            target_output["scale_embeddings"],
+            target_output["scale_logits"],
+            pseudo_confidence_threshold,
+        )
+
     # R memory has a strict information boundary: source true labels only.
     # It is updated during the source warmup, then frozen for all subsequent
     # target querying and final evaluation. Target labels/pseudo-labels never
@@ -2537,13 +2771,20 @@ def train_step(
             if class_scale_competence is not None
             else None
         )
-        reliability = (
-            _combine_scale_class_reliability(
+        calibrated_reliability = (
+            domain_gap_scale_calibrator.reliability(competence_reliability)
+            if domain_gap_scale_calibrator is not None
+            else None
+        )
+        reliability = prototype_reliability
+        if spec.use_class_scale_reliability_fusion:
+            reliability = _combine_scale_class_reliability(
                 prototype_reliability, competence_reliability
             )
-            if spec.use_class_scale_reliability_fusion
-            else prototype_reliability
-        )
+        elif spec.use_domain_gap_scale_calibration:
+            reliability = _combine_scale_class_reliability(
+                prototype_reliability, calibrated_reliability
+            )
         source_weights = prototype_bank.source_weights(source_class_priors)
 
     mean_gate = target_output["scale_class_weight"].detach().mean(dim=0)
@@ -2702,6 +2943,11 @@ def train_step(
         "source_real_class_scale_reliability": (
             class_scale_competence.reliability().cpu().tolist()
             if class_scale_competence is not None
+            else None
+        ),
+        "domain_gap_scale_calibration": (
+            domain_gap_scale_calibrator.state(competence_reliability)
+            if domain_gap_scale_calibrator is not None
             else None
         ),
         "augmentation_class_scale_deficit_weight": (
@@ -2920,6 +3166,7 @@ def evaluate_trials(
     final_target_evidence: TargetEvidenceSnapshot | None = None,
     source_prototype_memory: SourceMultiPrototypeMemory | None = None,
     class_scale_competence: ClassScaleCompetenceEMA | None = None,
+    domain_gap_scale_calibrator: DomainGapScaleCalibrator | None = None,
 ) -> dict:
     model.eval()
     probabilities = []
@@ -2956,15 +3203,26 @@ def evaluate_trials(
         if class_scale_competence is not None
         else None
     )
-    reliability = (
-        _combine_scale_class_reliability(
+    calibrated_reliability = (
+        domain_gap_scale_calibrator.reliability(competence_reliability)
+        if domain_gap_scale_calibrator is not None
+        else None
+    )
+    reliability = prototype_reliability
+    if model.use_class_scale_reliability_fusion:
+        reliability = _combine_scale_class_reliability(
             prototype_reliability, competence_reliability
         )
-        if model.use_class_scale_reliability_fusion
-        else prototype_reliability
-    )
+    elif domain_gap_scale_calibrator is not None:
+        reliability = _combine_scale_class_reliability(
+            prototype_reliability, calibrated_reliability
+        )
     guarded_reliability = (
-        competence_reliability
+        (
+            calibrated_reliability
+            if calibrated_reliability is not None
+            else competence_reliability
+        )
         if model.use_guarded_class_scale_reliability_fusion
         else None
     )
@@ -3274,6 +3532,11 @@ def evaluate_trials(
         "source_real_class_scale_reliability": (
             class_scale_competence.reliability().cpu().tolist()
             if class_scale_competence is not None
+            else None
+        ),
+        "domain_gap_scale_calibration": (
+            domain_gap_scale_calibrator.state(competence_reliability)
+            if domain_gap_scale_calibrator is not None
             else None
         ),
         "pyramid_bias_risk": (
@@ -3643,12 +3906,27 @@ def run_fold(
         spec.use_class_scale_adaptive_augmentation
         or spec.use_class_scale_reliability_fusion
         or spec.use_guarded_class_scale_reliability_fusion
+        or spec.use_domain_gap_scale_calibration
     ):
         class_scale_competence = ClassScaleCompetenceEMA(
             len(spec.scales),
             NUM_CLASSES,
             args.class_scale_competence_momentum,
             args.class_scale_competence_uniform_mix,
+            device,
+        )
+    domain_gap_scale_calibrator = None
+    if spec.use_domain_gap_scale_calibration:
+        domain_gap_scale_calibrator = DomainGapScaleCalibrator(
+            len(spec.scales),
+            NUM_CLASSES,
+            args.domain_gap_momentum,
+            args.target_scale_agreement_momentum,
+            args.domain_gap_spread_weight,
+            args.domain_gap_strength,
+            args.domain_gap_uniform_mix,
+            args.domain_gap_max_log_deviation,
+            args.domain_gap_min_updates,
             device,
         )
     if device.type == "cuda":
@@ -3722,6 +4000,7 @@ def run_fold(
             ),
             physiology_reliability_floor=args.physiology_reliability_floor,
             class_scale_competence=class_scale_competence,
+            domain_gap_scale_calibrator=domain_gap_scale_calibrator,
             mixup_warmup_iterations=args.mixup_warmup_iterations,
             mixup_beta_alpha=args.mixup_beta_alpha,
             mixup_rarity_power=args.mixup_rarity_power,
@@ -3771,6 +4050,7 @@ def run_fold(
                 final_target_evidence,
                 source_prototype_memory=source_prototype_memory,
                 class_scale_competence=class_scale_competence,
+                domain_gap_scale_calibrator=domain_gap_scale_calibrator,
             )
             target_evaluation_trace.append(
                 {"iteration": iteration, "evaluation": candidate_evaluation}
@@ -3907,6 +4187,9 @@ def run_fold(
             ),
             "use_guarded_class_scale_reliability_fusion": (
                 spec.use_guarded_class_scale_reliability_fusion
+            ),
+            "use_domain_gap_scale_calibration": (
+                spec.use_domain_gap_scale_calibration
             ),
             "class_scale_fusion_strength": args.class_scale_fusion_strength,
             "class_scale_entropy_strength": (
@@ -4084,6 +4367,17 @@ def run_fold(
             ),
             "competence_deficit_floor": args.competence_deficit_floor,
             "competence_deficit_power": args.competence_deficit_power,
+            "domain_gap_momentum": args.domain_gap_momentum,
+            "target_scale_agreement_momentum": (
+                args.target_scale_agreement_momentum
+            ),
+            "domain_gap_spread_weight": args.domain_gap_spread_weight,
+            "domain_gap_strength": args.domain_gap_strength,
+            "domain_gap_uniform_mix": args.domain_gap_uniform_mix,
+            "domain_gap_max_log_deviation": (
+                args.domain_gap_max_log_deviation
+            ),
+            "domain_gap_min_updates": args.domain_gap_min_updates,
             "removed_losses": [
                 "supervised_contrastive",
                 "information_maximization",
@@ -4103,6 +4397,15 @@ def run_fold(
         "final_class_scale_competence": (
             class_scale_competence.state()
             if class_scale_competence is not None
+            else None
+        ),
+        "final_domain_gap_scale_calibration": (
+            domain_gap_scale_calibrator.state(
+                class_scale_competence.reliability()
+                if class_scale_competence is not None
+                else None
+            )
+            if domain_gap_scale_calibrator is not None
             else None
         ),
         "final_target_prior_estimator": target_prior_estimator.state(),
@@ -4286,6 +4589,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--class-scale-competence-uniform-mix", type=float, default=0.10
     )
+    parser.add_argument("--domain-gap-momentum", type=float, default=0.95)
+    parser.add_argument(
+        "--target-scale-agreement-momentum", type=float, default=0.95
+    )
+    parser.add_argument(
+        "--domain-gap-spread-weight", type=float, default=0.25
+    )
+    parser.add_argument("--domain-gap-strength", type=float, default=0.50)
+    parser.add_argument(
+        "--domain-gap-uniform-mix", type=float, default=0.50
+    )
+    parser.add_argument(
+        "--domain-gap-max-log-deviation", type=float, default=0.35
+    )
+    parser.add_argument("--domain-gap-min-updates", type=int, default=20)
     parser.add_argument(
         "--competence-deficit-floor", type=float, default=0.25
     )
@@ -4491,6 +4809,18 @@ def validate_args(args, spec: ExperimentSpec) -> None:
         raise ValueError("class-scale-competence-momentum must be within [0,1)")
     if not 0 <= args.class_scale_competence_uniform_mix <= 1:
         raise ValueError("class-scale-competence-uniform-mix must be within [0,1]")
+    if not 0 <= args.domain_gap_momentum < 1:
+        raise ValueError("domain-gap-momentum must be within [0,1)")
+    if not 0 <= args.target_scale_agreement_momentum < 1:
+        raise ValueError("target-scale-agreement-momentum must be within [0,1)")
+    if min(args.domain_gap_spread_weight, args.domain_gap_strength) < 0:
+        raise ValueError("domain-gap weights must be nonnegative")
+    if not 0 <= args.domain_gap_uniform_mix <= 1:
+        raise ValueError("domain-gap-uniform-mix must be within [0,1]")
+    if args.domain_gap_max_log_deviation <= 0:
+        raise ValueError("domain-gap-max-log-deviation must be positive")
+    if args.domain_gap_min_updates < 1:
+        raise ValueError("domain-gap-min-updates must be positive")
     if min(
         args.class_scale_fusion_strength,
         args.class_scale_entropy_strength,
@@ -4520,6 +4850,11 @@ def validate_args(args, spec: ExperimentSpec) -> None:
         and not spec.use_class_scale_adaptive_augmentation
     ):
         raise ValueError("Guarded reliability fusion requires adaptive augmentation")
+    if (
+        spec.use_domain_gap_scale_calibration
+        and not spec.use_guarded_class_scale_reliability_fusion
+    ):
+        raise ValueError("Domain-gap calibration requires guarded fusion")
     if args.pyramid_gate_teacher_temperature <= 0:
         raise ValueError("pyramid gate teacher temperature must be positive")
     if args.prior_correction_strength < 0:

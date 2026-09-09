@@ -1,4 +1,4 @@
-"""Run the final A-F cross-dataset suite sequentially on one physical GPU."""
+"""Run domain-calibrated A-F transfers sequentially on one physical GPU."""
 
 from __future__ import annotations
 
@@ -175,6 +175,10 @@ def main() -> None:
         "data_dir": str(data_dir),
         "python": sys.executable,
         "protocol": "pairwise_cross_dataset_transductive_fixed1000",
+        "method": (
+            "class_balanced_multiscale_with_bounded_unlabeled_"
+            "domain_gap_scale_calibration"
+        ),
         "execution": "strictly_sequential_one_experiment_at_a_time",
         "code_sha256": _code_hashes(package),
         "data_identity": [

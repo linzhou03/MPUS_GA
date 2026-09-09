@@ -26,6 +26,7 @@ from MPUS_GA.trial_temporal.train import (  # noqa: E402
     EXPERIMENT_ORDER,
     EXPERIMENTS,
     ClassScaleCompetenceEMA,
+    DomainGapScaleCalibrator,
     PrototypeBank,
     SourceMultiPrototypeMemory,
     TargetPriorEstimator,
@@ -251,6 +252,47 @@ def test_class_scale_competence_uses_real_true_class_probability() -> None:
     torch.testing.assert_close(reliability.sum(dim=0), torch.ones(3))
     deficit = tracker.deficit_weight(floor=0.25, power=1.0)
     assert torch.all(deficit[1] > deficit[0])
+
+
+def test_domain_gap_scale_calibrator_is_label_free_bounded_and_normalized() -> None:
+    tracker = DomainGapScaleCalibrator(
+        scale_count=3,
+        class_count=3,
+        momentum=0.95,
+        agreement_momentum=0.95,
+        spread_weight=0.25,
+        gap_strength=0.5,
+        uniform_mix=0.5,
+        max_log_deviation=0.35,
+        minimum_updates=1,
+        device=torch.device("cpu"),
+    )
+    assert tracker.reliability(None) is None
+    torch.manual_seed(13)
+    source = torch.randn(12, 3, 8)
+    target = source[:8].clone()
+    target[:, 1] += 1.5
+    target[:, 2] += 3.0
+    target_logits = torch.tensor(
+        [
+            [[5.0, 0.0, 0.0], [2.0, 0.0, 0.0], [1.5, 0.0, 0.0]],
+            [[0.0, 5.0, 0.0], [0.0, 2.0, 0.0], [0.0, 1.5, 0.0]],
+            [[0.0, 0.0, 5.0], [0.0, 0.0, 2.0], [0.0, 0.0, 1.5]],
+        ]
+    ).repeat(3, 1, 1)[:8]
+    tracker.update([source], target, target_logits, confidence_threshold=0.5)
+    source_competence = torch.tensor(
+        [[0.6, 0.6, 0.6], [0.3, 0.3, 0.3], [0.1, 0.1, 0.1]]
+    )
+    reliability = tracker.reliability(source_competence)
+    assert reliability is not None
+    torch.testing.assert_close(reliability.sum(dim=0), torch.ones(3))
+    assert torch.all(reliability > 0)
+    assert torch.all(reliability[0] > reliability[2])
+    assert tracker.domain_gap[0] < tracker.domain_gap[2]
+    assert int(tracker.domain_updates) == 1
+    state = tracker.state(source_competence)
+    assert "no_target_labels" in state["statistics_source"]
 
 
 def test_weighted_pyramid_keeps_one_feature_per_class() -> None:
@@ -1319,6 +1361,7 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
         assert spec.use_balanced_multiscale_mixup
         assert spec.use_class_scale_adaptive_augmentation
         assert spec.use_guarded_class_scale_reliability_fusion
+        assert spec.use_domain_gap_scale_calibration
         assert not spec.use_class_scale_reliability_fusion
     paired_fields = (
         "ablation",
@@ -1345,6 +1388,7 @@ def test_experiment_matrix_and_adaptation_schedule() -> None:
         "use_class_scale_adaptive_augmentation",
         "use_class_scale_reliability_fusion",
         "use_guarded_class_scale_reliability_fusion",
+        "use_domain_gap_scale_calibration",
         "use_source_excess_suppression",
         "use_boundary_attractor_suppression",
         "domain_weight",
