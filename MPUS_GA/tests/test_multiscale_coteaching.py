@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import sys
 import tempfile
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 import torch
 import torch.nn.functional as F
@@ -217,25 +217,47 @@ def test_single_gpu_worker_runs_exactly_abcdef_and_stops_after_failure():
         for domain in ('seed_iv','seed_v','seed_vii'):
             p=package/'data_processed'/domain/'window_1s'/'subject_01_session_1.npz'
             p.parent.mkdir(parents=True,exist_ok=True);p.touch()
-        for failure in (None,'C'):
+        for reverse,failure in ((False,None),(False,'C'),(True,None),(True,'C')):
             calls=[]
-            run='r2_coteaching_scheduler_'+str(failure)
+            gpu='1' if reverse else '0'
+            order='FEDCBA' if reverse else 'ABCDEF'
+            run=f'r2_coteaching_scheduler_{reverse}_{failure}'
             def launch(cmd,**kwargs):
                 direction=cmd[cmd.index('--experiment')+1]
-                assert kwargs['env']['CUDA_VISIBLE_DEVICES']=='GPU-test-zero'
+                assert kwargs['env']['CUDA_VISIBLE_DEVICES']=='GPU-test-'+gpu
                 assert cmd[cmd.index('--random-seeds')+1:cmd.index('--random-seeds')+3]==['43','42']
                 calls.append(direction)
                 return 7 if direction==failure else 0
             with patch.object(suite,'__file__',str(package/'scripts'/'suite.py')), \
-                 patch.object(suite,'resolve_gpu_uuid',return_value='GPU-test-zero'), \
+                 patch.object(suite,'resolve_gpu_uuid',return_value='GPU-test-'+gpu), \
                  patch.object(suite.subprocess,'call',side_effect=launch), \
-                 patch.object(sys,'argv',['suite','--worker','--run-name',run,'--gpus','0']):
+                 patch.object(sys,'argv',['suite','--worker','--run-name',run,'--gpus',gpu]+(['--reverse'] if reverse else [])):
                 try:suite.main(method='r2_coteaching',config_type=CoTeachingConfig,default_gpus=['0'])
                 except SystemExit as error:assert failure and error.code==1
                 else:assert failure is None
-            assert calls==list('ABC' if failure else 'ABCDEF')
+            assert calls==list(order[:order.index(failure)+1] if failure else order)
             manifest=json.loads((package/('results_'+run)/'suite_manifest.json').read_text())
-            assert manifest['gpu_mapping']=={'0':list('ABCDEF')}
+            assert manifest['gpu_mapping']=={gpu:list(order)}
+
+
+def test_reverse_flag_reaches_detached_worker():
+    with tempfile.TemporaryDirectory() as directory:
+        package=Path(directory)/'MPUS_GA'
+        for domain in ('seed_iv','seed_v','seed_vii'):
+            p=package/'data_processed'/domain/'window_1s'/'subject_01_session_1.npz'
+            p.parent.mkdir(parents=True,exist_ok=True);p.touch()
+        with patch.object(suite,'__file__',str(package/'scripts'/'suite.py')), \
+             patch.object(suite,'resolve_gpu_uuid',return_value='GPU-test-one'), \
+             patch.object(suite.subprocess,'Popen',return_value=Mock(pid=12345)) as popen, \
+             patch.object(sys,'argv',['suite','--run-name','r2_coteaching_reverse_dispatch',
+                                      '--gpus','1','--reverse','--random-seeds','43','42']):
+            suite.main(method='r2_coteaching',config_type=CoTeachingConfig,
+                       module='MPUS_GA.scripts.run_r2_coteaching_suite')
+        cmd=popen.call_args.args[0]
+        assert '--worker' in cmd and '--reverse' in cmd
+        assert cmd[cmd.index('--gpus')+1]=='1'
+        assert cmd[cmd.index('--random-seeds')+1:cmd.index('--random-seeds')+3]==['43','42']
+        assert popen.call_args.kwargs['start_new_session']
 
 
 if __name__=='__main__':

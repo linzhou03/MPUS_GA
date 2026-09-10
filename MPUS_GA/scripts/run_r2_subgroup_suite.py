@@ -21,11 +21,12 @@ GPU_EXPERIMENTS = (("A", "C", "E"), ("B", "D", "F"))
 MODULE = "MPUS_GA.scripts.run_r2_subgroup_suite"
 
 
-def gpu_experiments(gpus):
+def gpu_experiments(gpus, reverse=False):
+    order = tuple("FEDCBA" if reverse else "ABCDEF")
     if len(gpus) == 1:
-        return (tuple("ABCDEF"),)
+        return (order,)
     if len(gpus) == 2:
-        return GPU_EXPERIMENTS
+        return (order[::2], order[1::2])
     raise ValueError("Provide one or two physical GPUs")
 
 
@@ -51,6 +52,7 @@ def main(method="r2_subgroup", config_type=SubgroupConfig, module=MODULE, defaul
     parser.add_argument("--data-dir", type=Path)
     parser.add_argument("--random-seeds", nargs="+", type=int, default=[43, 42])
     parser.add_argument("--target-subjects", default="all")
+    parser.add_argument("--reverse", action="store_true", help="Run directions F to A; seed order stays unchanged")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     for name, default in asdict(config_type()).items():
@@ -61,7 +63,7 @@ def main(method="r2_subgroup", config_type=SubgroupConfig, module=MODULE, defaul
     config.validate()
     if len(args.gpus) not in (1, 2) or len(set(args.gpus)) != len(args.gpus) or any(not gpu.isdigit() for gpu in args.gpus):
         parser.error("Provide one or two distinct physical GPU indices")
-    queues = gpu_experiments(args.gpus)
+    queues = gpu_experiments(args.gpus, reverse=args.reverse)
     if len(set(args.random_seeds)) != len(args.random_seeds):
         parser.error("Seeds must be distinct")
     package = Path(__file__).resolve().parents[1]
@@ -112,7 +114,8 @@ def main(method="r2_subgroup", config_type=SubgroupConfig, module=MODULE, defaul
                 [sys.executable, "-u", "-m", module, "--worker", "--run-name", run_name,
                  "--gpus", *args.gpus, "--data-dir", str(data_dir),
                  "--random-seeds", *map(str, args.random_seeds),
-                 "--target-subjects", args.target_subjects, *subgroup_arguments(config)],
+                 "--target-subjects", args.target_subjects,
+                 *(["--reverse"] if args.reverse else []), *subgroup_arguments(config)],
                 cwd=package.parent, stdin=subprocess.DEVNULL, stdout=log,
                 stderr=subprocess.STDOUT, start_new_session=True,
             )

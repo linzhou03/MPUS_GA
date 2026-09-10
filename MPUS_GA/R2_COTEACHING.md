@@ -138,3 +138,23 @@ behavior tests passed. The isolated C/seed43/subject01 GPU-0 fold completed all
 artifacts are at `/tmp/mpus_coteaching_smoke_20260910_y3oqeq3c/` on csu.
 A mocked worker test verifies exact A-B-C-D-E-F order on a single GPU and halts
 subsequent directions after a failed child. The final command uses GPU 0 only.
+
+## xju: GPU 1, reverse direction order
+
+The same training method can run F -> E -> D -> C -> B -> A with `--reverse`.
+Only the direction order changes; each direction still runs seed 43 then seed 42.
+The detached worker receives this flag and the manifest records the reversed GPU
+queue. Use an independent xju run name:
+
+```bash
+cd /home/gzw/projects
+/home/gzw/anaconda3/envs/BCI/bin/python -u \
+  -m MPUS_GA.scripts.run_r2_coteaching_suite \
+  --run-name r2_coteaching_xju_reverse_s43_s42_20260910 \
+  --gpus 1 --reverse \
+  --random-seeds 43 42 --target-subjects all
+```
+
+The scheduler isolates physical GPU 1 by UUID and the child uses `cuda:0` inside
+that isolated view. Logs and results use the same layout documented above under
+this independent run name. No extra nohup is necessary.
