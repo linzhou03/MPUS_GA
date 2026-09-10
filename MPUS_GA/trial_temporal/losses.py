@@ -17,6 +17,7 @@ def class_conditional_prototype_alignment_loss(
     confidence_threshold: float,
     target_valid_mask: torch.Tensor | None = None,
     target_sample_weight: torch.Tensor | None = None,
+    scale_class_strength: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, float]:
     """Align each source-domain/scale/class centroid to its target centroid.
 
@@ -38,6 +39,13 @@ def class_conditional_prototype_alignment_loss(
     classes = target_probability.shape[1]
     if joint_weights.shape != (domains, scales, classes):
         raise ValueError("joint_weights must be [domains, scales, classes]")
+    if scale_class_strength is not None:
+        if scale_class_strength.shape != (scales, classes):
+            raise ValueError("scale_class_strength must be [scales, classes]")
+        if not torch.isfinite(scale_class_strength).all() or not (
+            (scale_class_strength >= 0) & (scale_class_strength <= 1)
+        ).all():
+            raise ValueError("Centroid strength must be finite and within [0,1]")
     if any(item.ndim != 3 for item in source_embeddings):
         raise ValueError("source embeddings must be [batch, scales, features]")
     if target_valid_mask is not None and target_valid_mask.shape != (
@@ -86,6 +94,10 @@ def class_conditional_prototype_alignment_loss(
                 embedding[selected].mean(dim=0), dim=-1
             )
             distance = 1.0 - (source_centroid * target_centroid).sum(dim=-1)
+            if scale_class_strength is not None:
+                # Keep the ORIGINAL denominator: masking must reduce attraction,
+                # not renormalize it onto the remaining scales/classes.
+                distance = distance * scale_class_strength[:, class_index].detach().to(distance)
             for scale_index in range(scales):
                 losses.append(distance[scale_index])
                 weights.append(

@@ -37,6 +37,7 @@ from .data import (
 from .losses import class_conditional_prototype_alignment_loss
 from .model import MultiScaleMultiSourceDANN
 from .subgroup_alignment import SelectiveSubgroupAlignment, SubgroupConfig
+from .multiscale_coteaching import ClassConditionalCoTeaching, CoTeachingConfig
 
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
@@ -84,6 +85,7 @@ class ExperimentSpec:
     use_guarded_class_scale_reliability_fusion: bool = False
     use_domain_gap_scale_calibration: bool = False
     use_subgroup_alignment: bool = False
+    use_multiscale_coteaching: bool = False
     use_source_excess_suppression: bool = True
     use_boundary_attractor_suppression: bool = True
     target_dataset: str = "seed_v"
@@ -629,11 +631,17 @@ def subgroup_experiment(direction: str) -> ExperimentSpec:
     )
 
 
+def coteaching_experiment(direction: str) -> ExperimentSpec:
+    return replace(subgroup_experiment(direction), ablation="r2_coteaching",
+                   description=f"{direction}; R2 class-conditional multiscale peer teaching and selective alignment",
+                   use_multiscale_coteaching=True,
+                   prototype_weight=EXPERIMENTS["A_R2"].prototype_weight)
+
+
 def subgroup_config(args) -> SubgroupConfig:
-    return SubgroupConfig(**{
-        name: getattr(args, f"subgroup_{name}")
-        for name in SubgroupConfig.__dataclass_fields__
-    })
+    cls = CoTeachingConfig if getattr(args, "method", None) == "r2_coteaching" else SubgroupConfig
+    return cls(**{name: (value if (value := getattr(args, f"subgroup_{name}", None)) is not None else default)
+                  for name, default in asdict(cls()).items()})
 
 
 def set_seed(seed: int, device: torch.device) -> None:
@@ -2286,6 +2294,8 @@ def train_step(
         raise RuntimeError("Target adaptation batch unexpectedly contains labels")
     if spec.use_subgroup_alignment != (subgroup_alignment is not None):
         raise RuntimeError("Subgroup experiment and training controller must agree")
+    if spec.use_multiscale_coteaching != isinstance(subgroup_alignment, ClassConditionalCoTeaching):
+        raise RuntimeError("Co-teaching experiment and training controller must agree")
     if not spec.use_source_excess_suppression:
         common_bias_strength = 0.0
     if not spec.use_boundary_attractor_suppression:
@@ -2682,7 +2692,24 @@ def train_step(
         source_labels,
         target_consensus,
     )
-    if prototype_bank is not None and adaptation_active and not spec.use_subgroup_alignment:
+    subgroup_loss = target_output["logits"].sum() * 0.0
+    teaching_loss = subgroup_loss
+    subgroup_record = None
+    subgroup_coefficient = 0.0
+    teaching_coefficient = 0.0
+    centroid_strength = None
+    if subgroup_alignment is not None:
+        subgroup_loss, subgroup_record = subgroup_alignment.loss(
+            source_outputs, source_batches, target_output, target_batch, iteration
+        )
+        subgroup_coefficient = subgroup_alignment.config.weight * subgroup_alignment.config.ramp(iteration)
+        if spec.use_multiscale_coteaching:
+            centroid_strength = subgroup_alignment.centroid_strength(iteration)
+            teaching_loss = subgroup_alignment.teaching_loss
+            teaching_coefficient = subgroup_alignment.config.teaching_weight * subgroup_alignment.config.ramp(iteration)
+    if prototype_bank is not None and adaptation_active and (
+        not spec.use_subgroup_alignment or spec.use_multiscale_coteaching
+    ):
         prototype_loss, pseudo_coverage = (
             class_conditional_prototype_alignment_loss(
                 [output["scale_embeddings"] for output in source_outputs],
@@ -2697,6 +2724,7 @@ def train_step(
                     if spec.use_physiology_reliability
                     else None
                 ),
+                scale_class_strength=centroid_strength,
             )
         )
     else:
@@ -2708,19 +2736,10 @@ def train_step(
             .float()
             .mean()
         )
-    subgroup_loss = target_output["logits"].sum() * 0.0
-    subgroup_record = None
-    subgroup_coefficient = 0.0
-    if subgroup_alignment is not None:
-        subgroup_loss, subgroup_record = subgroup_alignment.loss(
-            source_outputs, source_batches, target_output, target_batch, iteration
-        )
-        subgroup_coefficient = (
-            subgroup_alignment.config.weight * subgroup_alignment.config.ramp(iteration)
-        )
     total_loss = (
         classification_loss
         + subgroup_coefficient * subgroup_loss
+        + teaching_coefficient * teaching_loss
         + mixup_loss_weight * augmentation_loss
         + physiology_classification_weight
         * physiology_classification_loss
@@ -2957,6 +2976,8 @@ def train_step(
         "prototype": float(prototype_loss.detach()),
         "subgroup_contrast": float(subgroup_loss.detach()),
         "subgroup_contrast_coefficient": subgroup_coefficient,
+        "peer_teaching": float(teaching_loss.detach()),
+        "peer_teaching_coefficient": teaching_coefficient,
         "subgroup_alignment": subgroup_record,
         "pseudo_label_coverage": pseudo_coverage,
         "physiology_reliability_active": (
@@ -3984,7 +4005,8 @@ def run_fold(
             device,
         )
     subgroup_alignment = (
-        SelectiveSubgroupAlignment(model, subgroup_config(args), device)
+        (ClassConditionalCoTeaching if spec.use_multiscale_coteaching else SelectiveSubgroupAlignment)(
+            model, subgroup_config(args), device)
         if spec.use_subgroup_alignment else None
     )
     if device.type == "cuda":
@@ -4078,6 +4100,8 @@ def run_fold(
             if subgroup_alignment is not None:
                 postfix["sub"] = f"{record['subgroup_contrast']:.3f}"
                 postfix["match"] = f"{record['subgroup_alignment']['sample_match_coverage']:.2f}"
+            if spec.use_multiscale_coteaching:
+                postfix["peer"] = f"{record['peer_teaching']:.3f}"
             progress.set_postfix(postfix)
         if _should_evaluate_target(
             args.evaluation_protocol,
@@ -4576,10 +4600,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="Class-conditional multiscale fixed-1000 UDA"
     )
     parser.add_argument("--experiment", choices=EXPERIMENT_ORDER, required=True)
-    parser.add_argument("--method", choices=("experiment", "r2_subgroup"), default="experiment",
-                        help="r2_subgroup builds A-F from R2, without later D/N/domain-gap additions")
-    for name, default in asdict(SubgroupConfig()).items():
-        parser.add_argument("--subgroup-" + name.replace("_", "-"), type=type(default), default=default)
+    parser.add_argument("--method", choices=("experiment", "r2_subgroup", "r2_coteaching"), default="experiment",
+                        help="R2 subgroup/peer-teaching A-F profiles without later D/N/domain-gap additions")
+    for name, default in asdict(CoTeachingConfig()).items():
+        parser.add_argument("--subgroup-" + name.replace("_", "-"), type=type(default), default=None)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     parser.add_argument("--result-root", type=Path, default=DEFAULT_RESULT_ROOT)
     parser.add_argument("--random-seeds", nargs="+", type=int, default=(42, 43, 44))
@@ -4767,8 +4791,10 @@ def validate_args(args, spec: ExperimentSpec) -> None:
             raise ValueError("R2 subgroup alignment requires fixed-final evaluation")
         if args.result_root.expanduser().resolve() == DEFAULT_RESULT_ROOT.resolve():
             raise ValueError("R2 subgroup alignment requires an independent --result-root")
-        if spec.prototype_weight != 0:
+        if spec.prototype_weight != 0 and not spec.use_multiscale_coteaching:
             raise ValueError("Subgroup contrast replaces coarse centroid alignment")
+        if spec.use_multiscale_coteaching and spec.prototype_weight != EXPERIMENTS["A_R2"].prototype_weight:
+            raise ValueError("Co-teaching requires the original R2 centroid weight for fallback")
     if isinstance(args.target_subjects, str):
         args.target_subjects = _target_subjects(
             args.target_subjects, spec.target_subject_count
@@ -4965,7 +4991,8 @@ def validate_args(args, spec: ExperimentSpec) -> None:
 
 def main() -> None:
     args = build_parser().parse_args()
-    spec = (subgroup_experiment(args.experiment) if args.method == "r2_subgroup"
+    spec = (coteaching_experiment(args.experiment) if args.method == "r2_coteaching"
+            else subgroup_experiment(args.experiment) if args.method == "r2_subgroup"
             else EXPERIMENTS[args.experiment])
     validate_args(args, spec)
     args.data_dir = args.data_dir.expanduser().resolve()

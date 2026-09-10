@@ -234,7 +234,8 @@ class SubgroupBank:
         self.history.append(self.state())
         return True
 
-    def loss(self, student_embeddings, teacher_embeddings, labels, confidence, valid):
+    def loss(self, student_embeddings, teacher_embeddings, labels, confidence, valid,
+             term_strength=None):
         zero = sum(tensor.sum() * 0.0 for tensor in student_embeddings)
         totals = {key: 0 for key in ("positive_pairs", "negative_pairs", "ignored_same_class_pairs",
                                     "eligible_anchors", "used_anchors")}
@@ -243,6 +244,9 @@ class SubgroupBank:
             other = 1 - domain
             for scale in range(self.scales):
                 for label in range(self.classes):
+                    strength = 1.0 if term_strength is None else float(term_strength[scale, label])
+                    if strength <= 0:
+                        continue
                     selected = valid[domain][:, scale] & (labels[domain] == label)
                     eligible = int(selected.sum())
                     totals["eligible_anchors"] += eligible
@@ -280,7 +284,7 @@ class SubgroupBank:
                         weights, self.config.temperature,
                     )
                     # Equal coarse-class/scale/direction terms, not population weighting.
-                    losses.append(value)
+                    losses.append(value * strength)
                     used = int(strong.sum())
                     totals["used_anchors"] += used
                     totals["positive_pairs"] += used
