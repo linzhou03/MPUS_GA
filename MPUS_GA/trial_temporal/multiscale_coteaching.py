@@ -194,11 +194,17 @@ class ClassConditionalCoTeaching(SelectiveSubgroupAlignment):
         self.transition_history = []
         self.teaching_loss = None
         self.cumulative_teaching_pairs = 0
+        # Read-only inputs for optional training auxiliaries; decisions stay owned here.
+        self.training_evidence = None
 
     def centroid_strength(self, iteration):
         if self.config.weight == 0:
             return torch.ones_like(self.readiness)
-        return 1 - self.readiness.detach() * self.config.ramp(iteration)
+        readiness=self.readiness.detach()
+        muse=getattr(self,'muse',None)
+        if muse is not None and muse.config.alignment_enabled:
+            readiness=readiness*muse.class_gate()[None]
+        return 1 - readiness * self.config.ramp(iteration)
 
     def loss(self, source_outputs, source_batches, target_output, target_batch, iteration):
         if 'y' in target_batch:
@@ -213,6 +219,9 @@ class ClassConditionalCoTeaching(SelectiveSubgroupAlignment):
         tf, tl = self._predict(target_batch)
         tk = trial_keys(target_batch, 0)
         probability = tl.softmax(-1)
+        muse = getattr(self, 'muse', None)
+        if muse is not None:
+            muse.observe(probability, target_batch, iteration)
         device = tf.device
         labels = torch.zeros(len(tk), dtype=torch.long, device=device)
         confidence = torch.zeros(len(tk), device=device)
@@ -240,9 +249,14 @@ class ClassConditionalCoTeaching(SelectiveSubgroupAlignment):
         student_features = [torch.cat([output['scale_embeddings'] for output in source_outputs]),
                             target_output['scale_embeddings']]
         source_valid = torch.ones(sf.shape[:2], dtype=torch.bool, device=device)
+        strength=self.readiness
+        contrast_valid=valid
+        if muse is not None and muse.config.alignment_enabled:
+            strength=strength*muse.class_gate()[None]
+            contrast_valid=valid & muse.evidence['hard_mask'][:,None]
         contrast, record = self.bank.loss(student_features, [sf, tf], [sy, labels],
-                                          [sf.new_ones(len(sf)), confidence], [source_valid, valid],
-                                          term_strength=self.readiness)
+                                          [sf.new_ones(len(sf)), confidence], [source_valid, contrast_valid],
+                                          term_strength=strength)
         # KL transfers coarse semantics, preserving each scale's feature representation.
         terms = []
         for scale in range(self.bank.scales):
@@ -256,6 +270,10 @@ class ClassConditionalCoTeaching(SelectiveSubgroupAlignment):
         used = int((peer_weight > 0).sum()) if self.config.ramp(iteration) > 0 and self.config.teaching_weight > 0 else 0
         self.cumulative_teaching_pairs += used
         self.pending = (sk, sf, sl, sy, tk, tf, probability, iteration)
+        self.training_evidence = {'source_keys': sk, 'source_features': sf,
+                                  'source_labels': sy, 'target_keys': tk,
+                                  'target_features': tf, 'target_labels': labels,
+                                  'target_confidence': confidence, 'target_valid': valid}
         record.update({'target_accepted_by_class': torch.bincount(labels[valid.any(-1)], minlength=3).tolist(),
                        'teacher_mean_confidence': float(probability.mean(1).max(-1).values.mean()),
                        'ramp': self.config.ramp(iteration), 'loss': float(contrast.detach()),
@@ -309,11 +327,15 @@ class ClassConditionalCoTeaching(SelectiveSubgroupAlignment):
                           torch.ones(sf.shape[:2], dtype=torch.bool, device=sf.device), iteration)
         self.evidence.observe_source(sl, sy)
         self.evidence.observe_target(tk, probability, tf, iteration)
+        muse=getattr(self,'muse',None)
+        if muse is not None and muse.config.alignment_enabled:
+            muse.observe_target_subgroups(self.bank,tk,tf,probability,iteration)
         if not self.evidence.refresh(iteration):
             return
         # Only the periodic published decisions enter the target subgroup bank.
-        self.bank.memory[1].clear()
-        selected = [(key, row) for key, row in self.evidence.published.items() if row['selected']]
+        muse_subgroups=muse is not None and muse.config.alignment_enabled
+        if not muse_subgroups:self.bank.memory[1].clear()
+        selected = [] if muse_subgroups else [(key, row) for key, row in self.evidence.published.items() if row['selected']]
         if selected:
             keys, rows = zip(*selected)
             self.bank.observe(1, keys, torch.stack([self.evidence.raw[key][1] for key in keys]),
@@ -321,6 +343,7 @@ class ClassConditionalCoTeaching(SelectiveSubgroupAlignment):
                               torch.tensor([row['confidence'] for row in rows]),
                               torch.stack([row['scale_valid'] for row in rows]), iteration)
         if self.bank.refresh(iteration):
+            if muse_subgroups:muse.after_bank_refresh(self.bank)
             self._refresh_readiness(iteration)
 
     def state(self):

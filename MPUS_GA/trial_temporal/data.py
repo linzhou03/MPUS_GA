@@ -329,6 +329,13 @@ class MultiScaleTrialDataset(Dataset):
             )
         item = {
             "x": features,
+            "trial_key_by_scale": {
+                scale_key(scale): torch.tensor([
+                    self.arrays[scale].subjects[self.groups[scale][key][0]],
+                    self.arrays[scale].sessions[self.groups[scale][key][0]],
+                    self.arrays[scale].trials[self.groups[scale][key][0]],
+                ], dtype=torch.long) for scale in self.scales
+            },
             "subject_id": torch.tensor(key[0], dtype=torch.long),
             "session_id": torch.tensor(key[1], dtype=torch.long),
             "trial_id": torch.tensor(key[2], dtype=torch.long),
@@ -388,6 +395,12 @@ def collate_multiscale(items: Sequence[dict]) -> dict:
         "trial_id": torch.stack([item["trial_id"] for item in items]),
         "domain_id": torch.stack([item["domain_id"] for item in items]),
     }
+    if any('trial_key_by_scale' in item for item in items):
+        if not all('trial_key_by_scale' in item for item in items):
+            raise ValueError('Batch mixes trials with and without per-scale IDs')
+        result['trial_key_by_scale'] = {key: torch.stack([item['trial_key_by_scale'][key] for item in items]) for key in keys}
+        from .multiscale_evidence import assert_scale_trial_ids
+        assert_scale_trial_ids(result)
     physiology_presence = ["physiology" in item for item in items]
     if any(physiology_presence) and not all(physiology_presence):
         raise ValueError("A batch cannot mix physiology-enabled and plain trials")

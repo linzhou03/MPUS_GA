@@ -63,7 +63,8 @@ def test_anatomical_partition_is_exhaustive_disjoint_and_region_balanced() -> No
     assert sum(len(channels) for channels in ANATOMICAL_REGIONS.values()) == 62
     assert len({name for region in ANATOMICAL_REGIONS.values() for name in region}) == 62
     assert set(name for region in ANATOMICAL_REGIONS.values() for name in region) == set(CHANNEL_NAMES)
-    np.testing.assert_allclose(matrix.sum(axis=1), np.ones(8))
+    # Test the partition weights without float32 reduction roundoff.
+    np.testing.assert_allclose(matrix.sum(axis=1, dtype=np.float64), np.ones(8))
     assert np.all((matrix > 0).sum(axis=0) == 1)
 
 

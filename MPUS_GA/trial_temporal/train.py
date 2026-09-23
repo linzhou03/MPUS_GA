@@ -36,8 +36,15 @@ from .data import (
 )
 from .losses import class_conditional_prototype_alignment_loss
 from .model import MultiScaleMultiSourceDANN
+from .r2_masked_reconstruction import R2MaskConfig, attach_reconstruction
 from .subgroup_alignment import SelectiveSubgroupAlignment, SubgroupConfig
 from .multiscale_coteaching import ClassConditionalCoTeaching, CoTeachingConfig
+from .style_augmentation import R3StyleController, StyleConfig, STYLE_VARIANTS, style_config
+from .full_pseudo_alignment import (FullPseudoAlignment, FullPseudoConfig, R4_VARIANTS,
+                                   attach_semantic_projection)
+from .multiscale_evidence import MuseConfig, MUSE_VARIANTS, muse_config
+from .muse_alignment import MuseController
+from .care_pseudo_label import CareConfig, CareController, CARE_VARIANTS, care_config
 
 
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
@@ -611,6 +618,32 @@ def _build_experiments() -> dict[str, ExperimentSpec]:
 EXPERIMENTS = _build_experiments()
 
 
+def r2_masked_experiment(direction: str) -> ExperimentSpec:
+    """The original A_R2 profile extended to all six dataset directions."""
+    if direction not in _FINAL_TRANSFER_DIRECTIONS:
+        raise ValueError('R2+MSMR uses directions A through F')
+    transfer = _FINAL_TRANSFER_DIRECTIONS[direction]
+    return replace(EXPERIMENTS['A_R2'], name=direction, transfer_direction=direction,
+                   ablation='r2_msmr', description=transfer['description'] + '; original R2 plus masked reconstruction',
+                   source_domains=transfer['source_domains'], target_dataset=transfer['target_dataset'],
+                   target_subject_count=transfer['target_subject_count'], target_trials=transfer['target_trials'])
+
+
+def r2_prototype_off_experiment(direction: str) -> ExperimentSpec:
+    """Original R2 with the source/target prototype subsystem disabled."""
+    if direction not in _FINAL_TRANSFER_DIRECTIONS:
+        raise ValueError('R2 prototype-off uses directions A through F')
+    transfer = _FINAL_TRANSFER_DIRECTIONS[direction]
+    return replace(
+        EXPERIMENTS['A_R2'], name=direction,
+        description=transfer['description'] + '; R2 prototype subsystem disabled',
+        transfer_direction=direction, ablation='r2_prototype_off',
+        source_domains=transfer['source_domains'], target_dataset=transfer['target_dataset'],
+        target_subject_count=transfer['target_subject_count'], target_trials=transfer['target_trials'],
+        use_prototypes=False, use_source_prototype_memory=False, prototype_weight=0.0,
+    )
+
+
 def subgroup_experiment(direction: str) -> ExperimentSpec:
     """R2 backbone with selective subgroup contrast replacing centroid alignment."""
     if direction not in _FINAL_TRANSFER_DIRECTIONS:
@@ -639,9 +672,53 @@ def coteaching_experiment(direction: str) -> ExperimentSpec:
 
 
 def subgroup_config(args) -> SubgroupConfig:
-    cls = CoTeachingConfig if getattr(args, "method", None) == "r2_coteaching" else SubgroupConfig
+    cls = CoTeachingConfig if getattr(args, "method", None) in ("r2_coteaching", "r3", "muse", "care") else SubgroupConfig
     return cls(**{name: (value if (value := getattr(args, f"subgroup_{name}", None)) is not None else default)
                   for name, default in asdict(cls()).items()})
+
+
+def r3_experiment(direction: str, variant: str = "full") -> ExperimentSpec:
+    style_config(variant)
+    return replace(coteaching_experiment(direction), ablation=f"r3_{variant}",
+                   description=f"{direction}; R3 hierarchical target style / matched variance; {variant}")
+
+
+def r3_config(args) -> StyleConfig:
+    return style_config(args.r3_variant, **{name: getattr(args, f"style_{name}")
+                                          for name in StyleConfig.__dataclass_fields__})
+
+
+def r4_experiment(direction, variant='full'):
+    if variant not in R4_VARIANTS:
+        raise ValueError('Unknown R4 variant')
+    return replace(subgroup_experiment(direction), ablation=f'r4_{variant}',
+                   description=f'{direction}; R4 all-trial self-training and semantic alignment; {variant}',
+                   use_subgroup_alignment=False, use_multiscale_coteaching=False,
+                   use_prototypes=False, use_source_prototype_memory=False,
+                   use_source_multiview_anchor=False, use_pyramid_gate_warmup=False,
+                   use_source_excess_suppression=False, use_boundary_attractor_suppression=False,
+                   domain_weight=0., prototype_weight=0.)
+
+
+def muse_experiment(direction, variant='full'):
+    muse_config(variant)
+    return replace(coteaching_experiment(direction), ablation=f'muse_{variant}',
+                   description=f'{direction}; MUSE-DA on R2 co-teaching; {variant}')
+
+
+def muse_args_config(args):
+    return muse_config(args.muse_variant, **{name:getattr(args, 'muse_'+name) for name in MuseConfig.__dataclass_fields__})
+
+
+def care_experiment(direction, variant='full'):
+    care_config(variant)
+    return replace(coteaching_experiment(direction), ablation=f'care_{variant}',
+                   description=f'{direction}; R2 + CARE-PL auxiliary target CE; {variant}')
+
+
+def care_args_config(args):
+    return care_config(args.care_variant, **{name: getattr(args, 'care_' + name)
+                                           for name in CareConfig.__dataclass_fields__})
 
 
 def set_seed(seed: int, device: torch.device) -> None:
@@ -1336,6 +1413,16 @@ def _weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     return (values * weights).sum() / weights.sum().clamp_min(1e-8)
 
 
+def _median_across_scales(value: torch.Tensor) -> torch.Tensor:
+    # CUDA median(dim=...) exposes nondeterministic tie indices even though R2
+    # consumes only values. In strict replay use the identical lower median
+    # value via sorting; preserve median's NaN propagation. Normal R2 is unchanged.
+    if torch.are_deterministic_algorithms_enabled() and value.is_cuda:
+        median = value.sort(dim=0).values[(value.shape[0] - 1) // 2]
+        return torch.where(value.isnan().any(dim=0), torch.full_like(median, float('nan')), median)
+    return value.median(dim=0).values
+
+
 class TargetPriorEstimator:
     """Estimate target label proportions from independent multiscale evidence.
 
@@ -1642,7 +1729,7 @@ class TargetPriorEstimator:
         log_excess = torch.maximum(soft_log_excess, hard_log_excess)
         # For three scales the median is positive only if at least two scales
         # report excess evidence. This rejects a single noisy temporal scale.
-        common_excess = log_excess.median(dim=0).values
+        common_excess = _median_across_scales(log_excess)
         source_penalty = (
             float(source_excess_strength)
             * false_positive_risk
@@ -1654,7 +1741,7 @@ class TargetPriorEstimator:
             - torch.log(boundary_probability.clamp_min(1e-8))
             - math.log1p(boundary_ratio_tolerance)
         ).clamp_min(0.0)
-        boundary_common_ratio = boundary_log_ratio.median(dim=0).values
+        boundary_common_ratio = _median_across_scales(boundary_log_ratio)
         boundary_penalty = (
             float(boundary_strength)
             * false_positive_risk
@@ -1857,6 +1944,8 @@ class PrototypeBank:
         confidence_threshold: float,
         valid_mask: torch.Tensor | None = None,
         sample_weight: torch.Tensor | None = None,
+        pseudo_label_override: torch.Tensor | None = None,
+        effective_weight_override: torch.Tensor | None = None,
     ) -> float:
         probability = probability.detach()
         confidence, pseudo_label = probability.max(dim=1)
@@ -1875,6 +1964,10 @@ class PrototypeBank:
             confidence_weight = confidence_weight * sample_weight.detach().to(
                 confidence_weight
             ).clamp(0.0, 1.0)
+        if pseudo_label_override is not None:
+            from .pcdiag import override_consumers
+            pseudo_label, valid, confidence_weight = override_consumers(
+                probability, valid_mask, pseudo_label_override, effective_weight_override)
         for class_index in range(self.target.shape[1]):
             selected = valid & (pseudo_label == class_index)
             weight = selected.to(confidence_weight) * confidence_weight
@@ -2289,6 +2382,11 @@ def train_step(
     competence_deficit_floor: float = 0.25,
     competence_deficit_power: float = 1.0,
     subgroup_alignment: SelectiveSubgroupAlignment | None = None,
+    style_augmentation: R3StyleController | None = None,
+    full_pseudo_alignment: FullPseudoAlignment | None = None,
+    care: CareController | None = None,
+    diagnostic=None,
+    neighbor_learning=None,
 ) -> dict:
     if "y" in target_batch:
         raise RuntimeError("Target adaptation batch unexpectedly contains labels")
@@ -2401,6 +2499,14 @@ def train_step(
             target_logit_adjustment.add_(prior_adjustment)
         if common_bias_adjustment is not None:
             target_logit_adjustment.add_(common_bias_adjustment)
+    uncertainty_pseudo = getattr(model, 'cbst', None) or getattr(model, 'uncertainty_pseudo', None)
+    if uncertainty_pseudo is not None:
+        uncertainty_pseudo.prepare(model, iteration, adaptation_active, dict(
+            compute_domain=False, scale_class_reliability=reliability,
+            multiview_source_anchor=source_multiview_anchor,
+            class_logit_adjustment=target_logit_adjustment,
+            pyramid_gate_ramp=pyramid_gate_ramp, pyramid_bias_risk=pyramid_bias_risk,
+            guarded_scale_class_reliability=guarded_reliability))
     source_outputs = []
     source_labels = []
     for batch in source_batches:
@@ -2517,6 +2623,15 @@ def train_step(
         consensus_jsd_threshold,
         consensus_minimum_votes,
     )
+    if uncertainty_pseudo is not None:
+        target_consensus = uncertainty_pseudo.refine(
+            target_output, target_batch, target_consensus, iteration, adaptation_active,
+            pseudo_confidence_threshold, consensus_jsd_threshold, consensus_minimum_votes)
+    intervention = {}
+    if diagnostic is not None:
+        target_consensus, intervention = diagnostic.capture(
+            iteration, source_batches, target_batch, target_output, target_consensus,
+            adaptation_active, source_labels, pseudo_confidence_threshold)
     if spec.use_physiology_reliability:
         if target_output["physiology_probability"] is None:
             raise RuntimeError("Physiology reliability output is unavailable")
@@ -2725,6 +2840,7 @@ def train_step(
                     else None
                 ),
                 scale_class_strength=centroid_strength,
+                **intervention,
             )
         )
     else:
@@ -2756,14 +2872,88 @@ def train_step(
             + spec.prototype_weight * prototype_loss
         )
     )
+    if uncertainty_pseudo is not None:
+        total_loss = total_loss + uncertainty_pseudo.loss(target_output['logits'], ramp)
+    style_record = None
+    r4_record = None
+    muse_record = None
+    care_record = None
+    if care is not None and care.config.enabled:
+        care_loss, care_record = care.loss(subgroup_alignment, target_output, target_batch, iteration)
+        care_record['L_R2'] = float(total_loss.detach())
+        total_loss = total_loss + care_loss
+        care_record['L_total'] = float(total_loss.detach())
+    muse = getattr(subgroup_alignment, 'muse', None)
+    if muse is not None:
+        existing_r2_loss = total_loss
+        muse_loss, muse_record = muse.loss(subgroup_alignment, source_outputs, source_batches,
+                                          target_output, target_batch, iteration)
+        total_loss = total_loss + muse_loss
+        muse_record.update({'iteration':iteration, 'L_R2':float(existing_r2_loss.detach()),
+                            'L_total':float(total_loss.detach())})
+    if full_pseudo_alignment is not None:
+        full_pseudo_alignment.observe_source(source_outputs, source_batches)
+        if iteration == 1 or iteration % full_pseudo_alignment.config.refresh_interval == 0:
+            full_pseudo_alignment.refresh(model, full_pseudo_alignment.evidence_loader, iteration)
+        r4_loss, r4_record = full_pseudo_alignment.loss(
+            source_outputs, source_batches, target_output, target_batch)
+        # R4 has four objectives; old domain/prototype/peer/style losses are excluded.
+        total_loss = classification_loss + r4_loss
+    if style_augmentation is not None:
+        style_loss, style_record = style_augmentation.loss(
+            model, source_outputs, target_output, subgroup_alignment, iteration)
+        if style_augmentation.config.enabled and ramp > 0:
+            total_loss = total_loss + style_loss
+    neighbor_record = None
+    if neighbor_learning is not None:
+        neighbor_context = dict(
+            compute_domain=False,
+            scale_class_reliability=reliability,
+            multiview_source_anchor=source_multiview_anchor,
+            class_logit_adjustment=target_logit_adjustment,
+            pyramid_gate_ramp=pyramid_gate_ramp,
+            pyramid_bias_risk=pyramid_bias_risk,
+            source_prototype_memory=source_prototype_memory.memory if source_prototype_memory is not None else None,
+            source_prototype_initialized=source_prototype_memory.initialized if source_prototype_memory is not None else None,
+            guarded_scale_class_reliability=guarded_reliability,
+        )
+        added_loss, neighbor_record = neighbor_learning.loss(
+            model, target_output, target_batch, iteration, ramp, neighbor_context)
+        if neighbor_record['active']:
+            total_loss = total_loss + added_loss
+    relation_alignment = getattr(model, 'relation_alignment', None)
+    if relation_alignment is not None:
+        total_loss = total_loss + relation_alignment.loss(
+            model, source_outputs, source_batches, target_output, target_batch, iteration, device)
+    boundary_heads = getattr(model, 'boundary_heads', None)
+    boundary_source_loss = None
+    if boundary_heads is not None:
+        boundary_source_loss = boundary_heads.source_loss(
+            torch.cat([output['scale_embeddings'] for output in source_outputs]),
+            torch.cat(source_labels))
+        total_loss = total_loss + boundary_heads.config.source_weight * boundary_source_loss
     total_loss.backward()
+    r2_masked_record = None
+    reconstruction = getattr(model, 'r2_mask_reconstruction', None)
+    if reconstruction is not None:
+        r2_masked_record = reconstruction.accumulate(model, source_batches, target_batch, device)
+        r2_masked_record['L_R2'] = float(total_loss.detach())
+        # This scalar is descriptive: the auxiliary encoder gradient is bounded/projected.
+        total_loss = total_loss.detach() + r2_masked_record['added_loss']
     gradient_norm = torch.nn.utils.clip_grad_norm_(
         model.parameters(), gradient_clip
     )
     optimizer.step()
     scheduler.step()
+    if boundary_heads is not None:
+        from .boundary_adaptation import extra_steps
+        boundary_heads.last_record = extra_steps(model, source_batches, target_batch,
+            optimizer, device, iteration, gradient_clip)
+        boundary_heads.last_record['base_source'] = float(boundary_source_loss.detach())
     if subgroup_alignment is not None:
         subgroup_alignment.after_step(model)
+    if style_augmentation is not None:
+        style_augmentation.after_step(subgroup_alignment, iteration)
 
     if class_scale_competence is not None:
         for output, labels in zip(
@@ -2821,6 +3011,7 @@ def train_step(
                 target_consensus.probability,
                 pseudo_confidence_threshold,
                 target_consensus.valid_mask,
+                **intervention,
                 sample_weight=(
                     target_physiology_weight
                     if spec.use_physiology_reliability
@@ -2934,6 +3125,11 @@ def train_step(
         ]
     record = {
         "iteration": iteration,
+        "r2_masked_reconstruction": r2_masked_record,
+        "style_augmentation": style_record,
+        "full_pseudo_alignment": r4_record,
+        "muse": muse_record,
+        "care": care_record,
         "adaptation_ramp": ramp,
         "prototype_updates_active": (
             prototype_bank is not None and adaptation_active
@@ -3123,6 +3319,11 @@ def train_step(
             prototype_bank.source_relation_weights().cpu().tolist()
         )
         record["scale_class_reliability"] = reliability.cpu().tolist()
+    if neighbor_record is not None:
+        record['neighbor_learning'] = neighbor_record
+    if uncertainty_pseudo is not None:
+        key = 'cbst' if getattr(model, 'cbst', None) is not None else 'uncertainty_pseudo'
+        record[key] = dict(uncertainty_pseudo.last_record)
     return record
 
 
@@ -3238,6 +3439,9 @@ def evaluate_trials(
     domain_gap_scale_calibrator: DomainGapScaleCalibrator | None = None,
 ) -> dict:
     model.eval()
+    reconstruction = getattr(model, 'r2_mask_reconstruction', None)
+    if reconstruction is not None:
+        reconstruction.predictions = []
     probabilities = []
     scale_probabilities = []
     corrected_scale_probabilities = []
@@ -3412,6 +3616,13 @@ def evaluate_trials(
                 **physiology_arguments,
             )
             probabilities.append(output["probability"].cpu().numpy())
+            if reconstruction is not None:
+                probability = output['probability'].detach().cpu()
+                for row in range(len(probability)):
+                    reconstruction.predictions.append({
+                        'trial_key': [int(batch[k][row]) for k in ('subject_id', 'session_id', 'trial_id')],
+                        'label': int(batch['y'][row]), 'prediction': int(probability[row].argmax()),
+                        'probability': probability[row].tolist()})
             scale_probabilities.append(
                 F.softmax(output["scale_logits"], dim=-1).cpu().numpy()
             )
@@ -3708,10 +3919,17 @@ def _target_evaluation_is_better(candidate: dict, incumbent: dict | None) -> boo
 
 
 def _write_summary(result_dir: Path) -> None:
-    results = [
-        json.loads(path.read_text(encoding="utf-8"))
-        for path in sorted(result_dir.glob("seed_*_subject_*.json"))
-    ]
+    # Offline diagnostic reports use the same stem as the fold result and add
+    # ``.offline.json``.  They intentionally do not contain the training
+    # ``evaluation`` tree, so keep them out of the aggregate summary.
+    results = []
+    for path in sorted(result_dir.glob("seed_*_subject_*.json")):
+        if path.name.endswith(".offline.json"):
+            continue
+        result = json.loads(path.read_text(encoding="utf-8"))
+        if "evaluation" not in result:
+            continue
+        results.append(result)
     if not results:
         return
     rows = []
@@ -3777,68 +3995,8 @@ def _scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, multiplier)
 
 
-def run_fold(
-    args,
-    spec: ExperimentSpec,
-    prepared: PreparedMultiSource,
-    seed: int,
-    subject: int,
-    device: torch.device,
-) -> None:
-    iterations = FIXED_UDA_PROTOCOL.training_iterations
-    experiment_dir = args.result_root / spec.name
-    experiment_dir.mkdir(parents=True, exist_ok=True)
-    result_path = experiment_dir / f"seed_{seed}_subject_{subject:02d}.json"
-    if result_path.exists() and not args.overwrite:
-        if spec.use_subgroup_alignment:
-            saved = json.loads(result_path.read_text(encoding="utf-8"))
-            if saved.get("experiment_spec") != asdict(spec) or (
-                saved.get("subgroup_alignment") or {}
-            ).get("config") != asdict(subgroup_config(args)):
-                raise ValueError("Existing result uses another method/config; use a new result root")
-        tqdm.write(f"Skip existing {result_path}")
-        return
-
-    target = prepare_target(
-        args.data_dir,
-        spec.target_dataset,
-        subject,
-        prepared,
-        spec.scales,
-    )
-    FIXED_UDA_PROTOCOL.validate_fold(
-        target_trials=len(target),
-        expected_target_trials=spec.target_trials,
-        training_iterations=iterations,
-    )
-    set_seed(seed, device)
-    if args.source_batch_size % len(prepared.datasets):
-        raise ValueError(
-            "source-batch-size must be divisible by the source-domain count"
-        )
-    per_source_batch = args.source_batch_size // len(prepared.datasets)
-    if per_source_batch < 2:
-        raise ValueError("Each source domain needs at least two trials per batch")
-    pin_memory = device.type == "cuda"
-    source_loaders = [
-        _source_loader(
-            dataset,
-            per_source_batch,
-            iterations,
-            seed + domain_index * 101,
-            args.source_balance_alpha,
-            pin_memory,
-        )
-        for domain_index, dataset in enumerate(prepared.datasets)
-    ]
-    target_loader, target_evidence_loader, test_loader = _target_loaders(
-        target,
-        args.target_batch_size,
-        iterations,
-        seed + 1001,
-        pin_memory,
-    )
-    model = MultiScaleMultiSourceDANN(
+def build_fold_model(args, spec, prepared, device):
+    return MultiScaleMultiSourceDANN(
         scales=spec.scales,
         num_domains=len(prepared.domain_names) + 1,
         d_model=args.d_model,
@@ -3921,6 +4079,126 @@ def run_fold(
             args.class_scale_guard_consensus_floor
         ),
     ).to(device)
+
+
+def run_fold(
+    args,
+    spec: ExperimentSpec,
+    prepared: PreparedMultiSource,
+    seed: int,
+    subject: int,
+    device: torch.device,
+) -> None:
+    iterations = FIXED_UDA_PROTOCOL.training_iterations
+    experiment_dir = args.result_root / spec.name
+    experiment_dir.mkdir(parents=True, exist_ok=True)
+    result_path = experiment_dir / f"seed_{seed}_subject_{subject:02d}.json"
+    if result_path.exists() and not args.overwrite:
+        if args.method == 'r2_msmr':
+            saved = json.loads(result_path.read_text())
+            if saved.get('method') != 'r2_msmr' or saved.get('r2_masked_reconstruction', {}).get('config') != asdict(R2MaskConfig()):
+                raise ValueError('Existing fold has a different R2+MSMR config')
+            if saved.get('experiment_spec') != json.loads(json.dumps(asdict(spec))) or any(
+                    saved.get('optimization', {}).get(k) != getattr(args, k)
+                    for k in ('source_batch_size', 'target_batch_size', 'learning_rate')):
+                raise ValueError('Existing R2+MSMR fold has different base settings')
+            if not result_path.with_suffix('.pt').exists():
+                raise ValueError('Existing R2+MSMR result is missing its final model checkpoint')
+        if args.method == 'care':
+            saved = json.loads(result_path.read_text(encoding='utf-8'))
+            if saved.get('care_config') != asdict(care_args_config(args)) or any(
+                saved.get('optimization', {}).get(name) != getattr(args, name)
+                for name in ('source_batch_size', 'target_batch_size')
+            ):
+                raise ValueError('Existing result uses another CARE config/batch; use a new result root')
+        if args.method == 'muse':
+            saved = json.loads(result_path.read_text(encoding='utf-8'))
+            if saved.get('muse_config') != asdict(muse_args_config(args)):
+                raise ValueError('Existing result uses another MUSE config; use a new result root')
+        if args.method == 'r4':
+            saved = json.loads(result_path.read_text(encoding='utf-8'))
+            if saved.get('experiment_spec') != json.loads(json.dumps(asdict(spec))) or (
+                saved.get('full_pseudo_alignment') or {}).get('config') != asdict(FullPseudoConfig(args.r4_variant)):
+                raise ValueError('Existing result uses another R4 config; use a new result root')
+        if spec.use_subgroup_alignment:
+            saved = json.loads(result_path.read_text(encoding="utf-8"))
+            if saved.get("experiment_spec") != json.loads(json.dumps(asdict(spec))) or (
+                saved.get("subgroup_alignment") or {}
+            ).get("config") != asdict(subgroup_config(args)):
+                raise ValueError("Existing result uses another method/config; use a new result root")
+            if args.method == "r3" and (saved.get("style_augmentation") or {}).get("config") != asdict(r3_config(args)):
+                raise ValueError("Existing result uses another R3 config; use a new result root")
+        tqdm.write(f"Skip existing {result_path}")
+        return
+
+    target = prepare_target(
+        args.data_dir,
+        spec.target_dataset,
+        subject,
+        prepared,
+        spec.scales,
+    )
+    if args.method == 'r2_msmr':
+        from .train_msmr import validate_trial_lengths
+        validate_trial_lengths(target)
+    FIXED_UDA_PROTOCOL.validate_fold(
+        target_trials=len(target),
+        expected_target_trials=spec.target_trials,
+        training_iterations=iterations,
+    )
+    set_seed(seed, device)
+    if args.source_batch_size % len(prepared.datasets):
+        raise ValueError(
+            "source-batch-size must be divisible by the source-domain count"
+        )
+    per_source_batch = args.source_batch_size // len(prepared.datasets)
+    if per_source_batch < 2:
+        raise ValueError("Each source domain needs at least two trials per batch")
+    pin_memory = device.type == "cuda"
+    source_loaders = [
+        _source_loader(
+            dataset,
+            per_source_batch,
+            iterations,
+            seed + domain_index * 101,
+            args.source_balance_alpha,
+            pin_memory,
+        )
+        for domain_index, dataset in enumerate(prepared.datasets)
+    ]
+    target_loader, target_evidence_loader, test_loader = _target_loaders(
+        target,
+        args.target_batch_size,
+        iterations,
+        seed + 1001,
+        pin_memory,
+    )
+    model = build_fold_model(args, spec, prepared, device)
+    if getattr(args, '_cbst_config', None) is not None:
+        from .cbst import CBSTController
+        if (spec.use_prototypes or spec.use_source_prototype_memory or spec.use_subgroup_alignment
+                or getattr(args, '_uncertainty_config', None) is not None):
+            raise ValueError('CBST requires prototype-free training without uncertainty kNN')
+        model.cbst = CBSTController(args._cbst_config, target_evidence_loader, device)
+        model.activation_checkpointing = args._cbst_config.activation_checkpointing
+        model.spatial_chunk_windows = args._cbst_config.spatial_chunk_windows
+    if getattr(args, '_uncertainty_config', None) is not None:
+        from .uncertainty_pseudo import UncertaintyPseudo
+        if spec.use_prototypes or spec.use_source_prototype_memory or spec.use_subgroup_alignment:
+            raise ValueError('Uncertainty pseudo-label mode requires prototype-free training')
+        model.uncertainty_pseudo = UncertaintyPseudo(args._uncertainty_config, target_evidence_loader, device)
+        model.activation_checkpointing = args._uncertainty_config.activation_checkpointing
+        model.spatial_chunk_windows = args._uncertainty_config.spatial_chunk_windows
+    if getattr(args, '_boundary_config', None) is not None:
+        from .boundary_adaptation import attach_heads
+        attach_heads(model, args._boundary_config, device)
+    if getattr(args, '_relation_config', None) is not None:
+        from .class_relation_alignment import RelationAlignment
+        model.relation_alignment = RelationAlignment(args._relation_config, device, len(model.scale_keys))
+    if args.method == 'r4':
+        attach_semantic_projection(model)
+    if args.method == 'r2_msmr':
+        attach_reconstruction(model, args.num_heads)
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
@@ -4009,36 +4287,61 @@ def run_fold(
             model, subgroup_config(args), device)
         if spec.use_subgroup_alignment else None
     )
+    style_augmentation = (R3StyleController(model, subgroup_alignment, r3_config(args))
+                          if args.method == "r3" else None)
+    care = (CareController(care_args_config(args), subgroup_config(args))
+            if args.method == 'care' and care_args_config(args).enabled else None)
+    muse = None
+    if args.method == 'muse' and muse_args_config(args).enabled:
+        muse = MuseController(model, muse_args_config(args), subgroup_config(args))
+        subgroup_alignment.muse = muse
+    full_pseudo_alignment = (FullPseudoAlignment(model, FullPseudoConfig(args.r4_variant))
+                            if args.method == 'r4' else None)
+    if full_pseudo_alignment is not None:
+        full_pseudo_alignment.evidence_loader = target_evidence_loader
+    neighbor_learning = None
+    if getattr(args, '_neighbor_config', None) is not None:
+        from .neighbor_soft import NeighborLearning
+        neighbor_learning = NeighborLearning(args._neighbor_config, target_evidence_loader, device)
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
+    diagnostic = getattr(args, "_diagnostic", None)
+    if diagnostic is not None:
+        diagnostic.bind(locals())
     source_iterators = [iter(loader) for loader in source_loaders]
     target_iterator = iter(target_loader)
     training_trace = []
     target_evaluation_trace = []
     selected_evaluation = None
     selected_iteration = None
+    start_iteration = diagnostic.start_iteration if diagnostic is not None else 0
+    if diagnostic is not None:
+        diagnostic.ready()
     progress = tqdm(
-        range(1, iterations + 1),
+        range(start_iteration + 1, iterations + 1),
         desc=f"{spec.name} | seed={seed} | target={subject:02d}",
         unit="iter",
         leave=False,
         dynamic_ncols=True,
     )
     for iteration in progress:
-        source_batches = []
-        for index, loader in enumerate(source_loaders):
+        if diagnostic is not None and diagnostic.start_iteration:
+            source_batches, target_batch = diagnostic.replay_batches(iteration)
+        else:
+            source_batches = []
+            for index, loader in enumerate(source_loaders):
+                try:
+                    batch = next(source_iterators[index])
+                except StopIteration:
+                    source_iterators[index] = iter(loader)
+                    batch = next(source_iterators[index])
+                source_batches.append(batch)
             try:
-                batch = next(source_iterators[index])
+                target_batch = next(target_iterator)
             except StopIteration:
-                source_iterators[index] = iter(loader)
-                batch = next(source_iterators[index])
-            source_batches.append(batch)
-        try:
-            target_batch = next(target_iterator)
-        except StopIteration:
-            target_iterator = iter(target_loader)
-            target_batch = next(target_iterator)
+                target_iterator = iter(target_loader)
+                target_batch = next(target_iterator)
         record = train_step(
             model,
             source_batches,
@@ -4088,7 +4391,14 @@ def run_fold(
             competence_deficit_floor=args.competence_deficit_floor,
             competence_deficit_power=args.competence_deficit_power,
             subgroup_alignment=subgroup_alignment,
+            style_augmentation=style_augmentation,
+            full_pseudo_alignment=full_pseudo_alignment,
+            care=care,
+            diagnostic=diagnostic,
+            neighbor_learning=neighbor_learning,
         )
+        if diagnostic is not None:
+            diagnostic.after_step(iteration, record)
         if iteration == 1 or iteration % args.log_interval == 0 or iteration == iterations:
             training_trace.append(record)
             postfix = {
@@ -4102,6 +4412,45 @@ def run_fold(
                 postfix["match"] = f"{record['subgroup_alignment']['sample_match_coverage']:.2f}"
             if spec.use_multiscale_coteaching:
                 postfix["peer"] = f"{record['peer_teaching']:.3f}"
+            if style_augmentation is not None:
+                style = record['style_augmentation']
+                postfix['style'] = f"{style['style_cls']:.3f}"
+                postfix['var'] = f"{style['variance']:.4f}"
+                # Plain lines keep all style diagnostics visible in redirected logs.
+                tqdm.write('R3 ' + json.dumps({'iteration': iteration, **style}, sort_keys=True))
+            if full_pseudo_alignment is not None:
+                r4 = record['full_pseudo_alignment']
+                postfix = {'total': f"{record['total']:.3f}", 'cls': f"{record['classification']:.3f}",
+                           'pseudo': f"{r4['pseudo']:.4f}", 'compact': f"{r4['compact']:.3f}",
+                           'align': f"{r4['align']:.4f}"}
+                tqdm.write('R4 ' + json.dumps({'iteration': iteration, **r4}, sort_keys=True))
+            if muse is not None:
+                muse.record(record['muse'])
+                tqdm.write('MUSE ' + json.dumps(record['muse'], sort_keys=True))
+                postfix.update({'hard':f"{record['muse']['L_hard']:.3f}",
+                                'partial':f"{record['muse']['L_partial']:.3f}",
+                                'muse_sub':f"{record['muse']['L_sub']:.4f}"})
+            if care is not None:
+                tqdm.write('CARE ' + json.dumps(record['care'], sort_keys=True))
+                postfix['care'] = f"{record['care']['added_loss']:.4f}"
+                postfix['rescued'] = str(sum(record['care']['accepted_by_class']))
+            if args.method == 'r2_msmr':
+                masked = record['r2_masked_reconstruction']
+                tqdm.write('R2_MSMR ' + json.dumps({'iteration': iteration, **masked}))
+                postfix.update(src_mask=f"{masked['source_reconstruction']:.3f}",
+                               tgt_mask=f"{masked['target_reconstruction']:.3f}",
+                               aux_grad=f"{masked['applied_gradient_ratio']:.3f}")
+            if neighbor_learning is not None:
+                neighbor = record['neighbor_learning']
+                tqdm.write('NEIGHBOR_SOFT ' + json.dumps({'iteration': iteration, **neighbor}))
+                postfix['target_ce'] = f"{neighbor['added_loss']:.4f}"
+            if 'uncertainty_pseudo' in record:
+                uncertainty = record['uncertainty_pseudo']
+                postfix['target_ce'] = f"{uncertainty['target_ce']:.4f}"
+                postfix['w'] = f"{uncertainty.get('mean_weight', 0.):.3f}"
+            if 'cbst' in record:
+                postfix['target_ce'] = f"{record['cbst']['target_ce']:.4f}"
+                postfix['accept'] = f"{record['cbst']['coverage']:.2f}"
             progress.set_postfix(postfix)
         if _should_evaluate_target(
             args.evaluation_protocol,
@@ -4147,6 +4496,24 @@ def run_fold(
             ):
                 selected_evaluation = candidate_evaluation
                 selected_iteration = iteration
+                if diagnostic is not None and hasattr(diagnostic, 'selected_checkpoint'):
+                    diagnostic.selected_checkpoint(iteration, candidate_evaluation, final_target_evidence)
+            current_fused = candidate_evaluation["fused"]
+            best_fused = selected_evaluation["fused"]
+            tqdm.write(
+                "TARGET_METRICS "
+                + json.dumps(
+                    {
+                        "iteration": iteration,
+                        "current_acc": current_fused["accuracy"],
+                        "current_recall": current_fused["per_class_recall"],
+                        "best_iteration": selected_iteration,
+                        "best_acc": best_fused["accuracy"],
+                        "best_recall": best_fused["per_class_recall"],
+                    },
+                    sort_keys=True,
+                )
+            )
             tqdm.write(
                 f"Target eval {spec.name}/seed{seed}/S{subject:02d} "
                 f"I{iteration:04d}: "
@@ -4155,6 +4522,8 @@ def run_fold(
                 f"at I{selected_iteration:04d}"
             )
 
+    if full_pseudo_alignment is not None:
+        full_pseudo_alignment.refresh(model, target_evidence_loader, iterations)
     if selected_evaluation is None or selected_iteration is None:
         raise RuntimeError("No target evaluation was produced")
     evaluation = selected_evaluation
@@ -4166,7 +4535,13 @@ def run_fold(
         "experiment": spec.name,
         "experiment_spec": asdict(spec),
         "method": args.method,
+        "care_config": asdict(care_args_config(args)) if args.method == 'care' else None,
+        "care": care.state() if care is not None else None,
         "subgroup_alignment": subgroup_alignment.state() if subgroup_alignment is not None else None,
+        "style_augmentation": style_augmentation.state() if style_augmentation is not None else None,
+        "full_pseudo_alignment": full_pseudo_alignment.state() if full_pseudo_alignment is not None else None,
+        "muse": muse.state() if muse is not None else None,
+        "muse_config": asdict(muse_args_config(args)) if args.method == 'muse' else None,
         "protocol": {
             "name": (
                 f"{'_'.join(prepared.domain_names)}_to_"
@@ -4584,12 +4959,69 @@ def run_fold(
         result["peak_cuda_memory_mib"] = (
             torch.cuda.max_memory_allocated(device) / (1024**2)
         )
-    result_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+        result['peak_cuda_reserved_mib'] = torch.cuda.max_memory_reserved(device) / (1024**2)
+        result['cuda_memory_budget_gib'] = args.cuda_memory_budget_gib
+    if style_augmentation is not None:
+        state_path = result_path.with_suffix('.style.pt')
+        temporary_state = state_path.with_suffix('.pt.tmp')
+        torch.save(style_augmentation.state_dict(), temporary_state)
+        temporary_state.replace(state_path)
+        result['style_state_file'] = state_path.name
+        result['style_state_scope'] = 'style_controller_only; interrupted_folds_restart_from_seed'
+    if muse is not None:
+        state_path = result_path.with_suffix('.muse.pt')
+        state_tmp = state_path.with_suffix('.pt.tmp')
+        torch.save({'config':asdict(muse.config),'controller':muse.state_dict()},state_tmp)
+        state_tmp.replace(state_path)
+        result['muse_state_file'] = state_path.name
+    if args.method == 'muse':
+        metrics=evaluation['fused']
+        matrix=np.asarray(metrics['confusion_matrix'],dtype=float)
+        denominator=matrix.sum(0)+matrix.sum(1)
+        per_class_f1=np.divide(2*np.diag(matrix),denominator,out=np.zeros_like(denominator),where=denominator>0)
+        result['muse_evaluation']={key:metrics[key] for key in ('accuracy','balanced_accuracy','macro_f1','per_class_recall')}
+        result['muse_evaluation']['per_class_f1']=dict(zip(CLASS_NAMES,per_class_f1.tolist()))
+        tqdm.write('MUSE_EVAL '+json.dumps(result['muse_evaluation'],sort_keys=True))
+    if args.method == 'r2_msmr':
+        result['r2_masked_reconstruction'] = model.r2_mask_reconstruction.state()
+        result['predictions'] = model.r2_mask_reconstruction.predictions
+        context = {
+            'compute_domain': False, 'pyramid_gate_ramp': 1.0,
+            'scale_class_reliability': prototype_bank.scale_class_reliability().detach().cpu(),
+            'multiview_source_anchor': prototype_bank.source_relation_weights().mean(0).detach().cpu(),
+            'source_prototype_memory': source_prototype_memory.memory.detach().cpu(),
+            'source_prototype_initialized': source_prototype_memory.initialized.detach().cpu(),
+            'class_logit_adjustment': torch.tensor(evaluation['target_logit_adjustment']),
+            'pyramid_bias_risk': torch.tensor(evaluation['pyramid_bias_risk']),
+        }
+        checkpoint_path = result_path.with_suffix('.pt')
+        checkpoint_tmp = checkpoint_path.with_suffix('.pt.tmp')
+        torch.save({'model': {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                    'training_args': {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+                    'experiment_spec': asdict(spec), 'model_description': result['model'],
+                    'mask_config': asdict(R2MaskConfig()), 'inference_context': context,
+                    'source_normalization': {str(k): [torch.from_numpy(v) for v in values] for k, values in prepared.stats.items()},
+                    'seed': seed, 'subject': subject, 'iteration': selected_iteration,
+                    'scope': 'final inference weights and context; interrupted folds restart from seed'}, checkpoint_tmp)
+        checkpoint_tmp.replace(checkpoint_path)
+        result['checkpoint_file'] = checkpoint_path.name
+    if diagnostic is not None:
+        diagnostic.finish(result, final_target_evidence)
+    temporary_result = result_path.with_suffix('.json.tmp')
+    temporary_result.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    temporary_result.replace(result_path)
     _write_summary(experiment_dir)
-    fused = evaluation["fused"]
-    result_label = "Selected" if is_target_selected else "Final"
+    # Diagnostics may intentionally rewrite formal reporting (for example,
+    # log every checkpoint but report step 1000). Read the committed result.
+    fused = result["evaluation"]["fused"]
+    reported_iteration = result["protocol"]["selected_iteration"]
+    result_label = (
+        "Selected"
+        if result["protocol"]["checkpoint_selection"] == "highest_target_accuracy"
+        else "Final"
+    )
     tqdm.write(
-        f"{result_label} {result_path} at iteration {selected_iteration}: "
+        f"{result_label} {result_path} at iteration {reported_iteration}: "
         f"acc={fused['accuracy']:.4f}, "
         f"bal={fused['balanced_accuracy']:.4f}, f1={fused['macro_f1']:.4f}"
     )
@@ -4600,8 +5032,24 @@ def build_parser() -> argparse.ArgumentParser:
         description="Class-conditional multiscale fixed-1000 UDA"
     )
     parser.add_argument("--experiment", choices=EXPERIMENT_ORDER, required=True)
-    parser.add_argument("--method", choices=("experiment", "r2_subgroup", "r2_coteaching"), default="experiment",
+    parser.add_argument("--method", choices=("experiment", "r2_subgroup", "r2_coteaching", "r2_prototype_off", "r3", "r4", "muse", "care", "r2_msmr"), default="experiment",
                         help="R2 subgroup/peer-teaching A-F profiles without later D/N/domain-gap additions")
+    parser.add_argument('--r3-variant', choices=STYLE_VARIANTS, default='full')
+    parser.add_argument('--r4-variant', choices=R4_VARIANTS, default='full')
+    parser.add_argument('--muse-variant', choices=MUSE_VARIANTS, default='full')
+    parser.add_argument('--care-variant', choices=CARE_VARIANTS, default='full')
+    parser.add_argument('--cuda-memory-budget-gib', type=float, default=0.,
+                        help='Optional PyTorch allocator cap; CUDA context adds overhead')
+    for name, default in asdict(CareConfig()).items():
+        options = {'action': argparse.BooleanOptionalAction} if isinstance(default, bool) else {'type': type(default)}
+        parser.add_argument('--care-' + name.replace('_', '-'), default=default, **options)
+    for name, default in asdict(MuseConfig()).items():
+        options = {'action':argparse.BooleanOptionalAction} if isinstance(default,bool) else {'type':type(default)}
+        parser.add_argument('--muse-'+name.replace('_','-'),default=default,**options)
+    for name, default in asdict(StyleConfig()).items():
+        options = ({'action': argparse.BooleanOptionalAction} if isinstance(default, bool)
+                   else {'type': type(default)})
+        parser.add_argument('--style-' + name.replace('_', '-'), default=default, **options)
     for name, default in asdict(CoTeachingConfig()).items():
         parser.add_argument("--subgroup-" + name.replace("_", "-"), type=type(default), default=None)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
@@ -4785,6 +5233,33 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def validate_args(args, spec: ExperimentSpec) -> None:
+    if not math.isfinite(args.cuda_memory_budget_gib) or args.cuda_memory_budget_gib < 0:
+        raise ValueError('CUDA memory budget must be finite and nonnegative')
+    if args.method == 'r2_msmr':
+        R2MaskConfig().validate()
+        if args.evaluation_protocol != EVALUATION_PROTOCOL_FIXED_FINAL or args.result_root.expanduser().resolve() == DEFAULT_RESULT_ROOT.resolve():
+            raise ValueError('R2+MSMR requires fixed-final evaluation in a new result root')
+        if spec.use_subgroup_alignment or spec.use_multiscale_coteaching:
+            raise ValueError('R2+MSMR extends original R2, not the subgroup/co-teaching profile')
+    if args.method == 'care':
+        care_args_config(args).validate()
+        if args.adaptation_warmup_iterations != subgroup_config(args).warmup or args.adaptation_ramp_end != subgroup_config(args).ramp_end:
+            raise ValueError('CARE retains the R2 warmup/ramp schedule')
+    if args.method == 'muse':
+        muse_args_config(args).validate()
+        if args.adaptation_warmup_iterations != subgroup_config(args).warmup or args.adaptation_ramp_end != subgroup_config(args).ramp_end:
+            raise ValueError('MUSE must retain the R2 warmup/ramp schedule')
+    if args.method == 'r4':
+        args.adaptation_warmup_iterations = 0
+        args.adaptation_ramp_end = 0
+        if args.evaluation_protocol != EVALUATION_PROTOCOL_FIXED_FINAL:
+            raise ValueError('R4 requires fixed final evaluation')
+        if args.result_root.expanduser().resolve() == DEFAULT_RESULT_ROOT.resolve():
+            raise ValueError('R4 requires a separate result root')
+    if args.method == 'r3':
+        r3_config(args).validate()
+        if args.adaptation_warmup_iterations != subgroup_config(args).warmup or args.adaptation_ramp_end != subgroup_config(args).ramp_end:
+            raise ValueError('R3 and co-teaching must share the existing adaptation schedule')
     if spec.use_subgroup_alignment:
         subgroup_config(args).validate()
         if args.evaluation_protocol != EVALUATION_PROTOCOL_FIXED_FINAL:
@@ -4991,7 +5466,13 @@ def validate_args(args, spec: ExperimentSpec) -> None:
 
 def main() -> None:
     args = build_parser().parse_args()
-    spec = (coteaching_experiment(args.experiment) if args.method == "r2_coteaching"
+    spec = (r2_masked_experiment(args.experiment) if args.method == 'r2_msmr'
+            else care_experiment(args.experiment, args.care_variant) if args.method == 'care'
+            else muse_experiment(args.experiment, args.muse_variant) if args.method == 'muse'
+            else r4_experiment(args.experiment, args.r4_variant) if args.method == 'r4'
+            else r3_experiment(args.experiment, args.r3_variant) if args.method == 'r3'
+            else coteaching_experiment(args.experiment) if args.method == "r2_coteaching"
+            else r2_prototype_off_experiment(args.experiment) if args.method == "r2_prototype_off"
             else subgroup_experiment(args.experiment) if args.method == "r2_subgroup"
             else EXPERIMENTS[args.experiment])
     validate_args(args, spec)
@@ -5002,6 +5483,9 @@ def main() -> None:
     )
     if device.type == "cuda":
         torch.cuda.set_device(device)
+        if args.cuda_memory_budget_gib:
+            total_memory = torch.cuda.get_device_properties(device).total_memory
+            torch.cuda.set_per_process_memory_fraction(min(1., args.cuda_memory_budget_gib * 1024**3 / total_memory), device)
     tqdm.write(
         f"Experiment={spec.name}: {spec.description}; "
         f"sources={spec.source_domains}; scales={spec.scales}; device={device}"
@@ -5025,6 +5509,9 @@ def main() -> None:
             "evidence refresh, diagnostic-only target-prior estimation, no "
             "checkpoint selection, one final labeled target evaluation"
         )
+    if args.method == 'r2_msmr':
+        from .train_msmr import validate_temporal_artifacts
+        validate_temporal_artifacts(args.data_dir, (*spec.source_domains, spec.target_dataset))
     prepared = prepare_sources(
         args.data_dir,
         spec.source_domains,
@@ -5035,9 +5522,20 @@ def main() -> None:
         compact_physiology=spec.use_physiology_reliability,
         subject_robust_physiology=spec.use_physiology_reliability,
     )
+    if args.method == 'r2_msmr':
+        from .train_msmr import validate_trial_lengths
+        for source in prepared.datasets:
+            validate_trial_lengths(source)
     for seed in args.random_seeds:
         for subject in args.target_subjects:
             run_fold(args, spec, prepared, seed, subject, device)
+            if args.method == 'r2_msmr':
+                import gc
+                import time
+                gc.collect()
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                time.sleep(1.)
 
 
 if __name__ == "__main__":

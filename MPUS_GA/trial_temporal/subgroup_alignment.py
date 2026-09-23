@@ -271,6 +271,10 @@ class SubgroupBank:
                         continue
                     own = assignment[strong]
                     paired = matched[strong].long().argmax(-1)
+                    if hasattr(self,'muse_transport'):
+                        transport=self.muse_transport[scale,label]
+                        if domain==1:transport=transport.T
+                        paired=transport[own].masked_fill(~matched[strong],-1).argmax(-1)
                     similarity = self.similarity[scale, label]
                     if domain == 1:
                         similarity = similarity.T

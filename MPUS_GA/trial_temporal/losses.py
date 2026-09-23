@@ -18,6 +18,8 @@ def class_conditional_prototype_alignment_loss(
     target_valid_mask: torch.Tensor | None = None,
     target_sample_weight: torch.Tensor | None = None,
     scale_class_strength: torch.Tensor | None = None,
+    pseudo_label_override: torch.Tensor | None = None,
+    effective_weight_override: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, float]:
     """Align each source-domain/scale/class centroid to its target centroid.
 
@@ -70,6 +72,10 @@ def class_conditional_prototype_alignment_loss(
         confidence_weight = confidence_weight * target_sample_weight.detach().to(
             confidence_weight
         ).clamp(0.0, 1.0)
+    if pseudo_label_override is not None:
+        from .pcdiag import override_consumers
+        pseudo_label, valid, confidence_weight = override_consumers(
+            target_probability, target_valid_mask, pseudo_label_override, effective_weight_override)
     coverage = float(valid.float().mean())
     class_losses = []
     for class_index in range(classes):

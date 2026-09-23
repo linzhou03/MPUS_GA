@@ -8,6 +8,7 @@ from collections.abc import Mapping, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from MPUS_GA.layers import GRL, PositionalEncoding, SpatialStream
 
@@ -1586,6 +1587,31 @@ class MultiScaleMultiSourceDANN(nn.Module):
             probability = probability.detach()
         return torch.einsum("bc,bd->bcd", probability, embedding).flatten(1)
 
+    def encode_window_sequence(self, x, mask, key):
+        """Original window/temporal encoder, with opt-in memory recomputation.
+
+        Spatial graphs are independent across windows. Chunking their evaluation
+        preserves all windows and the full trial-level optimization batch.
+        """
+        chunk = getattr(self, 'spatial_chunk_windows', 0)
+        recompute = getattr(self, 'activation_checkpointing', False) and self.training and torch.is_grad_enabled()
+        if chunk:
+            valid = x[mask]
+            pieces = []
+            for start in range(0, len(valid), chunk):
+                block = valid[start:start + chunk].unsqueeze(0)
+                block_mask = torch.ones(block.shape[:2], device=mask.device, dtype=torch.bool)
+                encoded = (checkpoint(self.spatial, block, block_mask, use_reentrant=False)
+                           if recompute else self.spatial(block, block_mask))
+                pieces.append(encoded.squeeze(0))
+            sequence = x.new_zeros(*mask.shape, self.d_model)
+            sequence[mask] = torch.cat(pieces)
+        else:
+            sequence = (checkpoint(self.spatial, x, mask, use_reentrant=False)
+                        if recompute else self.spatial(x, mask))
+        return (checkpoint(self.temporal[key].encode_sequence, sequence, mask, use_reentrant=False)
+                if recompute else self.temporal[key].encode_sequence(sequence, mask))
+
     def forward(
         self,
         x_by_scale: Mapping[str, torch.Tensor],
@@ -1618,10 +1644,7 @@ class MultiScaleMultiSourceDANN(nn.Module):
         pooled = []
         encoded_sequences = []
         for key in self.scale_keys:
-            sequence = self.spatial(x_by_scale[key], mask_by_scale[key])
-            encoded = self.temporal[key].encode_sequence(
-                sequence, mask_by_scale[key]
-            )
+            encoded = self.encode_window_sequence(x_by_scale[key], mask_by_scale[key], key)
             encoded_sequences.append(encoded)
             pooled.append(
                 self.temporal[key].pool_sequence(
@@ -1674,6 +1697,8 @@ class MultiScaleMultiSourceDANN(nn.Module):
         # graph are downstream fusion mechanisms and can never alter these
         # embeddings or logits in the forward pass.
         scale_embeddings = self.scale_output_norm(tokens)
+        if hasattr(self, 'r4_semantic_projection'):
+            scale_embeddings = self.r4_semantic_projection(scale_embeddings)
         scale_logits = self.classifier(scale_embeddings)
         fusion_scale_logits = scale_logits
         if class_logit_adjustment is not None:
