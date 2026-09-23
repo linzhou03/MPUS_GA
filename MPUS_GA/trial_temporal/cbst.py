@@ -23,19 +23,24 @@ class CBSTConfig:
     weight: float = 1.
     activation_checkpointing: bool = False
     spatial_chunk_windows: int = 0
+    selection_mode: str = 'strict_quota'
+    target_loss_mode: str = 'sample_mean'
 
     def __post_init__(self):
         if not 0 < self.initial_portion <= self.maximum_portion <= 1:
             raise ValueError('Invalid CBST selection portions')
         if self.refresh_interval < 1 or self.portion_increment < 0 or self.weight < 0:
             raise ValueError('Invalid CBST schedule')
+        if (self.selection_mode, self.target_loss_mode) not in (
+            ('strict_quota', 'sample_mean'), ('independent', 'class_mean')):
+            raise ValueError('Unsupported CBST selection/loss combination')
 
     def portion(self, round_index):
         return round(min(self.maximum_portion, self.initial_portion + self.portion_increment * round_index), 10)
 
 
 @torch.no_grad()
-def select(probability, portion):
+def select(probability, portion, mode='strict_quota'):
     p = probability.detach().float()
     if p.ndim != 2 or len(p) == 0 or not 0 < portion <= 1:
         raise ValueError('Expected a nonempty probability table and valid portion')
@@ -47,10 +52,15 @@ def select(probability, portion):
     support = torch.bincount(raw_label, minlength=num_classes)
     ranks = torch.zeros_like(support)
     accepted = torch.zeros(len(p), dtype=torch.bool, device=p.device)
+    if mode not in ('strict_quota', 'independent'):
+        raise ValueError('Unknown CBST selection mode')
     min_support = int(support.min().item())
-    if min_support > 0:
-        quota = max(1, int(math.floor(min_support * portion + 1e-9)))
+    if mode == 'independent' or min_support > 0:
+        shared_quota = max(1, int(math.floor(min_support * portion + 1e-9))) if mode == 'strict_quota' else None
         for c in range(num_classes):
+            if support[c] == 0:
+                continue
+            quota = shared_quota if shared_quota is not None else max(1, int(math.floor(int(support[c]) * portion + 1e-9)))
             candidates = torch.where(raw_label == c)[0]
             cand_conf = raw_confidence[candidates]
             sorted_order = cand_conf.sort(descending=True, stable=True).indices
@@ -58,8 +68,6 @@ def select(probability, portion):
             accepted[top_quota] = True
             ranks[c] = quota
             thresholds[c] = cand_conf[sorted_order[quota - 1]]
-    else:
-        quota = 0
     ratio = p / thresholds[None].clamp_min(1e-8)
     score = p.gather(1, raw_label[:, None]).squeeze(1)
     return dict(raw_probability=p, raw_label=raw_label, thresholds=thresholds,
@@ -69,11 +77,20 @@ def select(probability, portion):
         accepted_class_count=torch.bincount(raw_label[accepted],minlength=num_classes))
 
 
-def selected_ce(logits, label, accepted):
+def selected_ce(logits, label, accepted, mode='sample_mean'):
     accepted = accepted.detach().bool()
     if not accepted.any():
         return logits.sum() * 0.
-    return F.cross_entropy(logits[accepted], label.detach()[accepted])
+    if mode == 'sample_mean':
+        return F.cross_entropy(logits[accepted], label.detach()[accepted])
+    if mode != 'class_mean':
+        raise ValueError('Unknown target loss mode')
+    labels = label.detach()
+    return torch.stack([
+        F.cross_entropy(logits[mask], labels[mask])
+        for c in range(logits.shape[-1])
+        if (mask := accepted & (labels == c)).any()
+    ]).mean()
 
 
 class CBSTController:
@@ -91,7 +108,7 @@ class CBSTController:
         if self.ids is not None and not torch.equal(ids,self.ids):raise ValueError('Target trial order changed')
         if self.iteration is not None and iteration <= self.iteration:raise ValueError('Non-increasing refresh')
         portion=self.config.portion(len(self.rounds))
-        self.table=cpu(select(evidence['raw_probability'],portion))
+        self.table=cpu(select(evidence['raw_probability'],portion,self.config.selection_mode))
         self.ids,self.iteration=ids,int(iteration)
         self.rounds.append(dict(iteration=self.iteration,portion=portion,ids=ids,**cpu(self.table)))
 
@@ -132,7 +149,7 @@ class CBSTController:
     def loss(self, logits, ramp):
         if self.last_batch is None:return logits.sum()*0.
         row=self.last_batch
-        loss=selected_ce(logits,row['pseudo_label'].to(logits.device),row['accepted'].to(logits.device))
+        loss=selected_ce(logits,row['pseudo_label'].to(logits.device),row['accepted'].to(logits.device),self.config.target_loss_mode)
         added=self.config.weight*ramp*loss
         self.last_record.update(target_ce=float(loss.detach()),added_loss=float(added.detach()),coefficient=self.config.weight*ramp)
         return added
@@ -143,5 +160,5 @@ class CBSTController:
     def metadata(self):
         return dict(config=asdict(self.config),reference_commit=REFERENCE_COMMIT,active_steps=self.active_steps,
             refresh_iterations=[r['iteration'] for r in self.rounds],generator='CBST probability / class threshold',
-            selection='max_c p_c / threshold_c >= 1',target_truth_used_for_training=False,
+            selection=self.config.selection_mode,target_truth_used_for_training=False,
             prototype_learning=False,knn=False,entropy_weights=False,teacher=False)

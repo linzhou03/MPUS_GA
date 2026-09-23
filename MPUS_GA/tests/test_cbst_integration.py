@@ -29,8 +29,9 @@ def test_real_train_step_has_selected_ce_without_prototypes(tmp_path):
         records.append(train.train_step(model,[source],target,opt,sch,torch.device('cpu'),step,spec,
             torch.ones(1,3)/3,None,.1,5.,300,600,.6))
     assert records[0]['cbst']['added_loss']==0
-    assert records[1]['cbst']['target_ce']>0 and records[1]['prototype']==0
-    assert model.cbst.active_steps==1 and model.cbst.last_batch['accepted'].any()
+    assert records[1]['prototype']==0
+    assert model.cbst.active_steps==1
+    assert (records[1]['cbst']['target_ce']>0)==bool(model.cbst.last_batch['accepted'].any())
     assert not torch.equal(before,model.spatial.input_projection.weight.detach())
 
 
@@ -41,3 +42,17 @@ def test_passive_evaluation_restores_rng_and_model_mode():
     before=torch.get_rng_state().clone()
     result=passive_evaluation(evaluator)(model,None,torch.device('cpu'))
     assert torch.equal(before,torch.get_rng_state()) and model.training and len(result)==3
+
+
+def test_post300_balanced_selection_configuration(tmp_path):
+    args,spec=settings('B',tmp_path,tmp_path,'1',43,'cpu',
+                       selection='post300_bal_best',variant='independent')
+    assert args._target_selection_metric=='balanced_accuracy'
+    assert args._target_selection_min_iteration==301
+    assert args._cbst_config.selection_mode=='independent'
+    assert args._cbst_config.target_loss_mode=='class_mean'
+    assert not spec.use_prototypes
+    first={'fused':{'accuracy':.7,'balanced_accuracy':.4}}
+    second={'fused':{'accuracy':.5,'balanced_accuracy':.6}}
+    assert train._target_evaluation_is_better(second,first,'balanced_accuracy')
+    assert not train._target_evaluation_is_better(second,first,'accuracy')

@@ -20,14 +20,25 @@ from .train_boundary_study import context, metrics, model_hash
 from .uncertainty_pseudo import collect_evidence
 
 
-def settings(direction,data_dir,result_root,subjects='all',seed=43,device='cuda:0',selection='fixed_final'):
+def cbst_config(variant):
+    if variant == 'strict_quota':
+        return CBSTConfig()
+    if variant == 'independent':
+        return CBSTConfig(selection_mode='independent', target_loss_mode='class_mean')
+    raise ValueError(f'Unknown CBST variant: {variant}')
+
+
+def settings(direction,data_dir,result_root,subjects='all',seed=43,device='cuda:0',selection='fixed_final',variant='strict_quota'):
     args,spec=arguments(direction,data_dir,result_root,subjects,(seed,),device)
-    spec=replace(spec,ablation='cbst_'+selection,
-        description=f'{direction}: prototype-free R2 with trial CBST; {selection}',
+    spec=replace(spec,ablation=f'cbst_{variant}_{selection}',
+        description=f'{direction}: prototype-free R2 with trial CBST; {variant}; {selection}',
         use_prototypes=False,use_source_prototype_memory=False,prototype_weight=0.,use_source_multiview_anchor=False)
     assert not spec.use_subgroup_alignment and not spec.use_multiscale_coteaching
-    args._cbst_config=CBSTConfig()
+    args._cbst_config=cbst_config(variant)
     args.source_balance_alpha = 1.0
+    if selection == 'post300_bal_best':
+        args._target_selection_metric = 'balanced_accuracy'
+        args._target_selection_min_iteration = args.adaptation_warmup_iterations + 1
     # Both servers evaluate each update so logs expose current/best metrics.
     # Recorder.finish restores fixed-final formal reporting on xju.
     args.evaluation_protocol=train.EVALUATION_PROTOCOL_CAGA_TARGET_BEST
@@ -98,10 +109,10 @@ class Recorder:
             args={k:str(v) if isinstance(v,Path) else v for k,v in vars(r['args']).items() if not k.startswith('_')},
             cbst=r['model'].cbst.metadata(),cbst_state=r['model'].cbst.state(),
             seed=r['seed'],subject=r['subject'],iteration=iteration,evaluation=evaluation,
-            target_test_labels_used_for_selection=self.selection=='test_best')
+            target_test_labels_used_for_selection=self.selection!='fixed_final')
 
     def selected_checkpoint(self,iteration,evaluation,evidence):
-        if self.selection!='test_best':return
+        if self.selection=='fixed_final':return
         save_pt(self.path.with_suffix('.best.pt'),self.checkpoint(iteration,evidence,evaluation))
         save_pt(self.path.with_suffix('.best.pseudo.pt'),dict(iteration=iteration,prediction=self.collect(1000,evidence)))
 
@@ -118,16 +129,17 @@ class Recorder:
         suffix='.pt' if self.selection=='fixed_final' else '.last.pt'
         save_pt(self.path.with_suffix(suffix),self.checkpoint(train.FIXED_UDA_PROTOCOL.training_iterations,final_evidence,
             result['target_evaluation_trace'][-1]['evaluation']))
-        if self.selection=='test_best':self.path.with_suffix('.best.pt').replace(self.path.with_suffix('.pt'))
+        if self.selection!='fixed_final':self.path.with_suffix('.best.pt').replace(self.path.with_suffix('.pt'))
         result['method']='r2_proto_off_cbst'
         result['cbst']=dict(**learner.metadata(),observed_steps=self.steps,optimizer_steps=self.steps,
             initial_model_sha256=self.initial_hash,batch_sequence_sha256=self.batch_hash.hexdigest())
-        result['reporting']=dict(protocol=self.selection,selection_metric='fused.accuracy',tie_break='earliest',
-            target_test_labels_used_for_selection=self.selection=='test_best',
-            primary_output='test_selected_fused' if self.selection=='test_best' else 'fused',
+        result['reporting']=dict(protocol=self.selection,selection_metric=('fused.balanced_accuracy' if self.selection=='post300_bal_best' else 'fused.accuracy'),tie_break='earliest',
+            target_test_labels_used_for_selection=self.selection!='fixed_final',
+            primary_output='test_selected_fused' if self.selection!='fixed_final' else 'fused',
             selected_iteration=result['protocol']['selected_iteration'],evaluation_interval=1,
             logged_best_is_diagnostic=self.selection=='fixed_final',
-            note='Target-test-selected diagnostic' if self.selection=='test_best' else 'Fixed final step 1000')
+            note=('Target-test BalAcc selected from steps 301..1000' if self.selection=='post300_bal_best'
+                  else 'Target-test-selected diagnostic' if self.selection=='test_best' else 'Fixed final step 1000'))
 
 
 def offline_report(path,data_dir):
@@ -137,7 +149,7 @@ def offline_report(path,data_dir):
     truth_map=load_truth(data_dir,row['experiment_spec']['target_dataset'],row['target_subject'])
     def truth(p):return torch.tensor([truth_map[tuple(v)][0] for v in p['ids'].tolist()])
     final=saved['final'];primary_prediction=final
-    if row['reporting']['protocol']=='test_best':
+    if row['reporting']['protocol']!='fixed_final':
         best=torch.load(path.with_suffix('.best.pseudo.pt'),map_location='cpu',weights_only=False)
         assert best['iteration']==row['protocol']['selected_iteration']
         primary_prediction=best['prediction']
@@ -158,10 +170,10 @@ def offline_report(path,data_dir):
         reporting=row['reporting'],rounds=rounds,scope='Truth joined after training; never used to set CBST thresholds'))
 
 
-def complete(path,selection):
+def complete(path,selection,variant='strict_quota'):
     if not path.exists():return False
     row=json.loads(path.read_text());s=row.get('cbst',{});p=row['protocol']
-    if s.get('config')!=asdict(CBSTConfig()) or s.get('observed_steps')!=1000 or s.get('active_steps')!=700:
+    if s.get('config')!=asdict(cbst_config(variant)) or s.get('observed_steps')!=1000 or s.get('active_steps')!=700:
         raise RuntimeError('Incomplete or conflicting CBST result '+str(path))
     if row['reporting']['protocol']!=selection or row['final_prototype_bank'] is not None or row['final_source_prototype_memory'] is not None:
         raise RuntimeError('Wrong CBST protocol')
@@ -169,7 +181,10 @@ def complete(path,selection):
         assert p['selected_iteration']==1000 and p['target_evaluations']==1000 and p['target_eval_interval']==1
     else:
         assert 1<=p['selected_iteration']<=1000 and p['target_evaluations']==1000 and p['target_eval_interval']==1
-    for ext in ('.pt','.pseudo.pt')+ (('.last.pt','.best.pseudo.pt') if selection=='test_best' else ()):
+        if selection=='post300_bal_best':
+            assert 301<=p['selected_iteration']<=1000
+            assert row['reporting']['selection_metric']=='fused.balanced_accuracy'
+    for ext in ('.pt','.pseudo.pt')+ (('.last.pt','.best.pseudo.pt') if selection!='fixed_final' else ()):
         if not path.with_suffix(ext).exists():raise RuntimeError('Missing artifact '+str(path.with_suffix(ext)))
     return True
 
@@ -178,21 +193,22 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--direction',choices=list('ABCDEF'),required=True)
     p.add_argument('--data-dir',type=Path,required=True);p.add_argument('--result-root',type=Path,required=True)
-    p.add_argument('--selection',choices=['fixed_final','test_best'],required=True)
+    p.add_argument('--selection',choices=['fixed_final','test_best','post300_bal_best'],required=True)
+    p.add_argument('--variant',choices=['strict_quota','independent'],default='strict_quota')
     p.add_argument('--seed',type=int,default=43,choices=[43]);p.add_argument('--subjects',default='all')
     cli=p.parse_args();configure_determinism();torch.set_num_threads(4);install_passive_evaluation()
     device=torch.device('cuda:0');torch.cuda.set_device(device)
     if torch.cuda.device_count()!=1:raise RuntimeError('Expose one physical GPU per worker')
-    args,spec=settings(cli.direction,cli.data_dir,cli.result_root,cli.subjects,cli.seed,selection=cli.selection)
-    save_json(cli.result_root/cli.direction/'frozen_config.json',dict(spec=asdict(spec),config=asdict(CBSTConfig()),
-        selection=cli.selection,args={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items() if not k.startswith('_')}))
+    args,spec=settings(cli.direction,cli.data_dir,cli.result_root,cli.subjects,cli.seed,selection=cli.selection,variant=cli.variant)
+    save_json(cli.result_root/cli.direction/'frozen_config.json',dict(spec=asdict(spec),config=asdict(cbst_config(cli.variant)),
+        selection=cli.selection,variant=cli.variant,args={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items() if not k.startswith('_')}))
     prepared=None
     for subject in args.target_subjects:
         path,_=fold_paths(cli.result_root,cli.direction,cli.seed,subject)
-        if not complete(path,cli.selection):
+        if not complete(path,cli.selection,cli.variant):
             if prepared is None:prepared=prepare_sources(args.data_dir,spec.source_domains,spec.scales)
             args._diagnostic=Recorder(path,cli.selection)
-            print(f'START CBST/{cli.selection}/{cli.direction}/seed{cli.seed}/subject{subject:02d}',flush=True)
+            print(f'START CBST/{cli.variant}/{cli.selection}/{cli.direction}/seed{cli.seed}/subject{subject:02d}',flush=True)
             train.run_fold(args,spec,prepared,cli.seed,subject,device)
             del args._diagnostic;gc.collect();torch.cuda.empty_cache()
         if not path.with_suffix('.offline.json').exists():offline_report(path,args.data_dir)

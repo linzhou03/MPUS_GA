@@ -3910,11 +3910,13 @@ def _should_evaluate_target(
     )
 
 
-def _target_evaluation_is_better(candidate: dict, incumbent: dict | None) -> bool:
-    """Match public CAGA-SGA: select strictly higher target Accuracy."""
+def _target_evaluation_is_better(candidate: dict, incumbent: dict | None, metric: str = "accuracy") -> bool:
+    """Select strictly higher target metric, retaining the earlier tie."""
 
+    if metric not in ("accuracy", "balanced_accuracy"):
+        raise ValueError(f"Unsupported target selection metric: {metric}")
     return incumbent is None or (
-        candidate["fused"]["accuracy"] > incumbent["fused"]["accuracy"]
+        candidate["fused"][metric] > incumbent["fused"][metric]
     )
 
 
@@ -4315,6 +4317,8 @@ def run_fold(
     target_evaluation_trace = []
     selected_evaluation = None
     selected_iteration = None
+    selection_metric = getattr(args, '_target_selection_metric', 'accuracy')
+    selection_min_iteration = getattr(args, '_target_selection_min_iteration', 1)
     start_iteration = diagnostic.start_iteration if diagnostic is not None else 0
     if diagnostic is not None:
         diagnostic.ready()
@@ -4491,15 +4495,15 @@ def run_fold(
             target_evaluation_trace.append(
                 {"iteration": iteration, "evaluation": candidate_evaluation}
             )
-            if _target_evaluation_is_better(
-                candidate_evaluation, selected_evaluation
+            if iteration >= selection_min_iteration and _target_evaluation_is_better(
+                candidate_evaluation, selected_evaluation, selection_metric
             ):
                 selected_evaluation = candidate_evaluation
                 selected_iteration = iteration
                 if diagnostic is not None and hasattr(diagnostic, 'selected_checkpoint'):
                     diagnostic.selected_checkpoint(iteration, candidate_evaluation, final_target_evidence)
             current_fused = candidate_evaluation["fused"]
-            best_fused = selected_evaluation["fused"]
+            best_fused = selected_evaluation["fused"] if selected_evaluation is not None else None
             tqdm.write(
                 "TARGET_METRICS "
                 + json.dumps(
@@ -4508,18 +4512,20 @@ def run_fold(
                         "current_acc": current_fused["accuracy"],
                         "current_recall": current_fused["per_class_recall"],
                         "best_iteration": selected_iteration,
-                        "best_acc": best_fused["accuracy"],
-                        "best_recall": best_fused["per_class_recall"],
+                        "best_acc": best_fused["accuracy"] if best_fused is not None else None,
+                        "best_balanced_accuracy": best_fused["balanced_accuracy"] if best_fused is not None else None,
+                        "best_recall": best_fused["per_class_recall"] if best_fused is not None else None,
                     },
                     sort_keys=True,
                 )
             )
+            best_text = (f"best_{selection_metric}={best_fused[selection_metric]:.4f} "
+                         f"at I{selected_iteration:04d}" if best_fused is not None
+                         else "no eligible checkpoint yet")
             tqdm.write(
                 f"Target eval {spec.name}/seed{seed}/S{subject:02d} "
                 f"I{iteration:04d}: "
-                f"acc={candidate_evaluation['fused']['accuracy']:.4f}, "
-                f"best_acc={selected_evaluation['fused']['accuracy']:.4f} "
-                f"at I{selected_iteration:04d}"
+                f"acc={candidate_evaluation['fused']['accuracy']:.4f}, {best_text}"
             )
 
     if full_pseudo_alignment is not None:
@@ -4554,7 +4560,8 @@ def run_fold(
             "target_trials": spec.target_trials,
             "training_iterations": FIXED_UDA_PROTOCOL.training_iterations,
             "checkpoint_selection": (
-                "highest_target_accuracy"
+                ("highest_target_accuracy" if selection_metric == 'accuracy' and selection_min_iteration == 1
+                 else f"highest_target_{selection_metric}_from_step_{selection_min_iteration}")
                 if is_target_selected
                 else FIXED_UDA_PROTOCOL.checkpoint_selection
             ),
@@ -4563,6 +4570,8 @@ def run_fold(
                 args.target_eval_interval if is_target_selected else None
             ),
             "selected_iteration": selected_iteration,
+            "selection_metric": selection_metric if is_target_selected else None,
+            "selection_min_iteration": selection_min_iteration if is_target_selected else None,
             "target_probability_correction": (
                 args.prior_correction_strength > 0
                 or common_bias_strength > 0
@@ -5017,7 +5026,7 @@ def run_fold(
     reported_iteration = result["protocol"]["selected_iteration"]
     result_label = (
         "Selected"
-        if result["protocol"]["checkpoint_selection"] == "highest_target_accuracy"
+        if result["protocol"]["checkpoint_selection"].startswith("highest_target_")
         else "Final"
     )
     tqdm.write(

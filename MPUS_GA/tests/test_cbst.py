@@ -4,6 +4,7 @@ sys.path.insert(0,str(Path(__file__).parents[2]))
 import torch
 from MPUS_GA.trial_temporal.cbst import CBSTConfig,CBSTController,select,selected_ce
 from MPUS_GA.scripts.run_cbst_suite import plan,command
+from MPUS_GA.scripts.run_cbst_balanced_suite import plan as balanced_plan, command as balanced_command
 
 
 def test_class_threshold_and_normalized_reassignment():
@@ -34,6 +35,28 @@ def test_selected_ce_ignores_rejected_and_empty_has_zero_gradient():
     assert zero.item()==0 and logits.grad.abs().sum()==0
 
 
+def test_independent_acceptance_keeps_present_classes_when_one_is_missing():
+    p=torch.tensor([[.90,.05,.05],[.80,.10,.10],[.70,.20,.10],
+                    [.10,.85,.05],[.15,.75,.10],[.20,.70,.10]])
+    strict=select(p,.5)
+    independent=select(p,.5,'independent')
+    assert strict['accepted_class_count'].tolist()==[0,0,0]
+    assert independent['accepted_class_count'].tolist()==[1,1,0]
+    assert independent['accepted'].tolist()==[True,False,False,True,False,False]
+
+
+def test_class_mean_ce_gives_each_present_class_equal_weight():
+    logits=torch.tensor([[3.,0.,0.],[2.,0.,0.],[0.,3.,0.]],requires_grad=True)
+    label=torch.tensor([0,0,1]);mask=torch.tensor([True,True,True])
+    individual=torch.nn.functional.cross_entropy(logits,label,reduction='none')
+    expected=(individual[:2].mean()+individual[2])/2
+    actual=selected_ce(logits,label,mask,'class_mean')
+    torch.testing.assert_close(actual,expected)
+    assert not torch.isclose(actual,selected_ce(logits,label,mask))
+    actual.backward()
+    assert logits.grad.abs().sum()>0
+
+
 def test_frozen_round_lookup_and_growth():
     c=CBSTController(CBSTConfig(),[],torch.device('cpu'))
     ids=torch.tensor([[1,1,0],[1,1,1]])
@@ -57,3 +80,14 @@ def test_two_protocols_same_six_directions_one_seed(tmp_path):
             for item in queue:
                 args=command('python',item,tmp_path)
                 assert item['seeds']==[43] and args[args.index('--selection')+1]==selection
+
+
+def test_balanced_suite_is_paired_across_six_directions(tmp_path):
+    queues,summary=balanced_plan('r3_balanced_test',tmp_path)
+    assert summary['folds']==204 and summary['jobs']==12
+    assert summary['seeds']==[43] and summary['selection']=='post300_bal_best'
+    for queue in queues.values():
+        for item in queue:
+            args=balanced_command('python',item,tmp_path)
+            assert args[args.index('--variant')+1]==item['variant']
+            assert args[args.index('--selection')+1]=='post300_bal_best'
