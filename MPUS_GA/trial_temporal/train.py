@@ -4139,6 +4139,7 @@ def run_fold(
         subject,
         prepared,
         spec.scales,
+        target_normalization=getattr(args, "_target_normalization", "source"),
     )
     if args.method == 'r2_msmr':
         from .train_msmr import validate_trial_lengths

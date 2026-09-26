@@ -25,6 +25,9 @@ def cbst_config(variant):
         return CBSTConfig()
     if variant == 'independent':
         return CBSTConfig(selection_mode='independent', target_loss_mode='class_mean')
+    if variant == 'positive_gate':
+        return CBSTConfig(selection_mode='positive_gate', target_loss_mode='sample_mean',
+                          positive_min_votes=3, positive_negative_margin=.10)
     raise ValueError(f'Unknown CBST variant: {variant}')
 
 
@@ -69,7 +72,7 @@ class Recorder:
 
     def bind(self,runtime):
         self.runtime={k:runtime[k] for k in ('model','args','spec','device','prepared','seed','subject',
-            'target_evidence_loader','prototype_bank','source_prototype_memory','target_prior_estimator')}
+            'target','target_evidence_loader','prototype_bank','source_prototype_memory','target_prior_estimator')}
         assert runtime['prototype_bank'] is None and runtime['source_prototype_memory'] is None
         assert runtime['subgroup_alignment'] is None and runtime['neighbor_learning'] is None
         assert not any(hasattr(runtime['model'],n) for n in ('uncertainty_pseudo','relation_alignment','boundary_heads'))
@@ -105,7 +108,8 @@ class Recorder:
     def checkpoint(self,iteration,evidence,evaluation=None):
         r=self.runtime
         return dict(model=cpu(r['model'].state_dict()),context=cpu(context(r,1000,evidence)),
-            source_stats=cpu(r['prepared'].stats),spec=asdict(r['spec']),
+            source_stats=cpu(r['prepared'].stats),target_stats=cpu(r['target'].stats),
+            target_normalization=r['args']._target_normalization,spec=asdict(r['spec']),
             args={k:str(v) if isinstance(v,Path) else v for k,v in vars(r['args']).items() if not k.startswith('_')},
             cbst=r['model'].cbst.metadata(),cbst_state=r['model'].cbst.state(),
             seed=r['seed'],subject=r['subject'],iteration=iteration,evaluation=evaluation,
@@ -131,6 +135,7 @@ class Recorder:
             result['target_evaluation_trace'][-1]['evaluation']))
         if self.selection!='fixed_final':self.path.with_suffix('.best.pt').replace(self.path.with_suffix('.pt'))
         result['method']='r2_proto_off_cbst'
+        result['target_normalization']=r['args']._target_normalization
         result['cbst']=dict(**learner.metadata(),observed_steps=self.steps,optimizer_steps=self.steps,
             initial_model_sha256=self.initial_hash,batch_sequence_sha256=self.batch_hash.hexdigest())
         result['reporting']=dict(protocol=self.selection,selection_metric=('fused.balanced_accuracy' if self.selection=='post300_bal_best' else 'fused.accuracy'),tie_break='earliest',
@@ -170,9 +175,11 @@ def offline_report(path,data_dir):
         reporting=row['reporting'],rounds=rounds,scope='Truth joined after training; never used to set CBST thresholds'))
 
 
-def complete(path,selection,variant='strict_quota'):
+def complete(path,selection,variant='strict_quota',target_normalization='source'):
     if not path.exists():return False
     row=json.loads(path.read_text());s=row.get('cbst',{});p=row['protocol']
+    if row.get('target_normalization') != target_normalization:
+        raise RuntimeError('Wrong target normalization: '+str(path))
     if s.get('config')!=asdict(cbst_config(variant)) or s.get('observed_steps')!=1000 or s.get('active_steps')!=700:
         raise RuntimeError('Incomplete or conflicting CBST result '+str(path))
     if row['reporting']['protocol']!=selection or row['final_prototype_bank'] is not None or row['final_source_prototype_memory'] is not None:
@@ -194,18 +201,21 @@ def main():
     p.add_argument('--direction',choices=list('ABCDEF'),required=True)
     p.add_argument('--data-dir',type=Path,required=True);p.add_argument('--result-root',type=Path,required=True)
     p.add_argument('--selection',choices=['fixed_final','test_best','post300_bal_best'],required=True)
-    p.add_argument('--variant',choices=['strict_quota','independent'],default='strict_quota')
+    p.add_argument('--variant',choices=['strict_quota','independent','positive_gate'],default='strict_quota')
+    p.add_argument('--target-normalization',choices=['source','std_only','domain'],default='source')
     p.add_argument('--seed',type=int,default=43,choices=[43]);p.add_argument('--subjects',default='all')
     cli=p.parse_args();configure_determinism();torch.set_num_threads(4);install_passive_evaluation()
     device=torch.device('cuda:0');torch.cuda.set_device(device)
     if torch.cuda.device_count()!=1:raise RuntimeError('Expose one physical GPU per worker')
     args,spec=settings(cli.direction,cli.data_dir,cli.result_root,cli.subjects,cli.seed,selection=cli.selection,variant=cli.variant)
+    args._target_normalization=cli.target_normalization
     save_json(cli.result_root/cli.direction/'frozen_config.json',dict(spec=asdict(spec),config=asdict(cbst_config(cli.variant)),
-        selection=cli.selection,variant=cli.variant,args={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items() if not k.startswith('_')}))
+        selection=cli.selection,variant=cli.variant,target_normalization=cli.target_normalization,
+        args={k:str(v) if isinstance(v,Path) else v for k,v in vars(args).items() if not k.startswith('_')}))
     prepared=None
     for subject in args.target_subjects:
         path,_=fold_paths(cli.result_root,cli.direction,cli.seed,subject)
-        if not complete(path,cli.selection,cli.variant):
+        if not complete(path,cli.selection,cli.variant,cli.target_normalization):
             if prepared is None:prepared=prepare_sources(args.data_dir,spec.source_domains,spec.scales)
             args._diagnostic=Recorder(path,cli.selection)
             print(f'START CBST/{cli.variant}/{cli.selection}/{cli.direction}/seed{cli.seed}/subject{subject:02d}',flush=True)

@@ -25,6 +25,8 @@ class CBSTConfig:
     spatial_chunk_windows: int = 0
     selection_mode: str = 'strict_quota'
     target_loss_mode: str = 'sample_mean'
+    positive_min_votes: int = 0
+    positive_negative_margin: float = 0.
 
     def __post_init__(self):
         if not 0 < self.initial_portion <= self.maximum_portion <= 1:
@@ -32,15 +34,22 @@ class CBSTConfig:
         if self.refresh_interval < 1 or self.portion_increment < 0 or self.weight < 0:
             raise ValueError('Invalid CBST schedule')
         if (self.selection_mode, self.target_loss_mode) not in (
-            ('strict_quota', 'sample_mean'), ('independent', 'class_mean')):
+            ('strict_quota', 'sample_mean'), ('independent', 'class_mean'),
+            ('positive_gate', 'sample_mean')):
             raise ValueError('Unsupported CBST selection/loss combination')
+        if self.selection_mode == 'positive_gate':
+            if self.positive_min_votes < 2 or self.positive_negative_margin < 0:
+                raise ValueError('Invalid positive gate')
+        elif self.positive_min_votes or self.positive_negative_margin:
+            raise ValueError('Positive gate requires positive_gate selection mode')
 
     def portion(self, round_index):
         return round(min(self.maximum_portion, self.initial_portion + self.portion_increment * round_index), 10)
 
 
 @torch.no_grad()
-def select(probability, portion, mode='strict_quota'):
+def select(probability, portion, mode='strict_quota', scale_logits=None,
+           positive_min_votes=0, positive_negative_margin=0.):
     p = probability.detach().float()
     if p.ndim != 2 or len(p) == 0 or not 0 < portion <= 1:
         raise ValueError('Expected a nonempty probability table and valid portion')
@@ -50,18 +59,30 @@ def select(probability, portion, mode='strict_quota'):
     num_classes = p.shape[1]
     thresholds = p.new_ones(num_classes)
     support = torch.bincount(raw_label, minlength=num_classes)
+    eligible = torch.ones(len(p), dtype=torch.bool, device=p.device)
+    if mode == 'positive_gate':
+        if num_classes != 3 or scale_logits is None or scale_logits.ndim != 3 or (
+                scale_logits.shape[0] != len(p) or scale_logits.shape[2] != num_classes or
+                not 2 <= positive_min_votes <= scale_logits.shape[1] or
+                positive_negative_margin < 0):
+            raise ValueError('Positive gate requires three classes and valid scale logits')
+        votes = (scale_logits.detach().to(p.device).argmax(-1) == 0).sum(-1)
+        positive = raw_label == 0
+        eligible[positive] = ((votes >= positive_min_votes) &
+                              ((p[:, 0] - p[:, 2]) >= positive_negative_margin))[positive]
+    eligible_support = torch.bincount(raw_label[eligible], minlength=num_classes)
     ranks = torch.zeros_like(support)
     accepted = torch.zeros(len(p), dtype=torch.bool, device=p.device)
-    if mode not in ('strict_quota', 'independent'):
+    if mode not in ('strict_quota', 'independent', 'positive_gate'):
         raise ValueError('Unknown CBST selection mode')
-    min_support = int(support.min().item())
+    min_support = int(eligible_support.min().item())
     if mode == 'independent' or min_support > 0:
-        shared_quota = max(1, int(math.floor(min_support * portion + 1e-9))) if mode == 'strict_quota' else None
+        shared_quota = max(1, int(math.floor(min_support * portion + 1e-9))) if mode != 'independent' else None
         for c in range(num_classes):
-            if support[c] == 0:
+            if eligible_support[c] == 0:
                 continue
-            quota = shared_quota if shared_quota is not None else max(1, int(math.floor(int(support[c]) * portion + 1e-9)))
-            candidates = torch.where(raw_label == c)[0]
+            quota = shared_quota if shared_quota is not None else max(1, int(math.floor(int(eligible_support[c]) * portion + 1e-9)))
+            candidates = torch.where(eligible & (raw_label == c))[0]
             cand_conf = raw_confidence[candidates]
             sorted_order = cand_conf.sort(descending=True, stable=True).indices
             top_quota = candidates[sorted_order[:quota]]
@@ -71,7 +92,8 @@ def select(probability, portion, mode='strict_quota'):
     ratio = p / thresholds[None].clamp_min(1e-8)
     score = p.gather(1, raw_label[:, None]).squeeze(1)
     return dict(raw_probability=p, raw_label=raw_label, thresholds=thresholds,
-        raw_class_support=support, class_rank=ranks, ratio=ratio,
+        raw_class_support=support, eligible_class_support=eligible_support,
+        positive_gate_eligible=eligible, class_rank=ranks, ratio=ratio,
         probability=ratio/ratio.sum(-1,keepdim=True), pseudo_label=raw_label,
         confidence=raw_confidence, score=score, accepted=accepted,
         accepted_class_count=torch.bincount(raw_label[accepted],minlength=num_classes))
@@ -108,7 +130,9 @@ class CBSTController:
         if self.ids is not None and not torch.equal(ids,self.ids):raise ValueError('Target trial order changed')
         if self.iteration is not None and iteration <= self.iteration:raise ValueError('Non-increasing refresh')
         portion=self.config.portion(len(self.rounds))
-        self.table=cpu(select(evidence['raw_probability'],portion,self.config.selection_mode))
+        self.table=cpu(select(evidence['raw_probability'],portion,self.config.selection_mode,
+            evidence.get('scale_logits'),self.config.positive_min_votes,
+            self.config.positive_negative_margin))
         self.ids,self.iteration=ids,int(iteration)
         self.rounds.append(dict(iteration=self.iteration,portion=portion,ids=ids,**cpu(self.table)))
 
@@ -137,6 +161,7 @@ class CBSTController:
         self.last_record.update(coverage=float(row['accepted'].float().mean()),refresh_iteration=self.iteration,
             portion=self.rounds[-1]['portion'],thresholds=self.table['thresholds'].tolist(),
             raw_class_support=self.table['raw_class_support'].tolist(),
+            eligible_class_support=self.table['eligible_class_support'].tolist(),
             full_accepted_class_count=self.table['accepted_class_count'].tolist(),
             batch_accepted_class_count=torch.bincount(row['pseudo_label'][row['accepted']],minlength=3).tolist(),
             changed_label_fraction=float((row['pseudo_label'] != original.pseudo_label).float().mean()))

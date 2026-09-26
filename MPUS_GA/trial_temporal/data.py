@@ -483,7 +483,10 @@ def prepare_target(
     subject: int,
     prepared_sources: PreparedMultiSource,
     scales: Sequence[float],
+    target_normalization: str = "source",
 ) -> MultiScaleTrialDataset:
+    if target_normalization not in {"source", "std_only", "domain"}:
+        raise ValueError(f"Unsupported target normalization: {target_normalization}")
     scales = tuple(sorted(map(float, scales)))
     arrays = {
         scale: load_scale_arrays(
@@ -491,9 +494,22 @@ def prepare_target(
         )
         for scale in scales
     }
+    if target_normalization == "source":
+        stats = prepared_sources.stats
+    else:
+        target_stats = {
+            scale: fit_combined_stats([arrays[scale]]) for scale in scales
+        }
+        if target_normalization == "std_only":
+            stats = {
+                scale: (prepared_sources.stats[scale][0], target_stats[scale][1])
+                for scale in scales
+            }
+        else:
+            stats = target_stats
     return MultiScaleTrialDataset(
         arrays,
-        prepared_sources.stats,
+        stats,
         domain_id=len(prepared_sources.domain_names),
         physiology_stats=prepared_sources.physiology_stats,
         use_physiology=prepared_sources.physiology_enabled,

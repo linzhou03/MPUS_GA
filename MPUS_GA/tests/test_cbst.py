@@ -5,6 +5,7 @@ import torch
 from MPUS_GA.trial_temporal.cbst import CBSTConfig,CBSTController,select,selected_ce
 from MPUS_GA.scripts.run_cbst_suite import plan,command
 from MPUS_GA.scripts.run_cbst_balanced_suite import plan as balanced_plan, command as balanced_command
+from MPUS_GA.scripts.run_cbst_positive_gate_suite import plan as gate_plan, command as gate_command
 
 
 def test_class_threshold_and_normalized_reassignment():
@@ -43,6 +44,34 @@ def test_independent_acceptance_keeps_present_classes_when_one_is_missing():
     assert strict['accepted_class_count'].tolist()==[0,0,0]
     assert independent['accepted_class_count'].tolist()==[1,1,0]
     assert independent['accepted'].tolist()==[True,False,False,True,False,False]
+
+
+def test_positive_gate_filters_before_shared_quota_without_changing_target_loss():
+    p=torch.tensor([[.65,.20,.15],[.90,.05,.05],[.42,.17,.41],
+                    [.10,.80,.10],[.10,.70,.20],[.10,.10,.80],[.20,.10,.70]])
+    scales=torch.tensor([
+        [[3.,0.,0.],[3.,0.,0.],[3.,0.,0.]],
+        [[3.,0.,0.],[3.,0.,0.],[0.,0.,3.]],
+        [[3.,0.,0.],[3.,0.,0.],[3.,0.,0.]],
+        [[0.,3.,0.]]*3,[[0.,3.,0.]]*3,
+        [[0.,0.,3.]]*3,[[0.,0.,3.]]*3])
+    out=select(p,.5,'positive_gate',scales,3,.10)
+    assert out['raw_class_support'].tolist()==[3,2,2]
+    assert out['eligible_class_support'].tolist()==[1,2,2]
+    assert out['accepted'].tolist()==[True,False,False,True,False,True,False]
+    assert out['accepted_class_count'].tolist()==[1,1,1]
+    assert select(p,.5)['accepted'][1]
+    assert CBSTConfig(selection_mode='positive_gate',positive_min_votes=3,
+                      positive_negative_margin=.10).target_loss_mode=='sample_mean'
+
+
+def test_positive_gate_empty_class_vetoes_all_target_ce():
+    p=torch.tensor([[.9,.05,.05],[.1,.8,.1],[.1,.1,.8]])
+    scales=torch.tensor([[[3.,0.,0.],[3.,0.,0.],[0.,0.,3.]],
+                         [[0.,3.,0.]]*3,[[0.,0.,3.]]*3])
+    out=select(p,.5,'positive_gate',scales,3,.10)
+    assert out['eligible_class_support'].tolist()==[0,1,1]
+    assert out['accepted_class_count'].tolist()==[0,0,0]
 
 
 def test_class_mean_ce_gives_each_present_class_equal_weight():
@@ -91,3 +120,19 @@ def test_balanced_suite_is_paired_across_six_directions(tmp_path):
             args=balanced_command('python',item,tmp_path)
             assert args[args.index('--variant')+1]==item['variant']
             assert args[args.index('--selection')+1]=='post300_bal_best'
+
+
+def test_positive_gate_suite_has_three_concurrent_workers(tmp_path):
+    queues,summary=gate_plan('r3_posgate_test',tmp_path)
+    assert summary['jobs']==3 and summary['folds']==56
+    assert summary['phases']==[
+        {'physical_gpu':'0','concurrent_directions':['B','E']},
+        {'physical_gpu':'0','concurrent_directions':['C'],
+         'starts_after':'B and E both complete'}]
+    assert set(queues)=={'gpu0_B','gpu0_E','gpu0_C'}
+    assert all(items[0]['physical_gpu']=='0' for items in queues.values())
+    for items in queues.values():
+        item=items[0]
+        args=gate_command('python',item,tmp_path)
+        assert args[args.index('--variant')+1]=='positive_gate'
+        assert args[args.index('--selection')+1]=='post300_bal_best'
