@@ -1,0 +1,65 @@
+混淆矩阵改进实验文件清单
+====================================
+
+核心模块（3个）
+------------------------------------
+trial_temporal/losses/asymmetric_confusion.py          (6.7K, 230行)
+trial_temporal/calibration/multiscale_balance.py       (9.4K, 280行)
+trial_temporal/pseudo_label/confusion_aware_cbst.py    (8.1K, 240行)
+
+训练与调度（4个）
+------------------------------------
+trial_temporal/train_confusion_fix.py                  (约5K, 150行)
+scripts/master_worker_scheduler.py                     (约7K, 250行)
+scripts/run_confusion_fix_suite.sh                     (约5K, 200行)
+scripts/pre_launch_check.sh                            (约4K, 150行)
+
+结果分析（1个）
+------------------------------------
+scripts/summarize_confusion_fix.py                     (约6K, 220行)
+
+文档（4个）
+------------------------------------
+experiment/2026-10-01/.../README.md                    (约400行)
+experiment/2026-10-01/.../快速启动指南.md               (约250行)
+experiment/2026-10-01/.../实现清单.md                  (约300行)
+experiment/2026-10-01/.../项目总结.md                  (约300行)
+
+统计
+------------------------------------
+总文件数: 12
+总代码行数: ~2,150
+总文档行数: ~1,250
+总计: ~3,400 行
+
+核心功能
+------------------------------------
+✓ 非对称混淆损失（针对 positive 误判）
+✓ 多尺度偏置校准（估计并校正 class prior）
+✓ Confusion-Aware CBST（高质量伪标签选择）
+✓ Master-Worker 双卡并行调度
+✓ 自动结果汇总和可视化
+
+实验配置
+------------------------------------
+方向: A, C, E (3个)
+配置: baseline, asy, cal, cbst, asy_cal, asy_cbst, cal_cbst, full (8个)
+总任务: 24 个
+种子: 43
+选优: post300_bal_best
+数据: LDS 平滑版 (519 NPZ)
+
+预期时间
+------------------------------------
+单任务: 5-8 小时
+总时间: 55-88 小时（双卡并行）
+预计: 2.3-3.7 天
+
+下一步
+------------------------------------
+1. 集成到 train_cbst.py（2-4小时）
+2. 本地快速验证（10步测试）
+3. 部署到 CSU
+4. 启动实验
+5. 每日监控
+6. 结果汇总
