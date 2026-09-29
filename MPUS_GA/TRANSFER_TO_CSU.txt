@@ -1,0 +1,57 @@
+# Files to Transfer to CSU
+# Target: csu:/data/linzhou/MPUS_GA/
+
+## Core Implementation Files (必须传输)
+trial_temporal/train_cbst_confusion_fix.py
+trial_temporal/losses/asymmetric_confusion.py
+trial_temporal/calibration/multiscale_balance.py
+trial_temporal/pseudo_label/confusion_aware_cbst.py
+
+## Scheduler & Scripts (必须传输)
+scripts/master_worker_scheduler.py
+scripts/summarize_confusion_fix.py
+scripts/sanity_check_csu.sh
+scripts/deploy_confusion_fix_csu.sh
+
+## Documentation (可选)
+CONFUSION_FIX_QUICKSTART.md
+DEPLOYMENT_READY.md
+
+## Manual Transfer Commands:
+```bash
+# Method 1: Individual files
+scp trial_temporal/train_cbst_confusion_fix.py csu:/data/linzhou/MPUS_GA/trial_temporal/
+scp trial_temporal/losses/asymmetric_confusion.py csu:/data/linzhou/MPUS_GA/trial_temporal/losses/
+scp trial_temporal/calibration/multiscale_balance.py csu:/data/linzhou/MPUS_GA/trial_temporal/calibration/
+scp trial_temporal/pseudo_label/confusion_aware_cbst.py csu:/data/linzhou/MPUS_GA/trial_temporal/pseudo_label/
+scp scripts/master_worker_scheduler.py csu:/data/linzhou/MPUS_GA/scripts/
+scp scripts/summarize_confusion_fix.py csu:/data/linzhou/MPUS_GA/scripts/
+scp scripts/sanity_check_csu.sh csu:/data/linzhou/MPUS_GA/scripts/
+scp scripts/deploy_confusion_fix_csu.sh csu:/data/linzhou/MPUS_GA/scripts/
+scp CONFUSION_FIX_QUICKSTART.md csu:/data/linzhou/MPUS_GA/
+scp DEPLOYMENT_READY.md csu:/data/linzhou/MPUS_GA/
+
+# Method 2: Or just pull from GitHub on CSU
+ssh csu
+cd /data/linzhou/MPUS_GA
+git fetch mpusga
+git checkout r4_confusion_fix_20261001
+git pull mpusga r4_confusion_fix_20261001
+```
+
+## Launch Scheduler on CSU:
+```bash
+ssh csu
+cd /data/linzhou/MPUS_GA
+nohup python scripts/master_worker_scheduler.py > scheduler.log 2>&1 &
+tail -f scheduler.log
+```
+
+## Monitor Progress:
+```bash
+# Watch logs
+tail -f scheduler.log
+
+# Check summary
+python scripts/summarize_confusion_fix.py
+```
